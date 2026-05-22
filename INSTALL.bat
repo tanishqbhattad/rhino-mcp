@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 :: ============================================================
 ::   RhinoAIBridge -- Smart Installer
 ::   by tanishqb  |  https://github.com/tanishqbhattad/rhino-mcp
-::   Version 4.7.4  |  Auto-detects Claude Desktop, Codex, Antigravity
+::   Version 4.7.5  |  Auto-detects Claude Desktop, Codex, Antigravity
 ::   Pre-built plugin -- .NET SDK NOT required.
 :: ============================================================
 
@@ -193,7 +193,7 @@ if "!CONFIGURED!"=="0" (
 
 :: -- Done -----------------------------------------------------------------------
 echo  ============================================================
-echo    INSTALLATION COMPLETE  ^|  RhinoAIBridge v4.7.4 by tanishqb
+echo    INSTALLATION COMPLETE  ^|  RhinoAIBridge v4.7.5 by tanishqb
 echo  ============================================================
 echo.
 echo  NEXT STEPS:

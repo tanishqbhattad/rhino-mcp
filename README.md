@@ -1,6 +1,6 @@
-﻿# RhinoAIBridge — AI Control of Rhino 8 via MCP
+# RhinoAIBridge v4.7.5 — AI Control of Rhino 8 via MCP
 
-> **The most powerful Rhino MCP server.** Give Claude, ChatGPT, or Ollama full control of Rhino 8 — create geometry, manipulate layers, capture viewports, run any Rhino command, and more. No .NET SDK required on the target machine.
+> **The most powerful Rhino MCP server.** 90 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 — create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rhino 8](https://img.shields.io/badge/Rhino-8.x-blue)](https://www.rhino3d.com/)
@@ -14,26 +14,27 @@
 
 ## What is this?
 
-**RhinoAIBridge** is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that bridges any MCP-compatible AI — Claude Desktop, ChatGPT, or local Ollama models — directly into Rhino 3D (version 8). The AI can read your scene, create and modify geometry, manage layers, run scripts, capture viewport images, and execute any Rhino command — all from a natural language conversation.
+**RhinoAIBridge** is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that bridges any MCP-compatible AI — Claude Desktop, ChatGPT, Codex, or local Ollama models — directly into Rhino 3D (version 8). The AI can read your scene, create and modify geometry, manage layers, run scripts, capture viewport images, generate architectural drawings, manage materials, trace PDFs, and execute any Rhino command — all from a natural language conversation.
 
 This is the **fastest, most feature-complete Rhino AI integration available**:
 
-- ⚡ **Sub-millisecond ping** with in-process scene cache (no full scene walks)
-- 🗜️ **Gzip wire compression** — 5–8× smaller payloads on large scenes
-- 📸 **Auto-thumbnails** — every mutation returns a viewport JPEG so the AI sees what it built
-- ⚛️ **Atomic batches** — multi-step operations roll back as one unit on failure
-- 🔌 **No .NET SDK required** on target machines — plugin is pre-built
+- **Sub-millisecond ping** with in-process scene cache (no full scene walks)
+- **Gzip wire compression** — 5-8x smaller payloads on large scenes
+- **Auto-thumbnails** — every mutation returns a viewport JPEG so the AI sees what it built
+- **Atomic batches** — multi-step operations roll back as one unit on failure
+- **No .NET SDK required** on target machines — plugin is pre-built
+- **90 MCP tools** across 12 categories
 
 ---
 
 ## Quick Install (2 minutes)
 
-**Requirements:** Rhino 8 · Python (auto-installed via uv) · Claude Desktop / ChatGPT API key / Ollama
+**Requirements:** Rhino 8 · Python (auto-installed via uv) · Claude Desktop / ChatGPT API key / Codex / Ollama
 
 ### Windows
 
 1. **Download** the latest release zip and unzip anywhere
-2. **Double-click `INSTALL.bat`** — copies the plugin, installs dependencies, patches Claude Desktop config automatically
+2. **Double-click `INSTALL.bat`** — copies the plugin, installs dependencies, patches Claude Desktop/Codex config automatically
 3. **Open Rhino 8** → type `PluginManager` → Install → browse to:
    `%APPDATA%\McNeel\Rhinoceros\8.0\Plug-ins\RhinoAIBridge\RhinoAIBridge.rhp`
    *(First time only — auto-loads on future starts)*
@@ -46,24 +47,26 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 
 ---
 
-## 32 MCP Tools
+## 90 MCP Tools
 
 ### Scene & Context
 | Tool | What it does |
 |------|-------------|
-| `ping` | Liveness check — returns doc name, unit system, object count, scene version |
+| `ping` | Liveness check — returns doc name, unit system, object count, protocol version |
 | `query_scene` | Smart scene query: filter by type, layer, name, bbox, visibility |
-| `get_object_details` | Full metadata for specific objects |
 | `get_rhino_commands` | Discover all available Rhino commands with substring filter |
+| `get_state` | Read persistent key-value state |
+| `set_state` | Write persistent key-value state |
+| `clear_state` | Clear all persistent state |
 
 ### Geometry Creation
 | Tool | What it does |
 |------|-------------|
 | `create_object` | Universal create: Box, Cylinder, Sphere, Wall, Slab, Column, Roof, Curve, Point... |
-| `create_massing` | Parametric building mass from footprint + height |
 | `derive_floors_from_mass` | Auto-generate floor slabs by intersecting a massing solid |
 | `create_core` | Structural core punched through a massing solid |
 | `place_openings_on_facade` | Parametric window/door placement on any brep face |
+| `revolve_profile` | Create solids of revolution from profile curves |
 | `get_cross_section` | Cut a section curve at any Z height |
 
 ### Modify & Transform
@@ -73,14 +76,30 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 | `transform_objects` | Move, rotate, scale, mirror, array |
 | `boolean_operation` | Union, difference, intersection |
 | `delete_objects` | Delete by ID list |
+| `align_to_grid` | Snap objects to a grid |
+| `undo` | Undo last operation |
 
-### Layers & Materials
+### Layers & Organization
 | Tool | What it does |
 |------|-------------|
 | `create_layer` | Create layer with colour |
+| `create_layer_tree` | Create hierarchical layer structure |
 | `setup_arch_layers` | One-call layer stack: Site, Structure, Facade, Slab, Core, Roof... |
 | `batch_layer_visibility` | Show/hide multiple layers at once |
+| `name_group` | Name a group of objects |
+| `get_group` | Get group info |
+| `get_all_groups` | List all groups |
+
+### Materials & Appearance
+| Tool | What it does |
+|------|-------------|
 | `set_layer_material` | PBR material: color, roughness, metallic, opacity, emission |
+| `set_pbr_material` | Full PBR material on individual objects |
+| `search_materials` | Search AmbientCG material library |
+| `download_material` | Download and apply materials from AmbientCG |
+| `edit_material` | Edit existing material properties |
+| `list_materials` | List all materials in the document |
+| `get_material` | Get details of a specific material |
 
 ### Viewport & Capture
 | Tool | What it does |
@@ -90,8 +109,44 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 | `set_display_mode` | Wireframe, Shaded, Rendered, Ghosted, Arctic... |
 | `set_camera` | Position camera by location+target or zoom to bounding box |
 | `select_objects` | Highlight objects in the Rhino viewport |
+| `thumbnail` | Quick low-res viewport thumbnail |
 
-### Analysis
+### Sections & Drawings
+| Tool | What it does |
+|------|-------------|
+| `create_section` | Define a section plane |
+| `create_elevation` | Create elevation view |
+| `cut_section` | Generate section cut geometry |
+| `align_view_to_section` | Orient viewport to match section |
+| `create_plan` | Generate a plan view at a given level |
+| `create_all_plans` | Auto-generate all floor plans |
+| `list_sections` | List defined sections |
+| `update_section` | Modify section parameters |
+| `remove_section` | Delete a section |
+
+### Display Mode Engine
+| Tool | What it does |
+|------|-------------|
+| `create_display_mode` | 8 presets: diagram, technical, blueprint, sketch, axonometric, atmospheric, monochrome, cutaway |
+| `apply_display_mode` | Apply a custom display mode |
+| `list_display_modes` | List available display modes |
+| `adjust_display_mode` | Fine-tune display mode parameters |
+| `delete_display_mode` | Remove a custom display mode |
+| `capture_illustration` | Capture viewport with illustration settings |
+
+### PDF & File Import
+| Tool | What it does |
+|------|-------------|
+| `get_pdf_info` | PDF metadata and page count |
+| `preview_pdf_page` | Preview a PDF page as image |
+| `trace_pdf` | Trace PDF geometry into Rhino (vector + OCR pipeline) |
+| `clear_trace_layers` | Remove traced PDF layers |
+| `get_trace_layers` | List traced PDF layers |
+| `import_dwg` | Import DWG/DXF files |
+| `calibrate_scale` | Calibrate imported geometry scale |
+| `export_objects` | Export objects to various formats |
+
+### Analysis & Measurement
 | Tool | What it does |
 |------|-------------|
 | `measure_object` | Area, volume, bounding box, centroid |
@@ -99,6 +154,26 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 | `check_intersection` | Detect clashes between objects |
 | `validate_objects` | Check for bad geometry / open edges |
 | `report_areas` | Area schedule grouped by layer or type |
+| `analyze_architecture` | Architectural analysis of the model |
+| `get_building_systems` | Identify building systems |
+| `get_level_summary` | Summary per floor level |
+| `detect_design_patterns` | Detect repeated design patterns |
+| `find_unassigned_geometry` | Find geometry not assigned to any layer category |
+
+### Design Memory & Provenance
+| Tool | What it does |
+|------|-------------|
+| `set_design_brief` | Store design intent and constraints |
+| `get_design_brief` | Retrieve current design brief |
+| `tag_object` | Tag objects with metadata |
+| `get_provenance` | Get object creation/modification history |
+| `search_memory` | Search design memory by keyword |
+| `get_related_objects` | Find objects related by design intent |
+| `add_design_rule` | Add a design validation rule |
+| `log_session` | Log a design session summary |
+| `get_scene_diff` | Compare current scene to a previous state |
+| `get_change_log` | Get change history |
+| `get_tracker_version` | Get change tracker version |
 
 ### Scripting & Workflow
 | Tool | What it does |
@@ -106,8 +181,11 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 | `run_command` | Execute any Rhino command string; returns new object IDs |
 | `execute_script` | Run RhinoScript or Python code |
 | `batch` | Send multiple operations as one atomic transaction |
-| `undo` | Undo last operation |
+| `batch_preview` | Preview batch operations without executing |
 | `get_log` | Inspect bridge command log with timestamps and timing |
+| `save_checkpoint` | Save scene checkpoint for rollback |
+| `restore_checkpoint` | Restore scene to a saved checkpoint |
+| `list_checkpoints` | List available checkpoints |
 
 ---
 
@@ -135,12 +213,7 @@ Manual config — `~/.codex/config.toml`:
 ```toml
 [mcp_servers.rhino_architect]
 command = "uv"
-args = [
-  "--directory",
-  "C:\\path\\to\\rhino-mcp\\server",
-  "run",
-  "rhino-architect"
-]
+args = ["--directory", "C:\\path\\to\\rhino-mcp\\server", "run", "rhino-architect"]
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 enabled = true
@@ -186,14 +259,14 @@ uv run python chat.py --provider anthropic --model claude-opus-4-6
 ## Architecture
 
 ```
-Claude Desktop / ChatGPT / Ollama
+Claude Desktop / ChatGPT / Codex / Ollama
          |  MCP (stdio)
          v
-  server/src/rhino_architect/server.py   <- FastMCP Python server (32 tools)
+  server/src/rhino_architect/server.py   <- FastMCP Python server (90 tools)
          |  TCP 127.0.0.1:9544
          |  [1-byte flag][4-byte len][gzip payload]
          v
-  plugin/RhinoAIBridge.rhp              <- C# Rhino 8 plugin
+  plugin/RhinoAIBridge.rhp              <- C# Rhino 8 plugin (.NET 7)
          |  UI thread dispatch + deferred redraw
          v
   Rhino 8 Document
@@ -211,14 +284,14 @@ Claude Desktop / ChatGPT / Ollama
 
 Only needed if you want to modify the C# plugin. Target machines do NOT need the .NET SDK.
 
-Requirements: .NET 8 SDK, Rhino 8 (for RhinoCommon)
+Requirements: .NET 7 SDK, Rhino 8 (for RhinoCommon)
 
 ```
 cd plugin
 dotnet build --configuration Release
 ```
 
-Output: `plugin/bin/Release/net8.0/`. Copy `.rhp` + DLLs to the Rhino plugin folder.
+Output: `plugin/bin/Release/net7.0/`. Copy `.rhp` + DLLs to the Rhino plugin folder.
 
 ---
 
@@ -228,6 +301,8 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp` + DLLs to the Rhino plugin fol
 
 **Plugin does not appear in Claude** — Restart Claude Desktop after install. Check `%APPDATA%\Claude\claude_desktop_config.json` contains the `rhino-architect` server entry.
 
+**Protocol version mismatch** — Run `INSTALL.bat` again to copy the latest plugin binary. The v4.7.5 plugin reports protocol 4.7.
+
 **uv not found** — Open a new terminal after install (PATH change does not apply to the current session).
 
 **Ollama connection refused** — Run `ollama serve` in a separate terminal before starting `chat.py`.
@@ -236,22 +311,36 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp` + DLLs to the Rhino plugin fol
 
 **Run health check** — `cd server && uv run python ../scripts/doctor.py` checks plugin, port, Claude Desktop, and Codex config in one pass.
 
+**Codex TOML parse error** — Re-run INSTALL.bat option [4]. v4.7.5 uses inline array format that all TOML parsers accept.
+
 **Codex not seeing the server** — Run `codex mcp list` and confirm `rhino_architect` is listed and `enabled = true`. Re-run INSTALL.bat option [4] if missing.
 
 ---
 
 ## Changelog
 
-### v4.7 (current)
-- **Sections & Plans**: `create_section`, `create_elevation`, `cut_section`, `create_plan`, `create_all_plans` — full architectural drawing workflow
-- **Illustration Engine**: `create_display_mode` with 8 presets (diagram, technical, blueprint, sketch, axonometric, atmospheric, monochrome, cutaway); `capture_illustration`
-- **Material Intelligence**: `search_materials`, `download_material` (AmbientCG, confirmation gate), `apply_downloaded_material` with unit-aware UV scaling
-- **PDF Tracing**: `trace_pdf` (PyMuPDF + OpenCV CV pipeline, vector text at 1.0 confidence); `get_pdf_info`, `preview_pdf_page`
-- **File Import**: `import_dwg` (native Rhino DWG/DXF), `calibrate_scale`
+### v4.7.5 (current)
+- **90 tools** — up from 32 in v4.5
+- **15 missing dispatch entries fixed** — `set_design_brief`, `get_design_brief`, `tag_object`, `get_provenance`, `search_memory`, `get_related_objects`, `name_group`, `get_group`, `get_all_groups`, `add_design_rule`, `log_session`, `get_scene_diff`, `get_change_log`, `get_tracker_version`, and `get_design_rules` now properly registered in the C# plugin
+- **Double-serialization fix** — 35+ tools were wrapping JSON in `json.dumps()` causing clients to receive escaped strings. All tools now return native dicts
+- **MCP tool annotations** — every tool tagged with read-only, write, write-idempotent, or destructive hints for AI clients
+- **Codex TOML fix** — inline args array format prevents parse errors on all platforms
+- **Protocol v4.7** baked into the pre-built plugin binary
+
+### v4.7.4
+- Job system with background execution
+- Force-refresh on scene queries
+- 12 new architectural intelligence tools
+- Installer improvements and healthcheck script
+
+### v4.7.0
+- **Sections & Plans**: `create_section`, `create_elevation`, `cut_section`, `create_plan`, `create_all_plans`
+- **Illustration Engine**: `create_display_mode` with 8 presets; `capture_illustration`
+- **Material Intelligence**: `search_materials`, `download_material` with unit-aware UV scaling
+- **PDF Tracing**: `trace_pdf` (PyMuPDF pipeline, vector text at 1.0 confidence)
+- **File Import**: `import_dwg`, `calibrate_scale`
 - **Codex support**: `scripts/patch_codex_config.py` + INSTALL.bat option [4]
-- **Doctor script**: `scripts/doctor.py` — full health-check across plugin, port, Claude, Codex
-- Removed TrustManager — always developer mode
-- 30 bug fixes across all v4.7 systems (wrong TextureType slots, inverted merge logic, double Y-flip in text tracing, 22 missing json.dumps wrappers, cache rglob, and more)
+- **Doctor script**: `scripts/doctor.py` — full health-check
 
 ### v4.6
 - Auth token + 3-tier trust modes
@@ -261,19 +350,12 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp` + DLLs to the Rhino plugin fol
 
 ### v4.5
 - Pre-built plugin — no .NET SDK required on target machines
-- `set_camera` with explicit location/target or bounding-box framing
-- `get_rhino_commands` — live Rhino command discoverability
-- `set_layer_material` — PBR properties (roughness, metallic, opacity, emission)
-- `run_command` — execute any Rhino command string, returns new object IDs
-- Auto-thumbnails on every mutation response
-- Gzip wire compression (5-8x on large responses)
-- `capture_viewport` restore_state — AI inspection never disrupts your view
-- Atomic batch rollback with Doc.Undo() on failure
+- `set_camera`, `get_rhino_commands`, `set_layer_material`, `run_command`
+- Auto-thumbnails, gzip compression, atomic batch rollback
 
 ### v4.0
-- Scene snapshot cache — O(1) reads regardless of object count
-- Deferred redraw — batches fire one Redraw() instead of one per op
-- Atomic batches with reference resolution ($1.object_ids[0])
+- Scene snapshot cache — O(1) reads
+- Deferred redraw and atomic batches
 - Architect intelligence: massing, floors, core, facade, schedules
 
 ---
@@ -284,4 +366,4 @@ MIT — see LICENSE. Free for personal and commercial use.
 
 ---
 
-*Built by Tanishq Bhattad — https://github.com/tanishqb*
+*Built by Tanishq Bhattad — https://github.com/tanishqbhattad*

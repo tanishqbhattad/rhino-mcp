@@ -1,5 +1,5 @@
 {
-  "plugin_version": "4.7.0",
+  "plugin_version": "4.7.5",
   "protocol_version": "4.7",
   "min_rhino_version": "8.0",
   "min_python_version": "3.11",
@@ -22,5 +22,5 @@
     }
   },
   "breaking_changes": [],
-  "notes": "All v4.5 / v4.6 callers are forward-compatible. No schema changes to existing tools."
+  "notes": "All v4.5-v4.7.4 callers are forward-compatible. v4.7.5 adds 15 missing dispatch entries and fixes double-serialization on 35+ tools."
 }
