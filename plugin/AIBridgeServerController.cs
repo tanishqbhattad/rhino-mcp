@@ -1,7 +1,5 @@
-// RhinoAIBridge v4.5 — AIBridgeServerController.cs
+// RhinoAIBridge v4.7.5 — AIBridgeServerController.cs
 // by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
-
-using Rhino;
 
 namespace RhinoAIBridge
 {
@@ -17,15 +15,17 @@ namespace RhinoAIBridge
 
         public static void StartServer()
         {
-            if (!_server.IsRunning)
-                _server.Start();
-            else
-                RhinoApp.WriteLine($"AIBridge: Already running on 127.0.0.1:9544  build:{AIBridgeServer.BuildHash}");
+            if (!_server.IsRunning) _server.Start();
         }
 
         public static void StopServer()
         {
             if (_server.IsRunning) _server.Stop();
+        }
+
+        public static void ForceKill()
+        {
+            _server.ForceRelease();
         }
     }
 }

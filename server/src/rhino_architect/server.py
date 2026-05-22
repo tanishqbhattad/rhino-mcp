@@ -1,7 +1,7 @@
-# RhinoAIBridge v4.5 — MCP Server
+# RhinoAIBridge v4.7.5 — MCP Server
 # by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
 
-"""Rhino AI Bridge v4.5 — MCP Server.
+"""Rhino AI Bridge v4.7.5 — MCP Server.
 
 This release combines:
   Phase 1 — lean responses (dicts Ã¢â€ ' FastMCP Ã¢â€ ' orjson on wire)
@@ -27,7 +27,7 @@ from typing import Any, Optional
 import json
 import orjson
 from mcp.server.fastmcp import FastMCP
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from rhino_architect.protocol import (
     RhinoCommandError,
@@ -60,6 +60,64 @@ def _check_safe_mode(tool_name: str) -> dict | None:
             "blocked_tools": sorted(_SAFE_MODE_BLOCKED),
         }
     return None
+# Phase 7: Heartbeat watchdog — auto-exit when Rhino closes.
+# Runs in a daemon thread (not asyncio) so it works regardless of the MCP event loop.
+# Checks every 15s whether the Rhino TCP port is still accepting connections.
+# After 3 consecutive failures (~45s), exits the process so the MCP client knows
+# the server is gone and can restart it when Rhino reopens.
+import asyncio
+import socket
+import threading
+
+_HEARTBEAT_INTERVAL = 15   # seconds between checks
+_HEARTBEAT_MAX_FAILS = 3   # consecutive failures before exit
+
+def _rhino_heartbeat_loop():
+    """Background thread: poll Rhino TCP port, exit if unreachable.
+    
+    Two-phase design:
+      Phase 1: Wait INDEFINITELY for Rhino to appear (user might start Rhino after the MCP server).
+      Phase 2: Once connected, monitor. After 3 consecutive failures (~45s), exit.
+    """
+    import time
+    host = os.environ.get("RHINO_HOST", "127.0.0.1")
+    port = int(os.environ.get("RHINO_PORT", "9544"))
+    
+    # Phase 1: Wait for Rhino to become reachable (no timeout — wait forever)
+    logger.info("Heartbeat: waiting for Rhino on %s:%d ...", host, port)
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+            logger.info("Heartbeat: Rhino is reachable — entering monitor phase.")
+            break  # Rhino is up — move to phase 2
+        except OSError:
+            time.sleep(5)  # check every 5s while waiting
+    
+    # Phase 2: Monitor — exit if Rhino goes away
+    consecutive_fails = 0
+    while True:
+        time.sleep(_HEARTBEAT_INTERVAL)
+        try:
+            with socket.create_connection((host, port), timeout=3):
+                pass
+            consecutive_fails = 0
+        except OSError:
+            consecutive_fails += 1
+            logger.warning(
+                "Rhino heartbeat failed (%d/%d)",
+                consecutive_fails, _HEARTBEAT_MAX_FAILS,
+            )
+            if consecutive_fails >= _HEARTBEAT_MAX_FAILS:
+                logger.error(
+                    "Rhino unreachable for %ds — shutting down MCP server.",
+                    _HEARTBEAT_INTERVAL * _HEARTBEAT_MAX_FAILS,
+                )
+                os._exit(0)  # hard exit — clean shutdown not possible from a thread
+
+_heartbeat_thread = threading.Thread(target=_rhino_heartbeat_loop, daemon=True)
+_heartbeat_thread.start()
+
 mcp = FastMCP("RhinoAIBridge")
 
 
@@ -134,7 +192,6 @@ class QuerySceneInput(BaseModel):
     filter: dict[str, Any] = Field(default_factory=dict)
     detail: str = "summary"  # ids | summary | full
     limit: int = Field(default=80, ge=1, le=500)
-    force_refresh: bool = Field(default=False, description="Drop the cached snapshot and rebuild from the live document before querying. Use after bulk imports or external edits.")
 
 
 class CreateObjectInput(BaseModel):
@@ -206,48 +263,41 @@ class ModifyObjectInput(BaseModel):
 
 
 class BatchSubCommand(BaseModel):
-    """One sub-command inside a batch.
+    """One sub-command inside a batch. The plugin routes on `type`; `params` is passed verbatim.
 
-    REQUIRED shape:
-        {"type": "<command_name>", "params": {...}}
+    `type` must be one of the plugin command names — same names as the MCP tools
+    (create_object, derive_floors_from_mass, create_core, transform_objects, modify_object,
+    delete_objects, query_scene, setup_arch_layers, batch_layer_visibility, execute_script,
+    undo, Ã¢â‚¬Â¦) plus any legacy commands listed in rhino://capabilities.
 
-    "type" is the plugin command name (identical to the MCP tool name).
-    "params" is the arg dict as you would pass to the standalone tool.
-
-    EXAMPLE (create a massing box):
-        {"type": "create_object",
-         "params": {"type": "massing", "layer": "Massing",
-                    "params": {"footprint": [[0,0,0],[20000,0,0],[20000,15000,0],[0,15000,0]],
-                               "levels": 5, "level_height": 3600}}}
-
-    Reference prior results in any param string:
-        "$1.object_ids[0]"    -> first GUID from op 1
-        "$2.mass_id"          -> mass_id from op 2
-        "$3.bounding_box.min" -> nested path from op 3
+    `params` is the argument dict exactly as you'd pass to the corresponding standalone tool,
+    EXCEPT that any string value may start with a `$N` reference to resolve to a prior result:
+        "$1"                Ã¢â€ ' whole result dict of op 1
+        "$1.object_ids[0]"  Ã¢â€ ' first GUID from op 1
+        "$2.mass_id"        Ã¢â€ ' mass_id field from op 2
+        "$3.bounding_box.min" Ã¢â€ ' nested path
     """
-    model_config = ConfigDict(extra="ignore")   # tolerate unknown keys gracefully
+    model_config = ConfigDict(extra="forbid")
     type: str = Field(
         ...,
-        validation_alias=AliasChoices("type", "name", "tool", "fn", "cmd"),
-        serialization_alias="type",
         description=(
-            "Plugin command name — must match an MCP tool name exactly. "
-            "Common values: create_object, derive_floors_from_mass, create_core, "
-            "transform_objects, modify_object, delete_objects, query_scene, report_areas, "
-            "place_openings_on_facade, align_to_grid, setup_arch_layers, batch_layer_visibility, "
-            "create_layer, capture_viewport, set_view, set_display_mode, select_objects, "
-            "get_cross_section, boolean_operation, execute_script, undo. "
-            "Use 'type' as the key (not 'name', 'tool', 'fn', or 'cmd')."
+            "Plugin command name. Same names as the MCP tools: create_object, "
+            "derive_floors_from_mass, create_core, transform_objects, modify_object, "
+            "delete_objects, query_scene, report_areas, place_openings_on_facade, "
+            "align_to_grid, setup_arch_layers, batch_layer_visibility, create_layer, "
+            "capture_viewport, set_view, set_display_mode, select_objects, get_cross_section, "
+            "boolean_operation, execute_script, undo. Legacy commands also accepted."
         ),
     )
     params: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Arguments for the command, same shape as the standalone tool. "
-            "Any string value may be a $N reference to a prior result, e.g. "
+            "Arguments for the command — same shape as calling the tool standalone. "
+            "Any string value may be a $N reference to a prior op's result, e.g. "
             "'$1.object_ids[0]' or '$2.mass_id'."
         ),
     )
+
 
 class BatchCommandInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -375,8 +425,6 @@ class CaptureInput(BaseModel):
     restore_state: bool = Field(default=True, description="Restore viewport camera and display mode after capture. Default True — the AI can inspect the model from any angle without disrupting the user's current view.")
     view: Optional[str] = Field(default=None, description="Temporarily switch to this named view before capturing (Top, Front, Right, Perspective, etc.). Restored if restore_state=True.")
     display_mode: Optional[str] = Field(default=None, description="Temporarily switch to this display mode before capturing (Wireframe, Shaded, Rendered, Arctic, etc.). Restored if restore_state=True.")
-    save_to_file: bool = Field(default=False, description="If true, write the image bytes to output_path on disk instead of returning base64.")
-    output_path: Optional[str] = Field(default=None, description="Absolute file path to write the image when save_to_file=True (e.g. C:/temp/view.png).")
 
 
 class ViewInput(BaseModel):
@@ -412,12 +460,10 @@ class BooleanInput(BaseModel):
 
 
 class ScriptInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    code: str
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    code: str = Field(..., description="Python code to run inside Rhino. Alias: script.")
     undo_name: Optional[str] = None
     default_layer: Optional[str] = None
-    async_execution: bool = Field(default=False, description="If true, execute the script asynchronously. Returns job_id immediately; poll get_job_status then get_job_result.")
-    label: Optional[str] = Field(default=None, description="Human-readable label for the async job (shown in list_jobs output).")
 
 
 class UndoInput(BaseModel):
@@ -426,8 +472,8 @@ class UndoInput(BaseModel):
 
 
 class LogInput(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    count: int = 50
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    limit: int = Field(50, alias="count", description="Max entries to return (default 50).")
     errors_only: bool = False
 
 
@@ -465,7 +511,7 @@ class RunCommandInput(BaseModel):
 # Ã¢"â‚¬Ã¢"â‚¬ Capabilities Resource Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬
 # Long-tail commands (still callable inside `batch`) and discoverable workflows.
 CAPABILITIES: dict[str, Any] = {
-    "version": "4.5.0",
+    "version": "4.7.5",
     "phase": "1+2+3+5+6",
     "deferred_phases": {
         "phase_4": "multiplexed protocol — deferred (UI-thread serialization makes the gain marginal)",
@@ -564,7 +610,7 @@ def capabilities() -> str:
 
 
 @mcp.resource("rhino://arch-defaults")
-async def arch_defaults_resource() -> str:
+async def arch_defaults_resource() -> dict:
     """Standard architectural defaults: wall thicknesses, opening sizes, layer names."""
     return orjson.dumps({
         "wall": {"height": 3000, "thickness": 200},
@@ -582,32 +628,38 @@ async def arch_defaults_resource() -> str:
 
 @mcp.tool(name="ping", annotations=RO)
 async def ping(params: Empty) -> dict:
-    """Verify Rhino is reachable. Returns build hash, doc info, units, and current scene_version.
+    """Health check — verify Rhino bridge is reachable on 127.0.0.1:9544.
 
-    Cheap (sub-ms on server). Useful at conversation start, and as an etag check —
-    if scene_version matches what you saw last time, the scene is unchanged and you
-    can skip re-querying."""
+    Returns: bridge status, Rhino version, document name, model units, scene_version (etag),
+    protocol version, safe_mode flag, MCP server Python path, and dependency status.
+
+    Cheap (sub-ms). Call at conversation start and to check if scene has changed (etag)."""
+    import sys as _sys
     try:
         conn = await get_connection()
         data = await conn.ping()
         data["capabilities_resource"] = "rhino://capabilities"
         data["safe_mode"] = _SAFE_MODE
-        # Version compatibility check — warn only on major version downgrade
-        plugin_ver = data.get("protocol_version", "")
-        if plugin_ver:
+        data["mcp_python"] = _sys.executable
+        data["mcp_version"] = "4.7.5"
+        # Check optional dependencies
+        dep_status = {}
+        for pkg in ["pymupdf", "cv2", "numpy"]:
             try:
-                pmajor = int(plugin_ver.split(".")[0])
-                smajor = 4  # this server supports 4.x
-                if pmajor < smajor:
-                    data["version_warning"] = (
-                        f"MCP server is v4.x; plugin reports protocol {plugin_ver}. "
-                        f"Update the .rhp plugin for full compatibility."
-                    )
-            except Exception:
-                pass  # unparseable version — don't warn
+                __import__(pkg if pkg != "cv2" else "cv2")
+                dep_status[pkg] = "installed"
+            except ImportError:
+                dep_status[pkg] = "missing"
+        data["optional_dependencies"] = dep_status
+        # Version compatibility check
+        plugin_ver = data.get("protocol_version", "")
+        if plugin_ver and plugin_ver != "4.7":
+            data["version_warning"] = (f"MCP server expects protocol 4.7; plugin reports {plugin_ver}. "
+                                       f"Update the .rhp plugin to v4.7.5 for full compatibility.")
         return data
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": str(e),
+                "hint": "Is Rhino running with the AIBridge plugin loaded? Check 127.0.0.1:9544."}
 
 
 @mcp.tool(name="query_scene", annotations=RO)
@@ -859,11 +911,31 @@ async def delete_objects(params: DeleteInput) -> dict:
 
 @mcp.tool(name="execute_script", annotations=WR)
 async def execute_script(params: ScriptInput) -> dict:
-    """Run arbitrary Python 3 inside Rhino. Powerful escape hatch — prefer structured tools.
+    """Run arbitrary Python inside Rhino. Powerful escape hatch — prefer structured tools.
 
     Auto-imported preamble: rhinoscriptsyntax as rs, scriptcontext as sc, Rhino, System.
-    Use undo_name to wrap in an undo record."""
-    return await _exec_simple("execute_script", params.model_dump(exclude_none=True))
+    Use undo_name to wrap in an undo record.
+
+    IMPORTANT — Rhino uses IronPython 2. Avoid these Python 3-isms:
+      - open(path, encoding='utf-8')  →  use io.open(path, encoding='utf-8')
+      - re.fullmatch(pat, s)          →  use re.match(pat + '$', s)
+      - from __future__ import annotations  →  not supported, remove it
+      - f-strings                      →  use .format() or % formatting
+      - type hints (x: int = 0)        →  remove annotations
+    """
+    data = params.model_dump(exclude_none=True, by_alias=False)
+    # Normalize alias: if 'script' came through, map to 'code' for C#
+    if "script" in data and "code" not in data:
+        data["code"] = data.pop("script")
+    result = await _exec_simple("execute_script", data)
+    # Compact mode: if result has many object_ids, summarize to save tokens
+    if isinstance(result, dict):
+        ids = result.get("object_ids", [])
+        if isinstance(ids, list) and len(ids) > 20:
+            result["object_ids_count"] = len(ids)
+            result["object_ids_sample"] = ids[:5]
+            result["object_ids"] = f"[{len(ids)} objects — use query_scene to inspect]"
+    return result
 
 
 @mcp.tool(name="undo", annotations=WI)
@@ -874,8 +946,11 @@ async def undo(params: UndoInput) -> dict:
 
 @mcp.tool(name="get_log", annotations=RO)
 async def get_log(params: LogInput) -> dict:
-    """Fetch recent bridge log entries for debugging. errors_only=True filters to errors/warnings."""
-    return await _exec_simple("get_log", params.model_dump())
+    """Fetch recent bridge log entries for debugging.
+
+    limit: max entries to return (default 50, alias: count).
+    errors_only: True filters to errors/warnings only."""
+    return await _exec_simple("get_log", params.model_dump(by_alias=True))
 
 
 # Ã¢"â‚¬Ã¢"â‚¬ Materials Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬
@@ -917,76 +992,76 @@ async def run_command(params: RunCommandInput) -> dict:
 # SECTIONS & PLANS
 # =============================================================================
 
-@mcp.tool()
-async def create_section(label: str = "", start_x: float = None, start_y: float = None, start_z: float = None, end_x: float = None, end_y: float = None, end_z: float = None, view_side: str = "left") -> str:
+@mcp.tool(name="create_section", annotations=WR)
+async def create_section(label: str = "", start_x: float = None, start_y: float = None, start_z: float = None, end_x: float = None, end_y: float = None, end_z: float = None, view_side: str = "left") -> dict:
     """Create an architectural section line with arrowheads on a dedicated layer. The model will place a default section line at the model center — reposition it and call cut_section when satisfied."""
     params = {"view_side": view_side}
     if label: params["label"] = label
     if start_x is not None: params["start_point"] = {"x": start_x, "y": start_y or 0, "z": start_z or 0}
     if end_x is not None: params["end_point"] = {"x": end_x, "y": end_y or 0, "z": end_z or 0}
-    return json.dumps(await _exec_simple("create_section", params))
+    return await _exec_simple("create_section", params)
 
 
-@mcp.tool()
-async def create_elevation(label: str = "", direction: str = "north", offset: float = None) -> str:
+@mcp.tool(name="create_elevation", annotations=WR)
+async def create_elevation(label: str = "", direction: str = "north", offset: float = None) -> dict:
     """Create an elevation marker for the specified direction (north/south/east/west)."""
     params = {"direction": direction}
     if label: params["label"] = label
     if offset is not None: params["offset"] = offset
-    return json.dumps(await _exec_simple("create_elevation", params))
+    return await _exec_simple("create_elevation", params)
 
 
-@mcp.tool()
-async def cut_section(label: str, capture: bool = True) -> str:
+@mcp.tool(name="cut_section", annotations=WR)
+async def cut_section(label: str, capture: bool = True) -> dict:
     """Cut the named section — creates clipping plane, aligns view, captures result. Call after user has confirmed section line position."""
-    return json.dumps(await _exec_simple("cut_section", {"label": label, "capture": capture}))
+    return await _exec_simple("cut_section", {"label": label, "capture": capture})
 
 
-@mcp.tool()
-async def align_view_to_section(label: str) -> str:
+@mcp.tool(name="align_view_to_section", annotations=WI)
+async def align_view_to_section(label: str) -> dict:
     """Align the viewport camera perpendicular to the named section/elevation cut plane."""
-    return json.dumps(await _exec_simple("align_view_to_section", {"label": label}))
+    return await _exec_simple("align_view_to_section", {"label": label})
 
 
-@mcp.tool()
-async def create_plan(floor: str, cut_height_mm: float = 1200.0, capture: bool = True) -> str:
+@mcp.tool(name="create_plan", annotations=WR)
+async def create_plan(floor: str, cut_height_mm: float = 1200.0, capture: bool = True) -> dict:
     """Generate a floor plan for the specified floor (e.g. '1', '8', 'ground', 'G', 'B1'). Automatically places a horizontal clipping plane at cut_height_mm above the floor level and captures a top-down orthographic view."""
-    return json.dumps(await _exec_simple("create_plan", {"floor": floor, "cut_height_mm": cut_height_mm, "capture": capture}))
+    return await _exec_simple("create_plan", {"floor": floor, "cut_height_mm": cut_height_mm, "capture": capture})
 
 
-@mcp.tool()
-async def create_all_plans(cut_height_mm: float = 1200.0, capture: bool = True) -> str:
+@mcp.tool(name="create_all_plans", annotations=WR)
+async def create_all_plans(cut_height_mm: float = 1200.0, capture: bool = True) -> dict:
     """Generate floor plans for ALL detected floor levels simultaneously."""
-    return json.dumps(await _exec_simple("create_all_plans", {"cut_height_mm": cut_height_mm, "capture": capture}))
+    return await _exec_simple("create_all_plans", {"cut_height_mm": cut_height_mm, "capture": capture})
 
 
-@mcp.tool()
-async def list_sections() -> str:
+@mcp.tool(name="list_sections", annotations=RO)
+async def list_sections() -> dict:
     """List all sections, elevations, and plans currently defined in the model."""
-    return json.dumps(await _exec_simple("list_sections", {}))
+    return await _exec_simple("list_sections", {})
 
 
-@mcp.tool()
-async def update_section(label: str, start_x: float = None, start_y: float = None, start_z: float = None, end_x: float = None, end_y: float = None, end_z: float = None) -> str:
+@mcp.tool(name="update_section", annotations=WR)
+async def update_section(label: str, start_x: float = None, start_y: float = None, start_z: float = None, end_x: float = None, end_y: float = None, end_z: float = None) -> dict:
     """Reposition an existing section line and re-cut."""
     params = {"label": label}
     if start_x is not None: params["start_point"] = {"x": start_x, "y": start_y or 0, "z": start_z or 0}
     if end_x is not None: params["end_point"] = {"x": end_x, "y": end_y or 0, "z": end_z or 0}
-    return json.dumps(await _exec_simple("update_section", params))
+    return await _exec_simple("update_section", params)
 
 
-@mcp.tool()
-async def remove_section(label: str) -> str:
+@mcp.tool(name="remove_section", annotations=DE)
+async def remove_section(label: str) -> dict:
     """Remove a section, elevation, or plan layer and its clipping plane."""
-    return json.dumps(await _exec_simple("remove_section", {"label": label}))
+    return await _exec_simple("remove_section", {"label": label})
 
 
 # =============================================================================
 # ILLUSTRATION & DISPLAY MODES
 # =============================================================================
 
-@mcp.tool()
-async def create_display_mode(name: str, preset: str = "", base_mode: str = "", background_color: str = "", edge_color: str = "", edge_thickness: int = -1, silhouette_thickness: int = -1, show_edges: bool = None, show_silhouettes: bool = None, shading_enabled: bool = None) -> str:
+@mcp.tool(name="create_display_mode", annotations=WR)
+async def create_display_mode(name: str, preset: str = "", base_mode: str = "", background_color: str = "", edge_color: str = "", edge_thickness: int = -1, silhouette_thickness: int = -1, show_edges: bool = None, show_silhouettes: bool = None, shading_enabled: bool = None) -> dict:
     """Create a custom Rhino display mode for illustration. Presets: diagram, technical, blueprint, sketch, axonometric, atmospheric, monochrome, cutaway."""
     params = {"name": name}
     if preset: params["preset"] = preset
@@ -998,65 +1073,64 @@ async def create_display_mode(name: str, preset: str = "", base_mode: str = "", 
     if show_edges is not None: params["show_edges"] = show_edges
     if show_silhouettes is not None: params["show_silhouettes"] = show_silhouettes
     if shading_enabled is not None: params["shading_enabled"] = shading_enabled
-    return json.dumps(await _exec_simple("create_display_mode", params))
+    return await _exec_simple("create_display_mode", params)
 
 
-@mcp.tool()
-async def apply_display_mode(name: str) -> str:
+@mcp.tool(name="apply_display_mode", annotations=WI)
+async def apply_display_mode(name: str) -> dict:
     """Apply a display mode (built-in or custom AI- mode) to the active viewport."""
-    return json.dumps(await _exec_simple("apply_display_mode", {"name": name}))
+    return await _exec_simple("apply_display_mode", {"name": name})
 
 
-@mcp.tool()
-async def list_display_modes() -> str:
+@mcp.tool(name="list_display_modes", annotations=RO)
+async def list_display_modes() -> dict:
     """List all available display modes including custom AI-created ones."""
-    return json.dumps(await _exec_simple("list_display_modes", {}))
+    return await _exec_simple("list_display_modes", {})
 
 
-@mcp.tool()
-async def adjust_display_mode(name: str, background_color: str = "", edge_color: str = "", edge_thickness: int = -1, silhouette_thickness: int = -1) -> str:
+@mcp.tool(name="adjust_display_mode", annotations=WR)
+async def adjust_display_mode(name: str, background_color: str = "", edge_color: str = "", edge_thickness: int = -1, silhouette_thickness: int = -1) -> dict:
     """Adjust parameters of an existing custom AI display mode."""
     params = {"name": name}
     if background_color: params["background_color"] = background_color
     if edge_color: params["edge_color"] = edge_color
     if edge_thickness >= 0: params["edge_thickness"] = edge_thickness
     if silhouette_thickness >= 0: params["silhouette_thickness"] = silhouette_thickness
-    return json.dumps(await _exec_simple("adjust_display_mode", params))
+    return await _exec_simple("adjust_display_mode", params)
 
 
-@mcp.tool()
-async def delete_display_mode(name: str) -> str:
+@mcp.tool(name="delete_display_mode", annotations=DE)
+async def delete_display_mode(name: str) -> dict:
     """Delete a custom AI display mode (only AI- prefixed modes can be deleted)."""
-    return json.dumps(await _exec_simple("delete_display_mode", {"name": name}))
+    return await _exec_simple("delete_display_mode", {"name": name})
 
 
-@mcp.tool()
-async def capture_illustration(display_mode: str = "", width: int = 1600, height: int = 1200, style_notes: str = "", restore_mode: bool = True) -> str:
+@mcp.tool(name="capture_illustration", annotations=RO)
+async def capture_illustration(display_mode: str = "", width: int = 1600, height: int = 1200, style_notes: str = "", restore_mode: bool = True) -> dict:
     """Capture the viewport as an illustration using the specified or current display mode."""
     params = {"width": width, "height": height, "restore_mode": restore_mode}
     if display_mode: params["display_mode"] = display_mode
     if style_notes: params["style_notes"] = style_notes
-    return json.dumps(await _exec_simple("capture_illustration", params))
+    return await _exec_simple("capture_illustration", params)
 
 
 # =============================================================================
 # MATERIAL INTELLIGENCE
 # =============================================================================
 
-@mcp.tool()
-async def search_materials(keyword: str, limit: int = 5) -> str:
+@mcp.tool(name="search_materials", annotations=RO)
+async def search_materials(keyword: str, limit: int = 5) -> dict:
     """Search AmbientCG for PBR materials matching keyword. Returns candidates with names, preview info, and real-world dimensions. Call download_material with a specific asset_id to proceed."""
-    import json
     try:
         from rhino_architect.material_downloader import search_materials as _search
         results = _search(keyword, limit)
-        return json.dumps({"status": "ok", "results": results, "count": len(results)})
+        return {"status": "ok", "results": results, "count": len(results)}
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return {"status": "error", "message": str(e)}
 
 
-@mcp.tool()
-async def download_material(asset_id: str, layer_name: str, resolution: str = "2K", confirmed: bool = False) -> str:
+@mcp.tool(name="download_material", annotations=WR)
+async def download_material(asset_id: str, layer_name: str, resolution: str = "2K", confirmed: bool = False) -> dict:
     """
     Download and apply a PBR material from AmbientCG to a Rhino layer.
     IMPORTANT: First call with confirmed=False to get a preview of what will be downloaded.
@@ -1065,18 +1139,17 @@ async def download_material(asset_id: str, layer_name: str, resolution: str = "2
     layer_name: Rhino layer to assign the material to.
     resolution: '1K', '2K', or '4K'.
     """
-    import json
     try:
         from rhino_architect.material_downloader import get_material_info, download_material as _download, compute_uv_repeat
         info = get_material_info(asset_id)
         if not info:
-            return json.dumps({"status": "error", "message": f"Asset {asset_id} not found"})
+            return {"status": "error", "message": f"Asset {asset_id} not found"}
 
         # Preview mode — return info without downloading
         if not confirmed:
             dims = info.get("dimensionsInMeters", [1.0, 1.0])
             size_m = dims[0] if dims else 1.0
-            return json.dumps({
+            return {
                 "status": "preview",
                 "asset_id": asset_id,
                 "display_name": info.get("displayName", asset_id),
@@ -1085,7 +1158,7 @@ async def download_material(asset_id: str, layer_name: str, resolution: str = "2
                 "license": "CC0 (free, no attribution required)",
                 "message": f"Ready to download '{info.get('displayName', asset_id)}' ({resolution}, CC0). Call again with confirmed=True to proceed.",
                 "confirmed_required": True
-            })
+            }
 
         # Download
         result = _download(asset_id, resolution)
@@ -1105,13 +1178,13 @@ async def download_material(asset_id: str, layer_name: str, resolution: str = "2
             "physical_size_m": physical_size_m,
             "uv_repeat": uv_repeat
         }
-        return json.dumps(await _exec_simple("apply_downloaded_material", apply_params))
+        return await _exec_simple("apply_downloaded_material", apply_params)
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return {"status": "error", "message": str(e)}
 
 
-@mcp.tool()
-async def edit_material(layer_name: str = "", material_name: str = "", roughness: float = -1, metallic: float = -1, diffuse_color: str = "", transparency: float = -1, texture_scale: float = -1, texture_rotation: float = -361) -> str:
+@mcp.tool(name="edit_material", annotations=WR)
+async def edit_material(layer_name: str = "", material_name: str = "", roughness: float = -1, metallic: float = -1, diffuse_color: str = "", transparency: float = -1, texture_scale: float = -1, texture_rotation: float = -361) -> dict:
     """Edit properties of an existing Rhino render material on a layer."""
     params = {}
     if layer_name: params["layer_name"] = layer_name
@@ -1122,64 +1195,51 @@ async def edit_material(layer_name: str = "", material_name: str = "", roughness
     if transparency >= 0: params["transparency"] = transparency
     if texture_scale > 0: params["texture_scale"] = texture_scale
     if texture_rotation > -361: params["texture_rotation"] = texture_rotation
-    return json.dumps(await _exec_simple("edit_material", params))
+    return await _exec_simple("edit_material", params)
 
 
-@mcp.tool(annotations=RO)
-async def list_materials(
-    dedupe: bool = False,
-    limit: int = 500,
-    offset: int = 0,
-    include_object_materials: bool = False,
-) -> str:
-    """List all render materials in the current Rhino document.
-
-    dedupe: collapse materials with the same name (keeps first occurrence).
-    limit / offset: paginate for documents with many materials.
-    include_object_materials: also flag which materials are used directly by objects.
-    """
-    return json.dumps(await _exec_simple("list_materials", {
-        "dedupe": dedupe, "limit": limit, "offset": offset,
-        "include_object_materials": include_object_materials,
-    }))
+@mcp.tool(name="list_materials", annotations=RO)
+async def list_materials() -> dict:
+    """List all render materials in the current Rhino document."""
+    return await _exec_simple("list_materials", {})
 
 
-@mcp.tool()
-async def get_material(layer_name: str = "", material_index: int = -1) -> str:
+@mcp.tool(name="get_material", annotations=RO)
+async def get_material(layer_name: str = "", material_index: int = -1) -> dict:
     """Get full properties of a render material by layer name or material index."""
     params = {}
     if layer_name: params["layer_name"] = layer_name
     if material_index >= 0: params["material_index"] = material_index
-    return json.dumps(await _exec_simple("get_material", params))
+    return await _exec_simple("get_material", params)
 
 
 # =============================================================================
 # FILE TRACING
 # =============================================================================
 
-@mcp.tool()
-async def import_dwg(file_path: str) -> str:
+@mcp.tool(name="import_dwg", annotations=WR)
+async def import_dwg(file_path: str) -> dict:
     """Import a DWG or DXF file into Rhino using the native importer (100% accurate, no AI interpretation). Post-processes imported geometry."""
-    return json.dumps(await _exec_simple("import_dwg", {"file_path": file_path}))
+    return await _exec_simple("import_dwg", {"file_path": file_path})
 
 
-@mcp.tool()
-async def calibrate_scale(point1_x: float, point1_y: float, point1_z: float, point2_x: float, point2_y: float, point2_z: float, known_distance: float, unit: str = "mm") -> str:
+@mcp.tool(name="calibrate_scale", annotations=WR)
+async def calibrate_scale(point1_x: float, point1_y: float, point1_z: float, point2_x: float, point2_y: float, point2_z: float, known_distance: float, unit: str = "mm") -> dict:
     """Calibrate model scale by specifying two points and their known real-world distance. Rescales all geometry to match. Use after importing or tracing files that may be at wrong scale."""
-    return json.dumps(await _exec_simple("calibrate_scale", {
+    return await _exec_simple("calibrate_scale", {
         "point1": {"x": point1_x, "y": point1_y, "z": point1_z},
         "point2": {"x": point2_x, "y": point2_y, "z": point2_z},
         "known_distance": known_distance,
         "unit": unit
-    }))
+    })
 
 
 # =============================================================================
 # PDF / FILE TRACING TOOLS  (v4.7)
 # =============================================================================
 
-@mcp.tool()
-async def get_pdf_info(pdf_path: str) -> str:
+@mcp.tool(name="get_pdf_info", annotations=RO)
+async def get_pdf_info(pdf_path: str) -> dict:
     """Inspect a PDF file: page count, page sizes in mm, vector/text content flag.
 
     Call this before trace_pdf to choose the right page number and confirm
@@ -1190,13 +1250,13 @@ async def get_pdf_info(pdf_path: str) -> str:
     """
     try:
         from rhino_architect.pdf_tracer import get_pdf_info as _info
-        return json.dumps(_info(pdf_path))
+        return _info(pdf_path)
     except ImportError as e:
-        return json.dumps({"error": str(e)})
+        return {"error": str(e)}
 
 
-@mcp.tool()
-async def preview_pdf_page(pdf_path: str, page_number: int = 0) -> str:
+@mcp.tool(name="preview_pdf_page", annotations=RO)
+async def preview_pdf_page(pdf_path: str, page_number: int = 0) -> dict:
     """Render a PDF page as a base64 PNG thumbnail for previewing before tracing.
 
     Args:
@@ -1207,14 +1267,14 @@ async def preview_pdf_page(pdf_path: str, page_number: int = 0) -> str:
         from rhino_architect.pdf_tracer import render_page_preview
         b64 = render_page_preview(pdf_path, page_number)
         if b64:
-            return json.dumps({"status": "ok", "page": page_number, "image_base64": b64,
-                    "note": "Render the image to confirm the page looks correct before tracing."})
-        return json.dumps({"error": "Could not render page"})
+            return {"status": "ok", "page": page_number, "image_base64": b64,
+                    "note": "Render the image to confirm the page looks correct before tracing."}
+        return {"error": "Could not render page"}
     except ImportError as e:
-        return json.dumps({"error": str(e)})
+        return {"error": str(e)}
 
 
-@mcp.tool()
+@mcp.tool(name="trace_pdf", annotations=WR)
 async def trace_pdf(
     pdf_path: str,
     page_number: int = 0,
@@ -1225,7 +1285,7 @@ async def trace_pdf(
     z_elevation: float = 0.0,
     merge_tolerance_px: float = 5.0,
     min_line_length_px: float = 10.0,
-) -> str:
+) -> dict:
     """Trace a PDF drawing page and import the geometry into Rhino as curves, arcs, polylines and text.
 
     Two-step process handled automatically:
@@ -1251,7 +1311,14 @@ async def trace_pdf(
     try:
         from rhino_architect.pdf_tracer import trace_pdf as _trace
     except ImportError as e:
-        return json.dumps({"error": f"pdf_tracer import failed: {e}. Run: pip install pymupdf opencv-python numpy"})
+        import sys as _sys
+        return {
+            "error": f"pdf_tracer import failed: {e}",
+            "fix": f"Install into the MCP server\'s Python environment:",
+            "command": f"{_sys.executable} -m pip install pymupdf opencv-python numpy",
+            "python_path": _sys.executable,
+            "note": "This is NOT your system Python or Codex Python — it\'s the MCP bridge\'s own venv."
+        }
 
     # Step 1: Extract geometry in Python
     trace_result = _trace(
@@ -1265,14 +1332,14 @@ async def trace_pdf(
     )
 
     if "error" in trace_result and not trace_result.get("elements"):
-        return json.dumps(trace_result)
+        return trace_result
 
     meta = trace_result.get("metadata", {})
     elements = trace_result.get("elements", [])
 
     if not elements:
-        return json.dumps({"status": "ok", "message": "No geometry detected in this page.",
-                           "metadata": meta})
+        return {"status": "ok", "message": "No geometry detected in this page.",
+                           "metadata": meta}
 
     # Step 2: Send to Rhino C# to create objects
     payload = {
@@ -1285,57 +1352,57 @@ async def trace_pdf(
     }
     rhino_result = await _exec_simple("apply_traced_elements", payload)
 
-    return json.dumps({
+    return {
         "status": "ok",
         "trace_metadata": meta,
         "rhino_result": rhino_result,
         "note": f"Elements on REVIEW layer need manual inspection. Open layer panel to check '{layer_prefix}::REVIEW'.",
-    }, default=str)
+    }
 
 
-@mcp.tool()
-async def clear_trace_layers(layer_prefix: str = "Traced") -> str:
+@mcp.tool(name="clear_trace_layers", annotations=DE)
+async def clear_trace_layers(layer_prefix: str = "Traced") -> dict:
     """Delete all objects and layers created by a previous trace_pdf call.
 
     Args:
         layer_prefix: The prefix used when the layers were created (default "Traced").
     """
-    return json.dumps(await _exec_simple("clear_trace_layers", {"layer_prefix": layer_prefix}))
+    return await _exec_simple("clear_trace_layers", {"layer_prefix": layer_prefix})
 
 
-@mcp.tool()
-async def get_trace_layers(layer_prefix: str = "Traced") -> str:
+@mcp.tool(name="get_trace_layers", annotations=RO)
+async def get_trace_layers(layer_prefix: str = "Traced") -> dict:
     """List all trace layers and their object counts.
 
     Args:
         layer_prefix: Layer prefix to search for (default "Traced").
     """
-    return json.dumps(await _exec_simple("get_trace_layers", {"layer_prefix": layer_prefix}))
+    return await _exec_simple("get_trace_layers", {"layer_prefix": layer_prefix})
 
 
 # =============================================================================
 # DESIGN MEMORY TOOLS
 # =============================================================================
 
-@mcp.tool()
-async def set_design_brief(brief: str) -> str:
+@mcp.tool(name="set_design_brief", annotations=WR)
+async def set_design_brief(brief: str) -> dict:
     """Store the project design brief inside the Rhino file (.3dm UserData).
 
     Call this at the start of any significant design session. The brief persists
     in the .3dm file and survives save/reload. Include: building type, program,
     key constraints, structural approach, client requirements.
     """
-    return json.dumps(await _exec_simple("set_design_brief", {"brief": brief}))
+    return await _exec_simple("set_design_brief", {"brief": brief})
 
 
-@mcp.tool()
-async def get_design_brief() -> str:
+@mcp.tool(name="get_design_brief", annotations=RO)
+async def get_design_brief() -> dict:
     """Retrieve the project design brief and global design rules stored in the Rhino file."""
-    return json.dumps(await _exec_simple("get_design_brief", {}))
+    return await _exec_simple("get_design_brief", {})
 
 
-@mcp.tool()
-async def tag_object(ids: list[str], tags: dict) -> str:
+@mcp.tool(name="tag_object", annotations=WR)
+async def tag_object(ids: list[str], tags: dict) -> dict:
     """Write metadata tags to one or more Rhino objects (stored in UserDictionary, persists in .3dm).
 
     Useful tag keys:
@@ -1344,65 +1411,65 @@ async def tag_object(ids: list[str], tags: dict) -> str:
       ai_label    -- human-readable label
       ai_relations -- JSON string: {"children": ["id1", "id2"], "parent": "id0"}
     """
-    return json.dumps(await _exec_simple("tag_object", {"ids": ids, "tags": tags}))
+    return await _exec_simple("tag_object", {"ids": ids, "tags": tags})
 
 
-@mcp.tool()
-async def get_provenance(id: str) -> str:
+@mcp.tool(name="get_provenance", annotations=RO)
+async def get_provenance(id: str) -> dict:
     """Get the full creation context (provenance) for a Rhino object.
 
     Returns: which tool created it, with what parameters, in which session.
     Answers: 'why does this object exist?' and 'how was it created?'
     All AI-created objects are auto-tagged at creation time.
     """
-    return json.dumps(await _exec_simple("get_provenance", {"id": id}))
+    return await _exec_simple("get_provenance", {"id": id})
 
 
-@mcp.tool()
-async def search_memory(query: str) -> str:
+@mcp.tool(name="search_memory", annotations=RO)
+async def search_memory(query: str) -> dict:
     """Search the design memory for objects, rules, groups, and sessions matching a keyword.
 
     Searches across: design brief, session logs, named groups, and all object tags.
     Returns matching results with source and context (max 50 hits).
     Example queries: 'tower core', 'concrete 300mm', 'facade A', 'level 3 columns'.
     """
-    return json.dumps(await _exec_simple("search_memory", {"query": query}))
+    return await _exec_simple("search_memory", {"query": query})
 
 
-@mcp.tool()
-async def get_related_objects(id: str, relation: str = "") -> str:
+@mcp.tool(name="get_related_objects", annotations=RO)
+async def get_related_objects(id: str, relation: str = "") -> dict:
     """Get objects related to a given object via stored ai_relations tags.
 
     relation: 'parent', 'children', 'mirrors', 'group', or '' for all relations.
     Example: get all windows that belong to a specific facade wall.
     """
-    return json.dumps(await _exec_simple("get_related_objects", {"id": id, "relation": relation}))
+    return await _exec_simple("get_related_objects", {"id": id, "relation": relation})
 
 
-@mcp.tool()
-async def name_group(name: str, ids: list[str]) -> str:
+@mcp.tool(name="name_group", annotations=WR)
+async def name_group(name: str, ids: list[str]) -> dict:
     """Create or update a named group of objects stored in the Rhino file.
 
     Named groups persist in the .3dm file. Use to label sets of objects:
     'tower_core', 'north_facade', 'level_3_columns'. Retrieve with get_group.
     """
-    return json.dumps(await _exec_simple("name_group", {"name": name, "ids": ids}))
+    return await _exec_simple("name_group", {"name": name, "ids": ids})
 
 
-@mcp.tool()
-async def get_group(name: str) -> str:
+@mcp.tool(name="get_group", annotations=RO)
+async def get_group(name: str) -> dict:
     """Get the object IDs belonging to a named group stored in the Rhino file."""
-    return json.dumps(await _exec_simple("get_group", {"name": name}))
+    return await _exec_simple("get_group", {"name": name})
 
 
-@mcp.tool()
-async def get_all_groups() -> str:
+@mcp.tool(name="get_all_groups", annotations=RO)
+async def get_all_groups() -> dict:
     """List all named groups and their member object IDs stored in the Rhino file."""
-    return json.dumps(await _exec_simple("get_all_groups", {}))
+    return await _exec_simple("get_all_groups", {})
 
 
-@mcp.tool()
-async def add_design_rule(rule: str) -> str:
+@mcp.tool(name="add_design_rule", annotations=WR)
+async def add_design_rule(rule: str) -> dict:
     """Add a global design rule to the project memory (persists in .3dm file).
 
     Rules guide future generation decisions. Examples:
@@ -1411,25 +1478,25 @@ async def add_design_rule(rule: str) -> str:
       'floor-to-floor height 3500mm'
       'no windows below 900mm sill height'
     """
-    return json.dumps(await _exec_simple("add_design_rule", {"rule": rule}))
+    return await _exec_simple("add_design_rule", {"rule": rule})
 
 
-@mcp.tool()
-async def log_session(summary: str) -> str:
+@mcp.tool(name="log_session", annotations=WR)
+async def log_session(summary: str) -> dict:
     """Log a summary of the current AI session to the project memory (persists in .3dm).
 
     Call at the end of a work session with a brief description of what was done.
     Logs persist in the .3dm file and provide context for future sessions.
     """
-    return json.dumps(await _exec_simple("log_session", {"summary": summary}))
+    return await _exec_simple("log_session", {"summary": summary})
 
 
 # =============================================================================
 # INCREMENTAL SCENE SYNC TOOLS
 # =============================================================================
 
-@mcp.tool()
-async def get_scene_diff(from_version: int) -> str:
+@mcp.tool(name="get_scene_diff", annotations=RO)
+async def get_scene_diff(from_version: int) -> dict:
     """Get what changed in the Rhino scene since a specific version number.
 
     Returns arrays of added, deleted, and modified object refs.
@@ -1439,38 +1506,38 @@ async def get_scene_diff(from_version: int) -> str:
     WHEN TO USE: much faster than get_scene_summary on large models --
     only returns what changed, not everything.
     """
-    return json.dumps(await _exec_simple("get_scene_diff", {"from_version": from_version}))
+    return await _exec_simple("get_scene_diff", {"from_version": from_version})
 
 
-@mcp.tool()
-async def get_change_log(limit: int = 50, since_version: int = 0) -> str:
+@mcp.tool(name="get_change_log", annotations=RO)
+async def get_change_log(limit: int = 50, since_version: int = 0) -> dict:
     """Get the chronological log of recent scene change events.
 
     Returns change events (added/deleted/modified) with timestamps and version numbers.
     Useful for understanding the sequence of recent edits or auditing a session.
     Max limit: 200 events.
     """
-    return json.dumps(await _exec_simple("get_change_log", {
+    return await _exec_simple("get_change_log", {
         "limit": limit, "since_version": since_version
-    }))
+    })
 
 
-@mcp.tool()
-async def get_tracker_version() -> str:
+@mcp.tool(name="get_tracker_version", annotations=RO)
+async def get_tracker_version() -> dict:
     """Get the current change tracker version number.
 
     Workflow: store this version, do work or wait for user edits,
     then call get_scene_diff(from_version=stored_version) to see what changed.
     """
-    return json.dumps(await _exec_simple("get_tracker_version", {}))
+    return await _exec_simple("get_tracker_version", {})
 
 
 # =============================================================================
 # SEMANTIC SCENE INTELLIGENCE TOOLS
 # =============================================================================
 
-@mcp.tool()
-async def analyze_architecture() -> str:
+@mcp.tool(name="analyze_architecture", annotations=RO)
+async def analyze_architecture() -> dict:
     """Run a full semantic analysis of the Rhino scene.
 
     Classifies all geometry into architectural types: walls, slabs, columns,
@@ -1484,11 +1551,11 @@ async def analyze_architecture() -> str:
     Result is CACHED against scene_version -- calling twice costs almost nothing
     if the scene has not changed. Force refresh by modifying the scene.
     """
-    return json.dumps(await _exec_simple("analyze_architecture", {}))
+    return await _exec_simple("analyze_architecture", {})
 
 
-@mcp.tool()
-async def get_building_systems(system: str = "all") -> str:
+@mcp.tool(name="get_building_systems", annotations=RO)
+async def get_building_systems(system: str = "all") -> dict:
     """Get objects grouped by architectural building system.
 
     system options:
@@ -1501,11 +1568,11 @@ async def get_building_systems(system: str = "all") -> str:
     Each object includes: id, level index, layer, bounding box size [dx, dy, dz] in mm.
     Call analyze_architecture first for an overview, then drill into systems.
     """
-    return json.dumps(await _exec_simple("get_building_systems", {"system": system}))
+    return await _exec_simple("get_building_systems", {"system": system})
 
 
-@mcp.tool()
-async def get_level_summary(level: int = -1) -> str:
+@mcp.tool(name="get_level_summary", annotations=RO)
+async def get_level_summary(level: int = -1) -> dict:
     """Get a summary of one or all detected floor levels in the model.
 
     level: floor index (0 = ground floor), or -1 for all levels (default).
@@ -1513,11 +1580,11 @@ async def get_level_summary(level: int = -1) -> str:
     Levels are auto-detected by clustering the Z-positions of flat geometry.
     """
     params = {"level": level} if level >= 0 else {}
-    return json.dumps(await _exec_simple("get_level_summary", params))
+    return await _exec_simple("get_level_summary", params)
 
 
-@mcp.tool()
-async def detect_design_patterns() -> str:
+@mcp.tool(name="detect_design_patterns", annotations=RO)
+async def detect_design_patterns() -> dict:
     """Detect repeating design patterns in the Rhino model.
 
     Finds:
@@ -1528,11 +1595,11 @@ async def detect_design_patterns() -> str:
     Use before adding new elements to understand the existing design logic
     (bay spacing, grid, typical element sizes) so you can match them.
     """
-    return json.dumps(await _exec_simple("detect_design_patterns", {}))
+    return await _exec_simple("detect_design_patterns", {})
 
 
-@mcp.tool()
-async def find_unassigned_geometry(min_volume: float = 0.0) -> str:
+@mcp.tool(name="find_unassigned_geometry", annotations=RO)
+async def find_unassigned_geometry(min_volume: float = 0.0) -> dict:
     """Find geometry that couldn't be classified into any architectural system.
 
     min_volume: minimum bounding box volume in mm^3 to filter tiny objects (default: 0 = all).
@@ -1541,21 +1608,20 @@ async def find_unassigned_geometry(min_volume: float = 0.0) -> str:
     Use to review orphaned geometry, decide what to do with it (tag it,
     assign to a layer, delete it, or reclassify it).
     """
-    return json.dumps(await _exec_simple("find_unassigned_geometry", {"min_volume": min_volume}))
-
+    return await _exec_simple("find_unassigned_geometry", {"min_volume": min_volume})
 
 
 # =============================================================================
 # SMART BATCHING -- PREVIEW
 # =============================================================================
 
-@mcp.tool()
-async def batch_preview(commands: list[dict]) -> str:
+@mcp.tool(name="batch_preview", annotations=RO)
+async def batch_preview(commands: list[dict]) -> dict:
     """Validate a batch plan without executing any commands (dry run, zero mutations).
 
     Checks each step:
       - Is it a known command?
-      - Are $N paths ($1.object_ids, $1.object_ids[0]) forward-reference-free?
+      - Are  paths (, .object_ids, .object_ids[0]) forward-reference-free?
       - Are there destructive commands that need extra care?
       - Which steps involve viewport captures (consider capture_at_end)?
 
@@ -1563,258 +1629,230 @@ async def batch_preview(commands: list[dict]) -> str:
     and all warnings. Completely safe to call at any time -- does NOT modify Rhino.
 
     WHEN TO USE: before any complex or destructive batch, especially those with
-    many $N chains or boolean operations.
+    many  chains or boolean operations.
     """
-    return json.dumps(await _exec_simple("batch_preview", {"commands": commands}))
-
+    return await _exec_simple("batch_preview", {"commands": commands})
 
 
 # =============================================================================
-# v4.7 NEW: Async Job System
+# v4.7.4: TIER 1 — ACCURACY & SPEED BOOSTERS
 # =============================================================================
 
-@mcp.tool(name="execute_script_async", annotations=WR)
-async def execute_script_async(params: ScriptInput) -> dict:
-    """Execute a Python script asynchronously in Rhino and return a job_id immediately.
+@mcp.tool(name="set_state", annotations=WR)
+async def set_state(key: str, value: Any = None) -> dict:
+    """Store a value in the session scratchpad for later retrieval.
 
-    Use this for long-running scripts (>5 s). Poll get_job_status until status=completed,
-    then call get_job_result to retrieve the output.
+    Use this to cache derived geometry data across calls — face centers, grid
+    points, reference coordinates, computed values. Avoids re-deriving the same
+    data in every execute_script call.
+
+    key: unique name (e.g. "iwan_face_centers", "plinth_corners")
+    value: any JSON-serializable data (number, string, array, object)
+
+    Example flow:
+        set_state(key="dome_center", value=[0, 0, 15000])
+        ... later ...
+        get_state(key="dome_center") → {"value": [0, 0, 15000]}
     """
-    p = params.model_dump(exclude_none=True)
-    p["async_execution"] = True
-    return await _exec("execute_script", p)
+    return await _exec_simple("set_state", {"key": key, "value": value})
 
 
-@mcp.tool(annotations=RO)
-async def get_job_status(job_id: str) -> str:
-    """Check the status of an async job launched by execute_script_async.
+@mcp.tool(name="get_state", annotations=RO)
+async def get_state(key: str = "") -> dict:
+    """Retrieve a value from the session scratchpad.
 
-    Returns job_status: pending | running | completed | failed | cancelled.
+    key: the key to retrieve. If empty/omitted, returns a listing of all stored keys
+         with type info and value previews.
     """
-    return json.dumps(await _exec_simple("get_job_status", {"job_id": job_id}))
+    params = {}
+    if key:
+        params["key"] = key
+    return await _exec_simple("get_state", params)
 
 
-@mcp.tool(annotations=RO)
-async def get_job_result(job_id: str) -> str:
-    """Retrieve the result of a completed async job.
+@mcp.tool(name="clear_state", annotations=WR)
+async def clear_state(key: str = "") -> dict:
+    """Remove one or all keys from the session scratchpad.
 
-    Returns the same payload execute_script would have returned synchronously,
-    plus job_id. If the job is still running, returns status=pending.
+    key: specific key to remove. If empty, clears ALL stored state.
     """
-    return json.dumps(await _exec_simple("get_job_result", {"job_id": job_id}))
+    params = {}
+    if key:
+        params["key"] = key
+    return await _exec_simple("clear_state", params)
 
 
-@mcp.tool(annotations=WI)
-async def cancel_job(job_id: str) -> str:
-    """Request cancellation of a pending or running async job."""
-    return json.dumps(await _exec_simple("cancel_job", {"job_id": job_id}))
+class SetPbrMaterialInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    layer: str = Field(description="Layer to assign the material to (created if missing)")
+    base_color: Any = Field(default=None, description="RGB array [r,g,b] (0-255) or hex string '#rrggbb'. Default: light gray")
+    roughness: float = Field(default=0.5, description="Surface roughness 0.0 (mirror) to 1.0 (matte)")
+    metallic: float = Field(default=0.0, description="Metalness 0.0 (dielectric) to 1.0 (metal)")
+    opacity: float = Field(default=1.0, description="Opacity 0.0 (transparent) to 1.0 (opaque)")
+    name: str = Field(default="", description="Material name. Default: PBR_{layer}")
 
 
-@mcp.tool(annotations=RO)
-async def list_jobs() -> str:
-    """List all tracked async jobs and their current statuses."""
-    return json.dumps(await _exec_simple("list_jobs", {}))
+@mcp.tool(name="set_pbr_material", annotations=WR)
+async def set_pbr_material(params: SetPbrMaterialInput) -> dict:
+    """Create a PBR material and assign it to a layer in one call.
 
+    Replaces the ~12-line boilerplate of CreateBasicMaterial → SimulatedMaterial
+    → ToPhysicallyBased → set properties → Add → assign. One call does it all.
 
-# =============================================================================
-# v4.7 NEW: Named Views
-# =============================================================================
-
-@mcp.tool(annotations=WI)
-async def create_named_view(name: str) -> str:
-    """Save the current viewport state as a named view.
-
-    Named views capture camera position, target, and projection so you can
-    return to them precisely later via restore_named_view.
+    Common presets:
+        White marble:   base_color=[240,235,230], roughness=0.3, metallic=0.0
+        Sandstone:      base_color=[194,178,128], roughness=0.8, metallic=0.0
+        Polished metal: base_color=[180,180,190], roughness=0.1, metallic=0.9
+        Glass:          base_color=[200,220,255], roughness=0.05, metallic=0.0, opacity=0.3
+        Concrete:       base_color=[170,170,170], roughness=0.9, metallic=0.0
+        Dark wood:      base_color=[101,67,33],   roughness=0.6, metallic=0.0
+        Red brick:      base_color=[178,34,34],   roughness=0.85, metallic=0.0
+        Gold leaf:      base_color=[255,215,0],   roughness=0.2, metallic=1.0
     """
-    return json.dumps(await _exec_simple("create_named_view", {"name": name}))
+    return await _exec_simple("set_pbr_material", params.model_dump(exclude_none=True))
 
 
-@mcp.tool(annotations=RO)
-async def get_named_views() -> str:
-    """List all saved named views in the document."""
-    return json.dumps(await _exec_simple("get_named_views", {}))
+class RevolveProfileInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    points: list[list[float]] = Field(description="Profile points as [[x,y,z], ...]. Min 2 points. The profile is revolved around the axis.")
+    axis_start: list[float] = Field(description="Axis start point [x,y,z]")
+    axis_end: list[float] = Field(description="Axis end point [x,y,z]")
+    angle_degrees: float = Field(default=360.0, description="Sweep angle in degrees (360 = full revolution)")
+    cap: bool = Field(default=True, description="Cap the ends to create a closed solid")
+    layer: str = Field(default="", description="Target layer (created if missing)")
+    curve_degree: int = Field(default=3, description="Profile curve degree: 1=polyline, 3=smooth cubic")
 
 
-@mcp.tool(annotations=WI)
-async def restore_named_view(name: str) -> str:
-    """Restore the viewport to a previously saved named view."""
-    return json.dumps(await _exec_simple("restore_named_view", {"name": name}))
+@mcp.tool(name="revolve_profile", annotations=WR)
+async def revolve_profile(params: RevolveProfileInput) -> dict:
+    """Revolve a 2D profile around an axis to create a solid of revolution.
 
+    Covers domes, minarets, columns, finials, vases, balusters, chhatri caps,
+    and any lathe-turned architectural element.
 
-# =============================================================================
-# v4.7 NEW: Lighting
-# =============================================================================
+    The profile points define the cross-section. The axis defines what the
+    profile rotates around. Points should be in the plane containing the axis.
 
-@mcp.tool(annotations=WR)
-async def create_directional_light(
-    direction_x: float = -1.0,
-    direction_y: float = -1.0,
-    direction_z: float = -2.0,
-    intensity: float = 1.0,
-    name: str = "AI_Light",
-    layer: str = "",
-) -> str:
-    """Add a directional light to the scene.
-
-    Directional lights simulate distant sources like the sun — all rays are
-    parallel in the given direction. Adjust direction_x/y/z to position the
-    light; intensity 1.0 = full brightness.
+    Example — onion dome:
+        revolve_profile(
+            points=[[0,0,0], [3000,0,2000], [2000,0,6000], [500,0,8000], [0,0,8500]],
+            axis_start=[0,0,0], axis_end=[0,0,8500],
+            layer="Dome")
     """
-    return json.dumps(await _exec_simple("create_directional_light", {
-        "direction_x": direction_x, "direction_y": direction_y,
-        "direction_z": direction_z, "intensity": intensity,
-        "name": name, "layer": layer,
-    }))
+    return await _exec_simple("revolve_profile", params.model_dump(exclude_none=True))
 
 
-# =============================================================================
-# v4.7 NEW: File ops
-# =============================================================================
+class LayerEntry(BaseModel):
+    path: str = Field(description="Layer path using :: separator (e.g. 'Building::Walls::Exterior')")
+    color: list[int] = Field(default=None, description="RGB color [r,g,b] for the leaf layer")
+    visible: bool = Field(default=None, description="Layer visibility")
+    material: dict = Field(default=None, description="PBR material dict: {base_color, roughness, metallic, opacity}")
 
-@mcp.tool(annotations=WI)
-async def save_file(path: str = "") -> str:
-    """Save the current Rhino document.
 
-    If path is empty, overwrites the file at its current location.
-    If path is provided, saves a copy to that path (must be a .3dm path).
+@mcp.tool(name="create_layer_tree", annotations=WR)
+async def create_layer_tree(layers: list[dict]) -> dict:
+    """Create an entire layer hierarchy in one call.
+
+    Each entry specifies a full path (Parent::Child::Grandchild), optional color,
+    visibility, and PBR material. Intermediate layers are created automatically.
+    Existing layers are reused (not duplicated).
+
+    Example — typical building setup:
+        create_layer_tree(layers=[
+            {"path": "Site::Ground",      "color": [80,140,80]},
+            {"path": "Building::Walls",   "color": [180,60,60],  "material": {"base_color": [240,235,230], "roughness": 0.3}},
+            {"path": "Building::Slabs",   "color": [100,100,180]},
+            {"path": "Building::Columns", "color": [60,150,60]},
+            {"path": "Building::Roof",    "color": [140,80,140]},
+            {"path": "Landscape::Trees",  "color": [40,120,40]},
+        ])
+
+    Replaces 30+ individual create_layer calls at project startup.
     """
-    return json.dumps(await _exec_simple("save_file", {"path": path}))
+    return await _exec_simple("create_layer_tree", {"layers": layers})
 
 
-# =============================================================================
-# v4.7 NEW: Purge
-# =============================================================================
+@mcp.tool(name="thumbnail", annotations=RO)
+async def thumbnail(
+    width: int = 240,
+    height: int = 180,
+    quality: int = 60,
+    wireframe: bool = True,
+) -> dict:
+    """Capture a fast, cheap viewport thumbnail. Returns base64 JPEG.
 
-@mcp.tool(annotations=WI)
-async def purge_unused_layers(dry_run: bool = False) -> str:
-    """Delete all layers that contain no objects.
+    Unlike capture_viewport, this ALWAYS forces wireframe display mode so it
+    completes in <1 second regardless of scene complexity. Use it for quick
+    sanity checks between modeling steps — catching placement errors early
+    is worth far more than a pretty render.
 
-    Set dry_run=true to preview which layers would be removed without
-    actually deleting them.
+    Returns image_base64, camera info, and visible object count.
+    Call this after every major modeling step to verify geometry placement.
     """
-    return json.dumps(await _exec_simple("purge_unused_layers", {"dry_run": dry_run}))
-
-
-@mcp.tool(annotations=WI)
-async def purge_unused_materials(dry_run: bool = False) -> str:
-    """Delete all materials not referenced by any layer or object.
-
-    Set dry_run=true to preview without deleting.
-    """
-    return json.dumps(await _exec_simple("purge_unused_materials", {"dry_run": dry_run}))
-
-
-@mcp.tool(annotations=WR)
-async def delete_objects_by_type(
-    object_type: str,
-    layer: str = "",
-    dry_run: bool = False,
-) -> str:
-    """Delete all objects of a given type, optionally restricted to one layer.
-
-    object_type: brep | curve | mesh | point | text | instance | light
-    layer: if set, only delete objects on that layer.
-    dry_run: preview without deleting.
-    """
-    return json.dumps(await _exec_simple("delete_objects_by_type", {
-        "object_type": object_type, "layer": layer, "dry_run": dry_run,
-    }))
-
-
-# =============================================================================
-# v4.7 NEW: Annotation & Geometry helpers
-# =============================================================================
-
-@mcp.tool(annotations=WR)
-async def create_text_dot(
-    text: str,
-    x: float, y: float, z: float = 0.0,
-    font_height: float = 14.0,
-    layer: str = "",
-) -> str:
-    """Place a text dot (screen-space label) at a 3-D point.
-
-    Text dots always face the camera and are great for labelling rooms,
-    dimensions, or reference points in a drawing.
-    """
-    return json.dumps(await _exec_simple("create_text_dot", {
-        "text": text, "x": x, "y": y, "z": z,
-        "font_height": font_height, "layer": layer,
-    }))
-
-
-@mcp.tool(annotations=WR)
-async def create_truncated_cone(
-    base_x: float = 0.0, base_y: float = 0.0, base_z: float = 0.0,
-    height: float = 3000.0,
-    bottom_radius: float = 500.0,
-    top_radius: float = 300.0,
-    layer: str = "",
-    measure: bool = False,
-) -> str:
-    """Create a truncated cone (frustum / tapered cylinder).
-
-    Useful for columns with taper, cooling towers, grain silos, or any
-    rotationally-symmetric form that is wider at the base than the top.
-    All dimensions in model units.
-    """
-    return json.dumps(await _exec_simple("create_truncated_cone", {
-        "base_x": base_x, "base_y": base_y, "base_z": base_z,
-        "height": height, "bottom_radius": bottom_radius, "top_radius": top_radius,
-        "layer": layer, "measure": measure,
-    }))
+    return await _exec_simple("thumbnail", {
+        "width": width, "height": height,
+        "quality": quality, "wireframe": wireframe,
+    })
 
 
 # =============================================================================
-# v4.7 NEW: Blocks
+# v4.7.4: TIER 2 — WORKFLOW FEATURES
 # =============================================================================
 
-@mcp.tool(annotations=WR)
-async def create_block(
-    name: str,
-    object_ids: list[str],
-    base_x: float = 0.0, base_y: float = 0.0, base_z: float = 0.0,
-    description: str = "",
-    delete_source: bool = False,
-) -> str:
-    """Define a new block (instance definition) from existing objects.
+@mcp.tool(name="export_objects", annotations=RO)
+async def export_objects(
+    format: str = "stl",
+    path: str = "",
+    object_ids: list[str] = None,
+) -> dict:
+    """Export geometry to a file. Supports STL, OBJ, STEP, IGES, 3DM.
 
-    After creation, insert it with insert_block. Blocks reduce file size
-    when the same geometry is repeated many times (columns, windows, furniture).
-
-    object_ids: GUIDs of the objects to include in the block definition.
-    base_x/y/z: the base point / insertion origin of the block.
-    delete_source: if true, removes the original objects after defining the block.
+    format: output format (stl, obj, step, iges, 3dm)
+    path: output file path. If empty, saves to temp directory.
+    object_ids: specific objects to export. If empty, exports all visible geometry.
     """
-    return json.dumps(await _exec_simple("create_block", {
-        "name": name, "object_ids": object_ids,
-        "base_x": base_x, "base_y": base_y, "base_z": base_z,
-        "description": description, "delete_source": delete_source,
-    }))
+    params = {"format": format}
+    if path:
+        params["path"] = path
+    if object_ids:
+        params["object_ids"] = object_ids
+    return await _exec_simple("export_objects", params)
 
 
-@mcp.tool(annotations=WR)
-async def insert_block(
-    name: str,
-    x: float = 0.0, y: float = 1.0, z: float = 0.0,
-    scale_x: float = 1.0, scale_y: float = 1.0, scale_z: float = 1.0,
-    rotation_deg: float = 0.0,
-    layer: str = "",
-) -> str:
-    """Insert an instance of a block definition into the scene.
+@mcp.tool(name="save_checkpoint", annotations=WR)
+async def save_checkpoint(name: str) -> dict:
+    """Save the current model state as a named checkpoint.
 
-    name: must match an existing block definition (created with create_block
-          or already present in the document).
-    x/y/z: insertion point in model coordinates.
-    scale_x/y/z: non-uniform scaling per axis (1.0 = no scale).
-    rotation_deg: rotation around Z axis in degrees.
+    Use before risky operations (complex booleans, major redesigns) so you
+    can restore_checkpoint if things go wrong. Much faster than manual undo
+    through dozens of steps.
+
+    name: descriptive name like "before_roof", "clean_massing", "final_columns"
     """
-    return json.dumps(await _exec_simple("insert_block", {
-        "name": name, "x": x, "y": y, "z": z,
-        "scale_x": scale_x, "scale_y": scale_y, "scale_z": scale_z,
-        "rotation_deg": rotation_deg, "layer": layer,
-    }))
+    return await _exec_simple("save_checkpoint", {"name": name})
+
+
+@mcp.tool(name="restore_checkpoint", annotations=WR)
+async def restore_checkpoint(name: str) -> dict:
+    """Restore the model to a previously saved checkpoint.
+
+    WARNING: This replaces all current geometry with the checkpoint state.
+    Save a new checkpoint first if you want to preserve current work.
+
+    name: checkpoint name (from save_checkpoint)
+    """
+    return await _exec_simple("restore_checkpoint", {"name": name})
+
+
+@mcp.tool(name="list_checkpoints", annotations=RO)
+async def list_checkpoints() -> dict:
+    """List all saved design checkpoints with size and timestamp."""
+    return await _exec_simple("list_checkpoints", {})
+
+
+# =============================================================================
+# ENTRY POINT
+# =============================================================================
 
 def main():
     """Entry point for the rhino-architect MCP server."""

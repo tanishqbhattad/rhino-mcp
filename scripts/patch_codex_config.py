@@ -1,8 +1,8 @@
-"""
+﻿"""
 RhinoAIBridge — Codex config patcher
 by tanishqb (https://github.com/tanishqbhattad/rhino-mcp)
 
-Writes the rhino_architect MCP entry to %USERPROFILE%\\.codex\\config.toml
+Writes the rhino_architect MCP entry to %USERPROFILE%\.codex\config.toml
 so that OpenAI Codex picks up the server automatically.
 
 Usage: python patch_codex_config.py <server_directory>
@@ -30,7 +30,7 @@ def _build_entry(server_dir: str, safe_mode: bool = True) -> str:
         'command = "uv"\n'
         'args = [\n'
         '  "--directory",\n'
-        f'  "{sd}",\n'
+        '  "' + sd + '",\n'
         '  "run",\n'
         '  "rhino-architect"\n'
         ']\n'
@@ -41,17 +41,22 @@ def _build_entry(server_dir: str, safe_mode: bool = True) -> str:
         '[mcp_servers.rhino_architect.env]\n'
         'RHINO_HOST = "127.0.0.1"\n'
         'RHINO_PORT = "9544"\n'
-        f'RHINO_SAFE_MODE = "{safe}"\n'
+        'RHINO_SAFE_MODE = "' + safe + '"\n'
     )
 
 
 def _remove_existing_entry(content: str) -> str:
-    """Strip any existing [mcp_servers.rhino_architect] section from TOML content."""
-    # Remove the section and everything under it until the next top-level section
+    """Strip any existing [mcp_servers.rhino_architect*] sections from TOML content.
+
+    The old regex used [^\\[]* which broke on TOML array literals like
+    args = ["--directory", ...] because it treated the '[' in the value as
+    a section header.  The fix: match until the next line that starts with
+    '[' (a real section header) instead of stopping at any '[' character.
+    """
     pattern = re.compile(
-        r'\n?\[mcp_servers\.rhino_architect\][^\[]*'
-        r'(\[mcp_servers\.rhino_architect\.env\][^\[]*)?',
-        re.DOTALL,
+        r'\n?\[mcp_servers\.rhino_architect(?:\.env)?\]'
+        r'(?:\n(?!\[).*)*',
+        re.MULTILINE,
     )
     return pattern.sub('', content)
 
@@ -67,10 +72,8 @@ def main():
     codex_dir = os.path.join(os.environ.get("USERPROFILE", os.path.expanduser("~")), ".codex")
     config_path = os.path.join(codex_dir, "config.toml")
 
-    # ── Ensure ~/.codex/ exists ───────────────────────────────────────────────
     os.makedirs(codex_dir, exist_ok=True)
 
-    # ── Read existing config (if any) ─────────────────────────────────────────
     if os.path.exists(config_path):
         backup = config_path + f".backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         shutil.copy2(config_path, backup)
@@ -80,10 +83,7 @@ def main():
     else:
         content = ""
 
-    # ── Remove old rhino_architect entry ──────────────────────────────────────
     content = _remove_existing_entry(content)
-
-    # ── Append new entry ──────────────────────────────────────────────────────
     content = content.rstrip() + "\n" + _build_entry(server_dir, safe_mode)
 
     with open(config_path, "w", encoding="utf-8") as f:

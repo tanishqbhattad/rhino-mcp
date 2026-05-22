@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    RhinoAIBridge healthcheck — verifies every layer of the stack is alive.
+    RhinoAIBridge healthcheck - verifies every layer of the stack is alive.
 
 .DESCRIPTION
     Checks:
@@ -94,7 +94,7 @@ if ($portTest.TcpTestSucceeded) {
         try {
             $json = $resp | ConvertFrom-Json
             if ($json.status -eq "ok") {
-                OK "Ping OK — build: $($json.build_hash)  protocol: $($json.protocol_version)"
+                OK "Ping OK - build: $($json.build_hash)  protocol: $($json.protocol_version)"
             } else {
                 FAIL "Ping returned non-ok status: $resp"
             }
@@ -102,7 +102,7 @@ if ($portTest.TcpTestSucceeded) {
             FAIL "Ping response not valid JSON: $resp"
         }
     } else {
-        FAIL "No response to ping (server may be starting — retry in a few seconds)"
+        FAIL "No response to ping (server may be starting - retry in a few seconds)"
     }
 } else {
     WARN "Skipping ping (port not open)"
@@ -117,7 +117,7 @@ if ($resp) {
         if ($ver -match "^4\.") {
             OK "Protocol v$ver (compatible)"
         } elseif ($ver) {
-            WARN "Protocol v$ver — expected 4.x. You may need to rebuild the plugin."
+            WARN "Protocol v$ver - expected 4.x. You may need to rebuild the plugin."
         } else {
             WARN "Protocol version not reported"
         }
@@ -133,7 +133,7 @@ $pyProcs = Get-Process -Name "python*","uv" -ErrorAction SilentlyContinue |
 if ($pyProcs) {
     OK "MCP server process found (PID $($pyProcs[0].Id))"
 } else {
-    # Not a fatal failure — server may be running as a child of Claude
+    # Not a fatal failure - server may be running as a child of Claude
     WARN "No standalone MCP server process detected (normal if Claude Desktop is managing it)"
 }
 
@@ -155,7 +155,7 @@ if (Test-Path $serverDir) {
             FAIL "Python entry point check failed: $check"
         }
     } else {
-        WARN "'uv' not in PATH — cannot check venv"
+        WARN "'uv' not in PATH - cannot check venv"
     }
 } else {
     WARN "Server directory not found: $serverDir"
@@ -166,7 +166,7 @@ Banner "Summary"
 if ($script:failures -eq 0) {
     Write-Host "`n  All checks passed. RhinoAIBridge is healthy." -ForegroundColor Green
 } else {
-    Write-Host "`n  $($script:failures) check(s) failed — see [X] items above." -ForegroundColor Red
+    Write-Host "`n  $($script:failures) check(s) failed - see [X] items above." -ForegroundColor Red
     Write-Host "  Quick fixes:" -ForegroundColor Yellow
     Write-Host "    - Open Rhino 8, type 'AIBridge' to start the server" -ForegroundColor Yellow
     Write-Host "    - Re-run: install\install-rhino-mcp.ps1 to repair config" -ForegroundColor Yellow

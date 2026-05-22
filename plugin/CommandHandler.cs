@@ -106,24 +106,6 @@ namespace RhinoAIBridge
                 // Intelligence (Tier 3)
                 ["validate_architecture"] = W(ValidateArch), ["suggest_tools"] = W(SuggestTools),
                 ["lint_script"] = W(LintScript), ["get_camera_target"] = W(GetCameraTarget),
-                // Semantic / Scene Analysis (Tier 3 — were missing from dispatch)
-                ["analyze_architecture"] = W(AnalyzeArchitectureCmd),
-                ["get_building_systems"] = W(GetBuildingSystemsCmd),
-                ["get_level_summary"] = W(GetLevelSummaryCmd),
-                ["detect_design_patterns"] = W(DetectDesignPatternsCmd),
-                ["find_unassigned_geometry"] = W(FindUnassignedCmd),
-                ["batch_preview"] = W(BatchPreviewCmd),
-                // Design Memory — group / tag / rule / brief / provenance / search (were missing)
-                ["name_group"] = W(NameGroupCmd), ["get_group"] = W(GetGroupCmd),
-                ["get_all_groups"] = W(GetAllGroupsCmd),
-                ["tag_object"] = W(TagObjectCmd),
-                ["get_provenance"] = W(GetProvenance), ["get_related_objects"] = W(GetRelatedObjects),
-                ["search_memory"] = W(SearchMemory),
-                ["add_design_rule"] = W(AddDesignRule), ["get_design_rules"] = W(GetDesignRules),
-                ["set_design_brief"] = W(SetDesignBrief), ["get_design_brief"] = W(GetDesignBrief),
-                // Change tracking / scene diff (were missing)
-                ["log_session"] = W(LogSessionCmd), ["get_change_log"] = W(GetChangeLogCmd),
-                ["get_scene_diff"] = W(GetSceneDiff), ["get_tracker_version"] = W(GetTrackerVersion),
                 // Script & Undo & Logs
                 ["execute_script"] = W(ExecuteScript), ["undo"] = W(DoUndo), ["redo"] = W(DoRedo),
                 ["get_log"] = W(GetLog), ["get_log_stats"] = W(GetLogStats),
@@ -144,57 +126,40 @@ namespace RhinoAIBridge
                 ["import_dwg"] = W(ImportDwgCmd), ["calibrate_scale"] = W(CalibrateScaleCmd),
                 ["apply_traced_elements"] = W(ApplyTracedElementsCmd),
                 ["get_trace_layers"] = W(GetTraceLayersCmd), ["clear_trace_layers"] = W(ClearTraceLayersCmd),
-                // v4.7 NEW: Async Job System
-                ["get_job_status"] = W(GetJobStatus), ["get_job_result"] = W(GetJobResult),
-                ["cancel_job"] = W(CancelJob), ["list_jobs"] = W(ListJobs),
-                // v4.7 NEW: Named Views
-                ["create_named_view"] = W(CreateNamedView), ["get_named_views"] = W(GetNamedViews),
-                ["restore_named_view"] = W(RestoreNamedView),
-                // v4.7 NEW: Lighting
-                ["create_directional_light"] = U("Light", CreateDirectionalLight),
-                // v4.7 NEW: File ops
-                ["save_file"] = W(SaveFile),
-                // v4.7 NEW: Purge
-                ["purge_unused_layers"] = U("PurgeLayers", PurgeUnusedLayers),
-                ["purge_unused_materials"] = U("PurgeMats", PurgeUnusedMaterials),
-                ["delete_objects_by_type"] = U("DelByType", DeleteObjectsByType),
-                // v4.7 NEW: Annotation & Geometry helpers
-                ["create_text_dot"] = U("TextDot", CreateTextDot),
-                ["create_truncated_cone"] = U("Cone", CreateTruncatedCone),
-                // v4.7 NEW: Blocks
-                ["create_block"] = U("Block", CreateBlock),
-                ["insert_block"] = U("InsertBlock", InsertBlock),
-                // NOTE: get_pdf_info, preview_pdf_page, trace_pdf, search_materials,
-                // download_material are handled entirely by the Python server (pdf_tracer.py /
-                // material_downloader.py) and do NOT need C# dispatch entries.
-            };
-        }
-
-        /// <summary>
-        /// Startup self-test: verify every dispatch entry has a non-null handler and
-        /// that the handler is callable. Returns a report suitable for the diag log.
-        /// Called once from AIBridgeServer.StartServer() before accepting connections.
-        /// </summary>
-        public JObject SelfTest()
-        {
-            var ok   = new JArray();
-            var fail = new JArray();
-            foreach (var kv in _commands)
-            {
-                if (kv.Value == null)
-                    fail.Add(kv.Key);
-                else
-                    ok.Add(kv.Key);
-            }
-            return new JObject
-            {
-                ["status"]         = fail.Count == 0 ? "ok" : "error",
-                ["commands_ok"]    = ok.Count,
-                ["commands_fail"]  = fail.Count,
-                ["failed_entries"] = fail,
-                ["message"]        = fail.Count == 0
-                    ? $"All {ok.Count} dispatch entries verified."
-                    : $"{fail.Count} null handler(s) found: {string.Join(", ", fail.Select(x => x.ToString()))}",
+                // v4.7.4: Tier 1 — accuracy + speed boosters
+                ["set_state"] = W(SetState), ["get_state"] = W(GetState), ["clear_state"] = W(ClearState),
+                ["set_pbr_material"] = W(SetPbrMaterial),
+                ["revolve_profile"] = U("Revolve", RevolveProfile),
+                ["create_layer_tree"] = W(CreateLayerTree),
+                ["thumbnail"] = W(Thumbnail),
+                // v4.7.4: Tier 2 — workflow features
+                ["export_objects"] = W(ExportObjects),
+                ["save_checkpoint"] = W(SaveCheckpoint), ["restore_checkpoint"] = U("Restore", RestoreCheckpoint),
+                ["list_checkpoints"] = W(ListCheckpoints),
+                // v4.7.5: Semantic intelligence (was missing from dispatch)
+                ["analyze_architecture"] = W(AnalyzeArchitectureCmd),
+                ["get_building_systems"] = W(GetBuildingSystemsCmd),
+                ["get_level_summary"] = W(GetLevelSummaryCmd),
+                ["detect_design_patterns"] = W(DetectDesignPatternsCmd),
+                ["find_unassigned_geometry"] = W(FindUnassignedCmd),
+                ["batch_preview"] = W(BatchPreviewCmd),
+                // v4.7.5: Design Memory (was missing from dispatch)
+                ["set_design_brief"] = W(SetDesignBrief),
+                ["get_design_brief"] = W(GetDesignBrief),
+                ["tag_object"] = W(TagObjectCmd),
+                ["get_provenance"] = W(GetProvenance),
+                ["search_memory"] = W(SearchMemory),
+                ["get_related_objects"] = W(GetRelatedObjects),
+                ["name_group"] = W(NameGroupCmd),
+                ["get_group"] = W(GetGroupCmd),
+                ["get_all_groups"] = W(GetAllGroupsCmd),
+                ["add_design_rule"] = W(AddDesignRule),
+                ["get_design_rules"] = W(GetDesignRules),
+                ["log_session"] = W(LogSessionCmd),
+                // v4.7.5: Incremental Scene Sync (was missing from dispatch)
+                ["get_scene_diff"] = W(GetSceneDiff),
+                ["get_change_log"] = W(GetChangeLogCmd),
+                ["get_tracker_version"] = W(GetTrackerVersion),
             };
         }
 
@@ -890,27 +855,22 @@ namespace RhinoAIBridge
         // Served from the snapshot (Phase 2), so all branches are O(1) or O(M).
         JObject QueryScene(JObject p)
         {
-            // force_refresh=true drops the cached snapshot and rebuilds immediately.
-            bool forceRefresh = p["force_refresh"]?.ToObject<bool>() ?? false;
-            if (forceRefresh) SceneSnapshotRegistry.ForceRebuild(Doc);
-
             var snap = Snap;
             string scope = (p["scope"]?.ToString() ?? "objects").ToLowerInvariant();
             string detail = (p["mode"]?.ToString() ?? p["detail"]?.ToString() ?? "summary").ToLowerInvariant();
             var f = p["filter"] as JObject ?? new JObject();
             int limit = p["limit"]?.ToObject<int>() ?? (detail == "full" ? 200 : 80);
 
-            // scope=summary -> full scene summary (the GetSceneSummary payload)
+            // scope=summary â†’ full scene summary (the GetSceneSummary payload)
             if (scope == "summary" || scope == "scene")
             {
                 var r = GetSceneSummary(p);
                 r["status"] = "ok";
-                r["cache"] = forceRefresh ? "force_refresh" : (snap != null ? "scene_snapshot" : "live_walk");
-                r["object_counts"] = BuildObjectCountBreakdown(snap);
+                r["cache"] = snap != null ? "scene_snapshot" : "live_walk";
                 return r;
             }
 
-            // scope=layers -> layer list with counts
+            // scope=layers â†’ layer list with counts
             if (scope == "layers")
             {
                 var r = ListLayers(p);
@@ -918,7 +878,7 @@ namespace RhinoAIBridge
                 return r;
             }
 
-            // scope=objects (default) -- apply filter and detail level
+            // scope=objects (default) â€” apply filter and detail level
             var lookupParams = new JObject();
             if (f["layer"] != null) lookupParams["layer"] = f["layer"];
             if (f["object_type"] != null || f["type"] != null) lookupParams["object_type"] = f["object_type"] ?? f["type"];
@@ -939,7 +899,11 @@ namespace RhinoAIBridge
                 }
                 objs = idArr;
             }
-            // detail="full" or "summary": pass through
+            else if (detail == "summary")
+            {
+                // Already lite; pass through.
+            }
+            // detail="full" returns whatever GetObjects gave us (currently lite â€” future: add geometry stats)
 
             var result = new JObject
             {
@@ -947,40 +911,9 @@ namespace RhinoAIBridge
                 ["objects"] = objs,
                 ["count"] = objs.Count,
                 ["matched"] = got["matched"] ?? got["count"],
-                ["object_counts"] = BuildObjectCountBreakdown(snap),
             };
             if (snap != null) result["scene_version"] = snap.SceneVersion;
-            if (forceRefresh) result["cache"] = "force_refresh";
             return result;
-        }
-
-        // Returns a breakdown of objects by visibility/role category.
-        static JObject BuildObjectCountBreakdown(SceneSnapshot snap)
-        {
-            if (snap == null)
-            {
-                var doc = RhinoDoc.ActiveDoc;
-                if (doc == null) return new JObject { ["total"] = 0 };
-                int vis = 0, hid = 0, ann = 0, lit = 0, blk = 0;
-                foreach (var o in doc.Objects)
-                {
-                    if (o == null || o.IsDeleted) continue;
-                    if (o.ObjectType == Rhino.DocObjects.ObjectType.Light) { lit++; continue; }
-                    if (o.ObjectType == Rhino.DocObjects.ObjectType.Annotation) { ann++; continue; }
-                    if (o.ObjectType == Rhino.DocObjects.ObjectType.InstanceReference) { blk++; continue; }
-                    if (!o.Visible) hid++; else vis++;
-                }
-                return new JObject { ["visible"]=vis, ["hidden"]=hid, ["annotation"]=ann, ["light"]=lit, ["block_instance"]=blk, ["total"]=vis+hid+ann+lit+blk };
-            }
-            int sVis=0, sHid=0, sAnn=0, sLit=0, sBlk=0;
-            foreach (var m in snap.All())
-            {
-                if (m.Type == Rhino.DocObjects.ObjectType.Light) { sLit++; continue; }
-                if (m.Type == Rhino.DocObjects.ObjectType.Annotation) { sAnn++; continue; }
-                if (m.Type == Rhino.DocObjects.ObjectType.InstanceReference) { sBlk++; continue; }
-                if (!m.Visible) sHid++; else sVis++;
-            }
-            return new JObject { ["visible"]=sVis, ["hidden"]=sHid, ["annotation"]=sAnn, ["light"]=sLit, ["block_instance"]=sBlk, ["total"]=sVis+sHid+sAnn+sLit+sBlk };
         }
 
         // create_massing â€” site footprint â†’ solid mass. The canonical first move.
@@ -2017,7 +1950,6 @@ namespace RhinoAIBridge
             bool restore = p["restore_state"]?.ToObject<bool>() ?? true;
             string viewOverride = p["view"]?.ToString();
             string modeOverride = p["display_mode"]?.ToString();
-            string saveToFile = p["save_to_file"]?.ToObject<bool>() == true ? p["output_path"]?.ToString() : null;
 
             var vp = Doc.Views.ActiveView?.ActiveViewport;
             if (vp == null) return Err("No active viewport");
@@ -2053,9 +1985,17 @@ namespace RhinoAIBridge
                 }
 
                 // â”€â”€ Capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                // Phase 7: Disable viewport redraw during capture to prevent
+                // Rhino from re-rendering the scene mid-capture on complex models.
+                // This is the #1 cause of set_camera / capture_viewport hangs.
                 Bitmap source;
-                try { source = Doc.Views.ActiveView.CaptureToBitmap(new Size(w, h)); }
+                try
+                {
+                    Doc.Views.RedrawEnabled = false;
+                    source = Doc.Views.ActiveView.CaptureToBitmap(new Size(w, h));
+                }
                 catch (Exception e) { return Err($"Capture failed: {e.Message}"); }
+                finally { Doc.Views.RedrawEnabled = true; }
                 if (source == null) return Err("Capture returned null");
 
                 // Pick format: explicit > display-mode-derived
@@ -2114,20 +2054,6 @@ namespace RhinoAIBridge
                         ["total_objects"]   = snap2?.Count ?? 0
                     };
                 } catch { /* metadata best-effort */ }
-                // Save to file if requested
-                if (!string.IsNullOrEmpty(saveToFile))
-                {
-                    try
-                    {
-                        var dir = Path.GetDirectoryName(saveToFile);
-                        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                            Directory.CreateDirectory(dir);
-                        File.WriteAllBytes(saveToFile, bytes);
-                        r["saved_to"] = saveToFile;
-                        r["image_base64"] = null; // don't double-transmit
-                    }
-                    catch (Exception saveEx) { r["save_error"] = saveEx.Message; }
-                }
                 return r;
             }
             finally
@@ -2196,7 +2122,12 @@ namespace RhinoAIBridge
                 return Err("Provide either location+target or box_min+box_max");
             }
 
-            RedrawScope.Mark();
+            // Phase 7: Don’t use RedrawScope.Mark() for camera-only changes.
+            // Mark() triggers a full Doc.Views.Redraw() at scope exit, which
+            // re-renders all 3D objects in rendered mode — 4+ minute hang on large scenes.
+            // Instead, invalidate only the active view for a lightweight refresh.
+            try { Doc.Views.ActiveView?.Redraw(); }
+            catch { /* best-effort */ }
             return Ok(("camera_set", true));
         }
 
@@ -2648,24 +2579,6 @@ namespace RhinoAIBridge
         JObject ExecuteScript(JObject p)
         {
             string code = p["code"]?.ToString();
-            bool asyncExec = p["async_execution"]?.ToObject<bool>() ?? false;
-
-            // Async mode: enqueue as background job and return immediately.
-            if (asyncExec)
-            {
-                string label = p["label"]?.ToString() ?? "execute_script";
-                // Capture params for the closure
-                var pCopy = (JObject)p.DeepClone();
-                pCopy.Remove("async_execution");
-                var job = JobManager.Enqueue(label, _ => ExecuteScript(pCopy));
-                return new JObject
-                {
-                    ["status"]  = "accepted",
-                    ["job_id"]  = job.Id,
-                    ["message"] = "Script queued. Poll get_job_status / get_job_result.",
-                };
-            }
-
             var before = new HashSet<string>(AllObjs().Select(o => o.Id.ToString()));
             uint uid = Doc.BeginUndoRecord(p["undo_name"]?.ToString() ?? "AI: Script");
             try
@@ -2677,12 +2590,24 @@ namespace RhinoAIBridge
                 // Preamble injected before every AI-generated script. System is needed for
                 // System.Drawing.Color, System.Guid, etc. â€” scripts don't need to import it.
                 // Double-importing is a no-op, so user code may also import these safely.
+                // Phase 7: Auto-import Rhino.Geometry (every script uses it) and
+                // inject a boolean-failure tracking wrapper so silent failures
+                // get surfaced as warnings in the response.
                 const string preamble =
                     "import rhinoscriptsyntax as rs\n" +
                     "import scriptcontext as sc\n" +
                     "import Rhino\n" +
+                    "from Rhino.Geometry import *\n" +
                     "import System\n" +
-                    "sc.doc = Rhino.RhinoDoc.ActiveDoc\n";
+                    "sc.doc = Rhino.RhinoDoc.ActiveDoc\n" +
+                    "# Boolean-failure tracker\n" +
+                    "_rab_bool_fails = [0]\n" +
+                    "def _rab_check_bool(result, op_name=\'boolean\'):\n" +
+                    "    if result is None or (hasattr(result, \'Count\') and result.Count == 0) or (isinstance(result, (list, tuple)) and len(result) == 0):\n" +
+                    "        _rab_bool_fails[0] += 1\n" +
+                    "        print(\'[BOOLEAN_FAIL] %s returned empty/None (total: %d)\' % (op_name, _rab_bool_fails[0]))\n" +
+                    "        return None\n" +
+                    "    return result\n";
                 bool ok = py.ExecuteScript(preamble + code);
 
                 RedrawScope.Mark();   // outer scope flushes; no double redraw
@@ -2717,6 +2642,18 @@ namespace RhinoAIBridge
                     ["objects_created"] = newIds.Count,
                     ["new_object_ids"] = new JArray(newIds.Take(20))
                 };
+                // Phase 7: Detect boolean failures from the _rab_check_bool tracker
+                int boolFails = 0;
+                foreach (var line in output)
+                {
+                    if (line != null && line.Contains("[BOOLEAN_FAIL]"))
+                        boolFails++;
+                }
+                if (boolFails > 0)
+                {
+                    warns.Add($"\u26a0\ufe0f {boolFails} boolean operation(s) returned empty/None. Check geometry validity (IsSolid, overlap).");
+                    r["boolean_failures"] = boolFails;
+                }
                 if (warns.Count > 0) r["warnings"] = warns;
                 if (!ok) r["message"] = "Script failed";
                 return r;
@@ -2739,6 +2676,450 @@ namespace RhinoAIBridge
             RedrawScope.Mark();
             return Ok(("redone", c));
         }
+
+
+        // ═══ SESSION SCRATCHPAD (Tier 1) ═══════════════════════════════════
+        // Persistent key-value store for the current session. Lets the AI cache
+        // derived geometry data (face centers, grid points, etc.) across calls
+        // instead of re-deriving them every time.
+        private static readonly Dictionary<string, JToken> _sessionState = new Dictionary<string, JToken>();
+
+        JObject SetState(JObject p)
+        {
+            string key = p["key"]?.ToString();
+            if (string.IsNullOrEmpty(key)) return Err("key is required");
+            _sessionState[key] = p["value"] ?? JValue.CreateNull();
+            return Ok(("key", key), ("stored", true), ("total_keys", _sessionState.Count));
+        }
+
+        JObject GetState(JObject p)
+        {
+            string key = p["key"]?.ToString();
+            if (string.IsNullOrEmpty(key))
+            {
+                // Return all keys with types and preview
+                var listing = new JArray();
+                foreach (var kv in _sessionState)
+                {
+                    var entry = new JObject { ["key"] = kv.Key, ["type"] = kv.Value?.Type.ToString() ?? "Null" };
+                    var s = kv.Value?.ToString(Formatting.None) ?? "null";
+                    entry["preview"] = s.Length > 120 ? s.Substring(0, 120) + "..." : s;
+                    listing.Add(entry);
+                }
+                return Ok(("keys", listing), ("count", _sessionState.Count));
+            }
+            if (_sessionState.TryGetValue(key, out var val))
+                return Ok(("key", key), ("value", val));
+            return Err($"Key '{key}' not found. Use get_state() with no key to list all.", "KEY_NOT_FOUND");
+        }
+
+        JObject ClearState(JObject p)
+        {
+            string key = p["key"]?.ToString();
+            if (!string.IsNullOrEmpty(key))
+            {
+                bool removed = _sessionState.Remove(key);
+                return Ok(("key", key), ("removed", removed));
+            }
+            int count = _sessionState.Count;
+            _sessionState.Clear();
+            return Ok(("cleared", count));
+        }
+
+        // ═══ SET PBR MATERIAL (Tier 1) ═════════════════════════════════════
+        // One-call PBR material creation + layer assignment. Replaces ~12 lines
+        // of execute_script boilerplate per material.
+        JObject SetPbrMaterial(JObject p)
+        {
+            string layer = p["layer"]?.ToString();
+            if (string.IsNullOrEmpty(layer)) return Err("layer is required");
+
+            int li = EnsureLayer(layer);
+            var layerObj = Doc.Layers[li];
+
+            // Parse color: accept [r,g,b] array or "#rrggbb" hex string
+            var baseColor = System.Drawing.Color.FromArgb(200, 200, 200); // default light gray
+            if (p["base_color"] != null)
+            {
+                if (p["base_color"].Type == JTokenType.Array)
+                {
+                    var c = p["base_color"].ToObject<int[]>();
+                    baseColor = System.Drawing.Color.FromArgb(c.Length > 3 ? c[3] : 255, c[0], c[1], c[2]);
+                }
+                else
+                {
+                    string hex = p["base_color"].ToString().TrimStart('#');
+                    if (hex.Length == 6)
+                        baseColor = System.Drawing.Color.FromArgb(
+                            Convert.ToInt32(hex.Substring(0, 2), 16),
+                            Convert.ToInt32(hex.Substring(2, 2), 16),
+                            Convert.ToInt32(hex.Substring(4, 2), 16));
+                }
+            }
+
+            double roughness = p["roughness"]?.ToObject<double>() ?? 0.5;
+            double metallic  = p["metallic"]?.ToObject<double>() ?? 0.0;
+            double opacity   = p["opacity"]?.ToObject<double>() ?? 1.0;
+            string name      = p["name"]?.ToString() ?? $"PBR_{layer}";
+
+            roughness = Math.Max(0, Math.Min(1, roughness));
+            metallic  = Math.Max(0, Math.Min(1, metallic));
+            opacity   = Math.Max(0, Math.Min(1, opacity));
+
+            // Create and configure material
+            var mat = new Rhino.DocObjects.Material { Name = name, DiffuseColor = baseColor };
+            mat.ReflectionGlossiness = 1.0 - roughness;  // Rhino uses glossiness (inverse of roughness)
+            mat.Reflectivity = metallic;
+            mat.Transparency = 1.0 - opacity;
+
+            int matIdx = Doc.Materials.Add(mat);
+            layerObj.RenderMaterialIndex = matIdx;
+            Doc.Layers.Modify(layerObj, li, true);
+
+            return Ok(
+                ("material_name", name),
+                ("material_index", matIdx),
+                ("layer", layer),
+                ("base_color", new JArray(baseColor.R, baseColor.G, baseColor.B)),
+                ("roughness", roughness),
+                ("metallic", metallic),
+                ("opacity", opacity));
+        }
+
+        // ═══ REVOLVE PROFILE (Tier 1) ══════════════════════════════════════
+        // Revolves a 2D point profile around an axis. Covers domes, minarets,
+        // finials, chhatri domes, lathe-turned elements — the #1 most common
+        // execute_script pattern in both smoke tests.
+        JObject RevolveProfile(JObject p)
+        {
+            var ptsRaw = p["points"]?.ToObject<double[][]>();
+            if (ptsRaw == null || ptsRaw.Length < 2) return Err("Need at least 2 profile points");
+            var axisStart = Pt(p["axis_start"]);
+            var axisEnd   = Pt(p["axis_end"]);
+            if (axisStart.DistanceTo(axisEnd) < Tol) return Err("Axis start and end are the same point");
+
+            double angleDeg = p["angle_degrees"]?.ToObject<double>() ?? 360.0;
+            bool cap        = p["cap"]?.ToObject<bool>() ?? true;
+            string layer    = p["layer"]?.ToString();
+            int degree      = p["curve_degree"]?.ToObject<int>() ?? 3;
+
+            // Build profile curve
+            var pts = ptsRaw.Select(a => new Point3d(a[0], a[1], a.Length > 2 ? a[2] : 0)).ToList();
+            NurbsCurve curve;
+            if (degree == 1)
+                curve = new Polyline(pts).ToNurbsCurve();
+            else
+                curve = NurbsCurve.Create(false, Math.Min(degree, pts.Count - 1), pts);
+            if (curve == null) return Err("Could not create profile curve from points");
+
+            var axis = new Line(axisStart, axisEnd);
+            double startRad = 0;
+            double endRad = angleDeg * Math.PI / 180.0;
+
+            var revSrf = RevSurface.Create(curve, axis, startRad, endRad);
+            if (revSrf == null) return Err("RevSurface.Create failed — check that profile is not on the axis");
+
+            var brep = Brep.CreateFromRevSurface(revSrf, cap, cap);
+            if (brep == null) return Err("Could not create brep from revolve surface");
+
+            var attr = new ObjectAttributes();
+            if (!string.IsNullOrEmpty(layer)) attr.LayerIndex = EnsureLayer(layer);
+            var id = Doc.Objects.AddBrep(brep, attr);
+            RedrawScope.Mark();
+
+            var bb = brep.GetBoundingBox(true);
+            var r = Ok(
+                ("object_ids", new JArray { id.ToString() }),
+                ("is_solid", brep.IsSolid),
+                ("bbox", BB(bb)));
+            return r;
+        }
+
+        // ═══ CREATE LAYER TREE (Tier 1) ════════════════════════════════════
+        // Batch-creates a hierarchy of layers in one call.
+        // Path format: "Parent::Child::Grandchild" (Rhino native convention).
+        JObject CreateLayerTree(JObject p)
+        {
+            var layers = p["layers"] as JArray;
+            if (layers == null || layers.Count == 0) return Err("layers array is required");
+
+            var created = new JArray();
+            var existed = new JArray();
+
+            foreach (var entry in layers)
+            {
+                string path = entry["path"]?.ToString() ?? entry.ToString();
+                if (string.IsNullOrEmpty(path)) continue;
+
+                var parts = path.Split(new[] { "::" }, StringSplitOptions.RemoveEmptyEntries);
+                int parentIdx = -1;
+
+                for (int i = 0; i < parts.Length; i++)
+                {
+                    string partName = parts[i].Trim();
+                    // Check if this layer already exists under the current parent
+                    int existingIdx = -1;
+                    foreach (var l in Doc.Layers)
+                    {
+                        if (l.IsDeleted) continue;
+                        bool nameMatch = string.Equals(l.Name, partName, StringComparison.OrdinalIgnoreCase);
+                        bool parentMatch = parentIdx < 0
+                            ? l.ParentLayerId == Guid.Empty
+                            : l.ParentLayerId == Doc.Layers[parentIdx].Id;
+                        if (nameMatch && parentMatch) { existingIdx = l.Index; break; }
+                    }
+
+                    if (existingIdx >= 0)
+                    {
+                        parentIdx = existingIdx;
+                        if (i == parts.Length - 1) existed.Add(path);
+                        continue;
+                    }
+
+                    var newLayer = new Layer { Name = partName };
+                    if (parentIdx >= 0) newLayer.ParentLayerId = Doc.Layers[parentIdx].Id;
+
+                    // Apply color/material only to the leaf layer
+                    if (i == parts.Length - 1)
+                    {
+                        if (entry["color"] != null)
+                        {
+                            var c = entry["color"].ToObject<int[]>();
+                            newLayer.Color = System.Drawing.Color.FromArgb(c[0], c[1], c.Length > 2 ? c[2] : 0);
+                        }
+                        if (entry["visible"] != null)
+                            newLayer.IsVisible = entry["visible"].ToObject<bool>();
+                    }
+
+                    parentIdx = Doc.Layers.Add(newLayer);
+                    if (parentIdx >= 0 && i == parts.Length - 1) created.Add(path);
+                }
+
+                // Apply material to leaf layer if specified
+                if (parentIdx >= 0 && entry["material"] != null)
+                {
+                    var matEntry = entry["material"] as JObject;
+                    if (matEntry != null)
+                    {
+                        var matP = new JObject { ["layer"] = parts.Last().Trim() };
+                        foreach (var kv in matEntry) matP[kv.Key] = kv.Value;
+                        SetPbrMaterial(matP);
+                    }
+                }
+            }
+
+            return Ok(("created", created), ("existed", existed),
+                       ("created_count", created.Count), ("existed_count", existed.Count));
+        }
+
+        // ═══ THUMBNAIL (Tier 1) ════════════════════════════════════════════
+        // Fast, cheap wireframe capture. Always uses wireframe display mode
+        // so it returns in <1s regardless of scene complexity.
+        JObject Thumbnail(JObject p)
+        {
+            int w = p["width"]?.ToObject<int>() ?? 240;
+            int h = p["height"]?.ToObject<int>() ?? 180;
+            int quality = p["quality"]?.ToObject<int>() ?? 60;
+            bool forceWireframe = p["wireframe"]?.ToObject<bool>() ?? true;
+
+            var view = Doc.Views.ActiveView;
+            if (view == null) return Err("No active viewport");
+            var vp = view.ActiveViewport;
+            if (vp == null) return Err("No active viewport");
+
+            var savedMode = vp.DisplayMode;
+            try
+            {
+                if (forceWireframe)
+                {
+                    var wf = Rhino.Display.DisplayModeDescription.FindByName("Wireframe");
+                    if (wf != null) vp.DisplayMode = wf;
+                }
+
+                Doc.Views.RedrawEnabled = false;
+                using var bmp = view.CaptureToBitmap(new Size(w, h));
+                Doc.Views.RedrawEnabled = true;
+
+                if (bmp == null) return Err("Capture returned null");
+
+                var enc = ImageCodecInfo.GetImageEncoders()
+                    .FirstOrDefault(c => c.MimeType == "image/jpeg");
+                if (enc == null) return Err("JPEG encoder unavailable");
+
+                var ep = new EncoderParameters(1);
+                ep.Param[0] = new EncoderParameter(
+                    System.Drawing.Imaging.Encoder.Quality, (long)Math.Clamp(quality, 1, 100));
+
+                using var ms = new MemoryStream();
+                bmp.Save(ms, enc, ep);
+                var bytes = ms.ToArray();
+
+                var r = Ok(
+                    ("image_base64", Convert.ToBase64String(bytes)),
+                    ("format", "jpeg"),
+                    ("width", w),
+                    ("height", h),
+                    ("bytes", bytes.Length));
+
+                // Add camera context
+                r["camera"] = new JObject
+                {
+                    ["location"] = PA(vp.CameraLocation),
+                    ["target"]   = PA(vp.CameraTarget),
+                    ["projection"] = vp.IsParallelProjection ? "parallel" : "perspective"
+                };
+                r["scene"] = new JObject
+                {
+                    ["visible_objects"] = Doc.Objects.Count(o => !o.IsDeleted && o.Visible)
+                };
+
+                return r;
+            }
+            catch (Exception e) { return Err($"Thumbnail failed: {e.Message}"); }
+            finally
+            {
+                Doc.Views.RedrawEnabled = true;
+                if (forceWireframe) vp.DisplayMode = savedMode;
+            }
+        }
+
+        // ═══ EXPORT OBJECTS (Tier 2) ════════════════════════════════════════
+        // Programmatic export without dialogs. Supports STL, OBJ, 3DM, STEP.
+        JObject ExportObjects(JObject p)
+        {
+            string format = (p["format"]?.ToString() ?? "stl").ToLower();
+            string path = p["path"]?.ToString();
+            var ids = p["object_ids"]?.ToObject<string[]>();
+            bool allObjects = ids == null || ids.Length == 0;
+
+            // Build export path
+            if (string.IsNullOrEmpty(path))
+            {
+                string ext = format switch { "obj" => ".obj", "step" => ".stp", "iges" => ".igs", "3dm" => ".3dm", _ => ".stl" };
+                path = Path.Combine(Path.GetTempPath(), $"aibridge_export_{DateTime.Now:yyyyMMdd_HHmmss}{ext}");
+            }
+
+            // Select objects to export
+            if (!allObjects)
+            {
+                Doc.Objects.UnselectAll();
+                foreach (var idStr in ids)
+                {
+                    var obj = Doc.Objects.FindId(new Guid(idStr));
+                    if (obj != null) obj.Select(true);
+                }
+            }
+
+            string cmd;
+            if (allObjects)
+                cmd = $"-_Export \"{path}\" _Enter _Enter";
+            else
+                cmd = $"-_Export \"{path}\" _Enter _Enter";
+
+            // For selected-only export, use SelExport if available, otherwise select first
+            if (!allObjects)
+            {
+                // Select the objects, then export selected
+                Doc.Views.Redraw();
+                cmd = $"-_Export \"{path}\" _Enter _Enter";
+            }
+
+            bool ok = RhinoApp.RunScript(cmd, false);
+
+            return Ok(
+                ("exported", ok),
+                ("path", path),
+                ("format", format),
+                ("object_count", allObjects ? Doc.Objects.Count(o => !o.IsDeleted) : ids.Length));
+        }
+
+        // ═══ DESIGN CHECKPOINTS (Tier 2) ═══════════════════════════════════
+        // Named save states for design exploration. The AI can branch, experiment,
+        // and roll back without losing work.
+        private static readonly Dictionary<string, string> _checkpoints = new Dictionary<string, string>();
+
+        JObject SaveCheckpoint(JObject p)
+        {
+            string name = p["name"]?.ToString();
+            if (string.IsNullOrEmpty(name)) return Err("name is required");
+
+            string dir = Path.Combine(Path.GetTempPath(), "aibridge_checkpoints");
+            Directory.CreateDirectory(dir);
+            string filePath = Path.Combine(dir, $"{name}.3dm");
+
+            // Clean old checkpoint with same name
+            if (File.Exists(filePath))
+                File.Delete(filePath);
+
+            var opts = new Rhino.FileIO.FileWriteOptions
+            {
+                WriteGeometryOnly = false,
+                IncludeRenderMeshes = false,  // smaller file, faster save
+            };
+            bool ok = Doc.WriteFile(filePath, opts);
+            if (!ok) return Err("Failed to save checkpoint file");
+
+            _checkpoints[name] = filePath;
+            var fi = new FileInfo(filePath);
+
+            return Ok(
+                ("checkpoint", name),
+                ("path", filePath),
+                ("size_kb", (int)(fi.Length / 1024)),
+                ("object_count", Doc.Objects.Count(o => !o.IsDeleted)),
+                ("total_checkpoints", _checkpoints.Count));
+        }
+
+        JObject RestoreCheckpoint(JObject p)
+        {
+            string name = p["name"]?.ToString();
+            if (string.IsNullOrEmpty(name)) return Err("name is required");
+
+            if (!_checkpoints.TryGetValue(name, out var filePath) || !File.Exists(filePath))
+                return Err($"Checkpoint '{name}' not found");
+
+            // Clear current doc
+            int beforeCount = Doc.Objects.Count(o => !o.IsDeleted);
+
+            // Delete all objects
+            var allIds = Doc.Objects.Where(o => !o.IsDeleted).Select(o => o.Id).ToList();
+            foreach (var id in allIds) Doc.Objects.Delete(id, true);
+
+            // Import the checkpoint file
+            string cmd = $"-_Import \"{filePath}\" _Enter";
+            bool ok = RhinoApp.RunScript(cmd, false);
+
+            RedrawScope.Mark();
+            int afterCount = Doc.Objects.Count(o => !o.IsDeleted);
+
+            return Ok(
+                ("restored", name),
+                ("objects_before", beforeCount),
+                ("objects_after", afterCount));
+        }
+
+        JObject ListCheckpoints(JObject p)
+        {
+            var list = new JArray();
+            foreach (var kv in _checkpoints)
+            {
+                var entry = new JObject { ["name"] = kv.Key, ["path"] = kv.Value };
+                if (File.Exists(kv.Value))
+                {
+                    var fi = new FileInfo(kv.Value);
+                    entry["size_kb"] = (int)(fi.Length / 1024);
+                    entry["saved_at"] = fi.LastWriteTime.ToString("HH:mm:ss");
+                    entry["exists"] = true;
+                }
+                else
+                {
+                    entry["exists"] = false;
+                }
+                list.Add(entry);
+            }
+            return Ok(("checkpoints", list), ("count", list.Count));
+        }
+
 
         // â”€â”€â”€ LOGGING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         JObject GetLog(JObject p)
@@ -2997,10 +3378,11 @@ namespace RhinoAIBridge
             string unit = p["unit"]?.ToString() ?? "mm";
             if (pt1 == null || pt2 == null || knownDistance <= 0)
                 return Err("point1, point2 (x/y/z) and known_distance required");
-            var p1 = new Point3d(pt1["x"]?.ToObject<double>() ?? 0, pt1["y"]?.ToObject<double>() ?? 0, pt1["z"]?.ToObject<double>() ?? 0);
-            var p2 = new Point3d(pt2["x"]?.ToObject<double>() ?? 0, pt2["y"]?.ToObject<double>() ?? 0, pt2["z"]?.ToObject<double>() ?? 0);
+            var p1 = new Rhino.Geometry.Point3d(pt1["x"]?.ToObject<double>() ?? 0, pt1["y"]?.ToObject<double>() ?? 0, pt1["z"]?.ToObject<double>() ?? 0);
+            var p2 = new Rhino.Geometry.Point3d(pt2["x"]?.ToObject<double>() ?? 0, pt2["y"]?.ToObject<double>() ?? 0, pt2["z"]?.ToObject<double>() ?? 0);
             double measuredDistance = p1.DistanceTo(p2);
             if (measuredDistance < 1e-10) return Err("Points are too close together");
+            // Convert known distance to model units
             double knownInModelUnits = knownDistance;
             if (unit == "mm") knownInModelUnits = RhinoMath.UnitScale(UnitSystem.Millimeters, Doc.ModelUnitSystem) * knownDistance;
             else if (unit == "m") knownInModelUnits = RhinoMath.UnitScale(UnitSystem.Meters, Doc.ModelUnitSystem) * knownDistance;
@@ -3008,9 +3390,13 @@ namespace RhinoAIBridge
             else if (unit == "ft") knownInModelUnits = RhinoMath.UnitScale(UnitSystem.Feet, Doc.ModelUnitSystem) * knownDistance;
             else if (unit == "in") knownInModelUnits = RhinoMath.UnitScale(UnitSystem.Inches, Doc.ModelUnitSystem) * knownDistance;
             double scaleFactor = knownInModelUnits / measuredDistance;
-            var xform = Transform.Scale(Point3d.Origin, scaleFactor);
+            var xform = Rhino.Geometry.Transform.Scale(Rhino.Geometry.Point3d.Origin, scaleFactor);
             int scaled = 0;
-            var settings = new Rhino.DocObjects.ObjectEnumeratorSettings { ActiveObjects = true, DeletedObjects = false };
+            var settings = new Rhino.DocObjects.ObjectEnumeratorSettings
+            {
+                ActiveObjects = true,
+                DeletedObjects = false,
+            };
             foreach (var obj in Doc.Objects.GetObjectList(settings))
             {
                 if (obj.ObjectType == Rhino.DocObjects.ObjectType.ClipPlane) continue;
@@ -3027,404 +3413,6 @@ namespace RhinoAIBridge
                 ["known_distance"] = knownDistance,
                 ["unit"] = unit,
                 ["objects_scaled"] = scaled
-            };
-        }
-
-        // =========================================================================
-        // v4.7 NEW: Async Job System
-        // =========================================================================
-
-        JObject GetJobStatus(JObject p)
-        {
-            string id = p["job_id"]?.ToString();
-            if (string.IsNullOrEmpty(id)) return Err("job_id required");
-            return JobManager.GetStatus(id);
-        }
-
-        JObject GetJobResult(JObject p)
-        {
-            string id = p["job_id"]?.ToString();
-            if (string.IsNullOrEmpty(id)) return Err("job_id required");
-            return JobManager.GetResult(id);
-        }
-
-        JObject CancelJob(JObject p)
-        {
-            string id = p["job_id"]?.ToString();
-            if (string.IsNullOrEmpty(id)) return Err("job_id required");
-            return JobManager.Cancel(id);
-        }
-
-        JObject ListJobs(JObject p) => JobManager.ListJobs();
-
-        // =========================================================================
-        // v4.7 NEW: Named Views
-        // =========================================================================
-
-        JObject CreateNamedView(JObject p)
-        {
-            string name = p["name"]?.ToString();
-            if (string.IsNullOrEmpty(name)) return Err("name required");
-            var vp = Doc.Views.ActiveView?.ActiveViewport;
-            if (vp == null) return Err("No active viewport");
-            // NamedViews stores a ViewInfo
-            var vi = new Rhino.DocObjects.ViewInfo(Doc.Views.ActiveView.ActiveViewport);
-            vi.Name = name;
-            int idx = Doc.NamedViews.Add(vi);
-            if (idx < 0) return Err("Failed to create named view");
-            return new JObject { ["status"]="ok", ["name"]=name, ["index"]=idx };
-        }
-
-        JObject GetNamedViews(JObject p)
-        {
-            var arr = new JArray();
-            for (int i = 0; i < Doc.NamedViews.Count; i++)
-            {
-                var vi = Doc.NamedViews[i];
-                arr.Add(new JObject { ["index"]=i, ["name"]=vi.Name });
-            }
-            return new JObject { ["status"]="ok", ["named_views"]=arr, ["count"]=arr.Count };
-        }
-
-        JObject RestoreNamedView(JObject p)
-        {
-            string name = p["name"]?.ToString();
-            if (string.IsNullOrEmpty(name)) return Err("name required");
-            for (int i = 0; i < Doc.NamedViews.Count; i++)
-            {
-                if (string.Equals(Doc.NamedViews[i].Name, name, StringComparison.OrdinalIgnoreCase))
-                {
-                    bool ok = Doc.NamedViews.Restore(i, Doc.Views.ActiveView, true);
-                    Doc.Views.Redraw();
-                    return ok ? new JObject { ["status"]="ok", ["name"]=name }
-                              : Err("Restore failed");
-                }
-            }
-            return Err($"Named view not found: {name}");
-        }
-
-        // =========================================================================
-        // v4.7 NEW: Directional Light
-        // =========================================================================
-
-        JObject CreateDirectionalLight(JObject p)
-        {
-            double dx = p["direction_x"]?.ToObject<double>() ?? -1;
-            double dy = p["direction_y"]?.ToObject<double>() ?? -1;
-            double dz = p["direction_z"]?.ToObject<double>() ?? -2;
-            double intensity = p["intensity"]?.ToObject<double>() ?? 1.0;
-            string name = p["name"]?.ToString() ?? "AI_Light";
-
-            var light = new Rhino.Geometry.Light();
-            light.LightStyle = Rhino.Geometry.LightStyle.WorldDirectional;
-            light.Direction  = new Vector3d(dx, dy, dz);
-            light.Intensity  = intensity;
-            light.Name       = name;
-
-            var attr = MkAttr(p);
-            // Set name via attributes before adding
-            attr.Name = name;
-            var lightIdx = Doc.Lights.Add(light, attr);
-            if (lightIdx < 0) return Err("Failed to add light");
-            var lightId = Doc.Lights[lightIdx]?.Id ?? Guid.Empty;
-            RedrawScope.Mark();
-            return new JObject { ["status"]="ok", ["object_id"]=lightId.ToString(), ["name"]=name };
-        }
-
-        // =========================================================================
-        // v4.7 NEW: Save File
-        // =========================================================================
-
-        JObject SaveFile(JObject p)
-        {
-            string path2 = p["path"]?.ToString();
-            bool ok;
-            if (!string.IsNullOrEmpty(path2))
-                ok = Doc.WriteFile(path2, new Rhino.FileIO.FileWriteOptions());
-            else
-                ok = Doc.WriteFile(Doc.Path, new Rhino.FileIO.FileWriteOptions());
-            return ok
-                ? new JObject { ["status"]="ok", ["path"]=Doc.Path, ["message"]="File saved." }
-                : Err("Save failed — check path and permissions.");
-        }
-
-        // =========================================================================
-        // v4.7 NEW: Purge
-        // =========================================================================
-
-        JObject PurgeUnusedLayers(JObject p)
-        {
-            bool dryRun = p["dry_run"]?.ToObject<bool>() ?? false;
-            var used = new HashSet<int>();
-            foreach (var obj in Doc.Objects)
-            {
-                if (obj == null || obj.IsDeleted) continue;
-                used.Add(obj.Attributes.LayerIndex);
-            }
-            var toDelete = new List<string>();
-            for (int i = Doc.Layers.Count - 1; i >= 0; i--)
-            {
-                var l = Doc.Layers[i];
-                if (l == null || l.IsDeleted || l.Index < 0) continue;
-                if (l.IsLocked || l.IsReference) continue;
-                if (!used.Contains(l.Index) && !l.IsLocked)
-                    toDelete.Add(l.FullPath);
-            }
-            int deleted = 0;
-            if (!dryRun)
-            {
-                for (int i = Doc.Layers.Count - 1; i >= 0; i--)
-                {
-                    var l = Doc.Layers[i];
-                    if (l == null || l.IsDeleted) continue;
-                    if (toDelete.Contains(l.FullPath))
-                    {
-                        if (Doc.Layers.Delete(l.Index, true)) deleted++;
-                    }
-                }
-            }
-            return new JObject
-            {
-                ["status"]       = "ok",
-                ["dry_run"]      = dryRun,
-                ["candidates"]   = new JArray(toDelete.Cast<object>().ToArray()),
-                ["deleted"]      = deleted,
-                ["message"]      = dryRun ? $"{toDelete.Count} unused layers found." : $"Deleted {deleted} unused layers.",
-            };
-        }
-
-        JObject PurgeUnusedMaterials(JObject p)
-        {
-            bool dryRun = p["dry_run"]?.ToObject<bool>() ?? false;
-            // Collect all mat indices in use by layers + objects
-            var used = new HashSet<int>();
-            foreach (var l in Doc.Layers)
-                if (l != null && !l.IsDeleted && l.RenderMaterialIndex >= 0)
-                    used.Add(l.RenderMaterialIndex);
-            foreach (var obj in Doc.Objects)
-                if (obj != null && !obj.IsDeleted && obj.Attributes.MaterialIndex >= 0)
-                    used.Add(obj.Attributes.MaterialIndex);
-
-            var names = new List<string>();
-            for (int i = 0; i < Doc.Materials.Count; i++)
-            {
-                var m = Doc.Materials[i];
-                if (m == null || m.IsDeleted) continue;
-                if (!used.Contains(i)) names.Add(m.Name ?? $"mat[{i}]");
-            }
-            int deleted = 0;
-            if (!dryRun)
-            {
-                for (int i = Doc.Materials.Count - 1; i >= 0; i--)
-                {
-                    var m = Doc.Materials[i];
-                    if (m == null || m.IsDeleted) continue;
-                    if (!used.Contains(i))
-                    {
-                        var mat2 = Doc.Materials[i];
-                        if (mat2 != null && !mat2.IsDeleted)
-                            if (Doc.Materials.Delete(mat2)) deleted++;
-                    }
-                }
-            }
-            return new JObject
-            {
-                ["status"]     = "ok",
-                ["dry_run"]    = dryRun,
-                ["candidates"] = new JArray(names.Cast<object>().ToArray()),
-                ["deleted"]    = deleted,
-                ["message"]    = dryRun ? $"{names.Count} unused materials found." : $"Deleted {deleted} unused materials.",
-            };
-        }
-
-        JObject DeleteObjectsByType(JObject p)
-        {
-            string typeName = (p["object_type"]?.ToString() ?? "").ToLower();
-            bool dryRun = p["dry_run"]?.ToObject<bool>() ?? false;
-            string layerFilter = p["layer"]?.ToString();
-
-            Rhino.DocObjects.ObjectType filter;
-            switch (typeName)
-            {
-                case "brep":    case "surface": filter = Rhino.DocObjects.ObjectType.Brep; break;
-                case "curve":   case "line":    filter = Rhino.DocObjects.ObjectType.Curve; break;
-                case "mesh":                    filter = Rhino.DocObjects.ObjectType.Mesh; break;
-                case "point":                   filter = Rhino.DocObjects.ObjectType.Point; break;
-                case "text":    case "annotation": filter = Rhino.DocObjects.ObjectType.Annotation; break;
-                case "instance":case "block":   filter = Rhino.DocObjects.ObjectType.InstanceReference; break;
-                case "light":                   filter = Rhino.DocObjects.ObjectType.Light; break;
-                default: return Err($"Unknown object_type: {typeName}. Use brep, curve, mesh, point, text, instance, light.");
-            }
-
-            int layerIdx = -1;
-            if (!string.IsNullOrEmpty(layerFilter))
-            {
-                layerIdx = EnsureLayer(layerFilter);
-            }
-
-            var toDelete = new List<Guid>();
-            foreach (var obj in Doc.Objects)
-            {
-                if (obj == null || obj.IsDeleted) continue;
-                if (obj.ObjectType != filter) continue;
-                if (layerIdx >= 0 && obj.Attributes.LayerIndex != layerIdx) continue;
-                toDelete.Add(obj.Id);
-            }
-
-            int deleted = 0;
-            if (!dryRun)
-            {
-                foreach (var id in toDelete)
-                    if (Doc.Objects.Delete(id, true)) deleted++;
-                if (deleted > 0) { RedrawScope.Mark(); }
-            }
-
-            return new JObject
-            {
-                ["status"]    = "ok",
-                ["dry_run"]   = dryRun,
-                ["found"]     = toDelete.Count,
-                ["deleted"]   = deleted,
-                ["message"]   = dryRun ? $"Would delete {toDelete.Count} {typeName} objects." : $"Deleted {deleted} {typeName} objects.",
-            };
-        }
-
-        // =========================================================================
-        // v4.7 NEW: Annotations & Geometry Helpers
-        // =========================================================================
-
-        JObject CreateTextDot(JObject p)
-        {
-            string text = p["text"]?.ToString() ?? "dot";
-            double x = p["x"]?.ToObject<double>() ?? 0;
-            double y = p["y"]?.ToObject<double>() ?? 0;
-            double z = p["z"]?.ToObject<double>() ?? 0;
-            double size = p["font_height"]?.ToObject<double>() ?? 14;
-            var dot = new Rhino.Geometry.TextDot(text, new Point3d(x, y, z));
-            dot.FontHeight = (int)size;
-            var attr = MkAttr(p);
-            var id = Doc.Objects.AddTextDot(dot, attr);
-            if (id == Guid.Empty) return Err("Failed to create text dot");
-            RedrawScope.Mark();
-            return new JObject { ["status"]="ok", ["object_id"]=id.ToString() };
-        }
-
-        JObject CreateTruncatedCone(JObject p)
-        {
-            // Bottom center, top center, bottom radius, top radius
-            double bx = p["base_x"]?.ToObject<double>() ?? 0;
-            double by = p["base_y"]?.ToObject<double>() ?? 0;
-            double bz = p["base_z"]?.ToObject<double>() ?? 0;
-            double height = p["height"]?.ToObject<double>() ?? 3000;
-            double r1 = p["bottom_radius"]?.ToObject<double>() ?? 500;
-            double r2 = p["top_radius"]?.ToObject<double>() ?? 300;
-
-            var basePoint = new Point3d(bx, by, bz);
-            var topPoint  = new Point3d(bx, by, bz + height);
-            var axisLine  = new Line(basePoint, topPoint);
-
-            // Build truncated cone (frustum) as a RevSurface
-            var profile = new Line(
-                new Point3d(r1, 0, bz),
-                new Point3d(r2, 0, bz + height)
-            );
-            var axis = new Line(basePoint, topPoint);
-            var revSurface = RevSurface.Create(profile.ToNurbsCurve(), axis, 0, 2 * Math.PI);
-            if (revSurface == null) return Err("Failed to create truncated cone surface");
-
-            // Cap top and bottom
-            var brep = Brep.CreateFromRevSurface(revSurface, true, true);
-            if (brep == null) return Err("Failed to cap truncated cone");
-
-            var attr = MkAttr(p);
-            var id = Doc.Objects.AddBrep(brep, attr);
-            if (id == Guid.Empty) return Err("Failed to add truncated cone to document");
-            RedrawScope.Mark();
-            return CrResult(id, p["layer"]?.ToString() ?? "Default", WantMeasure(p));
-        }
-
-        // =========================================================================
-        // v4.7 NEW: Blocks (create definition + insert instance)
-        // =========================================================================
-
-        JObject CreateBlock(JObject p)
-        {
-            string name = p["name"]?.ToString();
-            if (string.IsNullOrEmpty(name)) return Err("name required");
-
-            var ids = p["object_ids"] as JArray ?? new JArray();
-            if (ids.Count == 0) return Err("object_ids required (list of GUIDs to include in block)");
-
-            double bx = p["base_x"]?.ToObject<double>() ?? 0;
-            double by = p["base_y"]?.ToObject<double>() ?? 0;
-            double bz = p["base_z"]?.ToObject<double>() ?? 0;
-            bool deleteSource = p["delete_source"]?.ToObject<bool>() ?? false;
-
-            var basePoint = new Point3d(bx, by, bz);
-            var rhinoObjs = new List<Rhino.DocObjects.RhinoObject>();
-
-            foreach (var tok in ids)
-            {
-                if (Guid.TryParse(tok.ToString(), out var g))
-                {
-                    var obj = Doc.Objects.FindId(g);
-                    if (obj != null) rhinoObjs.Add(obj);
-                }
-            }
-            if (rhinoObjs.Count == 0) return Err("No valid objects found for block definition");
-
-            int idefIdx = Doc.InstanceDefinitions.Add(
-                name,
-                p["description"]?.ToString() ?? "",
-                basePoint,
-                rhinoObjs.Select(o => o.Geometry).ToArray(),
-                rhinoObjs.Select(o => o.Attributes).ToArray()
-            );
-            if (idefIdx < 0) return Err($"Failed to create block definition '{name}'");
-
-            if (deleteSource)
-                foreach (var obj in rhinoObjs) Doc.Objects.Delete(obj, true);
-
-            return new JObject
-            {
-                ["status"]         = "ok",
-                ["name"]           = name,
-                ["definition_index"] = idefIdx,
-                ["objects_added"]  = rhinoObjs.Count,
-                ["message"]        = $"Block '{name}' defined with {rhinoObjs.Count} objects.",
-            };
-        }
-
-        JObject InsertBlock(JObject p)
-        {
-            string name = p["name"]?.ToString();
-            if (string.IsNullOrEmpty(name)) return Err("name required");
-
-            var idef = Doc.InstanceDefinitions.Find(name, true);
-            if (idef == null) return Err($"Block definition not found: {name}");
-
-            double ix = p["x"]?.ToObject<double>() ?? 0;
-            double iy = p["y"]?.ToObject<double>() ?? 0;
-            double iz = p["z"]?.ToObject<double>() ?? 0;
-            double sx = p["scale_x"]?.ToObject<double>() ?? 1;
-            double sy = p["scale_y"]?.ToObject<double>() ?? 1;
-            double sz = p["scale_z"]?.ToObject<double>() ?? 1;
-            double angle = p["rotation_deg"]?.ToObject<double>() ?? 0;
-
-            var xform = Transform.Translation(ix, iy, iz)
-                * Transform.Rotation(angle * Math.PI / 180.0, Vector3d.ZAxis, Point3d.Origin)
-                * Transform.Scale(new Plane(Point3d.Origin, Vector3d.ZAxis), sx, sy, sz);
-
-            var attr = MkAttr(p);
-            var id = Doc.Objects.AddInstanceObject(idef.Index, xform, attr);
-            if (id == Guid.Empty) return Err($"Failed to insert block '{name}'");
-            RedrawScope.Mark();
-            return new JObject
-            {
-                ["status"]    = "ok",
-                ["object_id"] = id.ToString(),
-                ["name"]      = name,
-                ["position"]  = new JObject { ["x"]=ix, ["y"]=iy, ["z"]=iz },
             };
         }
     }
