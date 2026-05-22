@@ -1,4 +1,4 @@
-﻿"""
+"""
 RhinoAIBridge — Codex config patcher
 by tanishqb (https://github.com/tanishqbhattad/rhino-mcp)
 
@@ -28,12 +28,7 @@ def _build_entry(server_dir: str, safe_mode: bool = True) -> str:
     return (
         '\n[mcp_servers.rhino_architect]\n'
         'command = "uv"\n'
-        'args = [\n'
-        '  "--directory",\n'
-        '  "' + sd + '",\n'
-        '  "run",\n'
-        '  "rhino-architect"\n'
-        ']\n'
+        'args = ["--directory", "' + sd + '", "run", "rhino-architect"]\n'
         'startup_timeout_sec = 20\n'
         'tool_timeout_sec = 120\n'
         'enabled = true\n'
