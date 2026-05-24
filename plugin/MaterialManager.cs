@@ -524,7 +524,7 @@ namespace RhinoAIBridge
         /// <summary>
         /// Constructs a Rhino.DocObjects.Texture with repeating wrap and UV scale set via UvwTransform.
         /// </summary>
-        private static Rhino.DocObjects.Texture BuildTexture(string filePath, double uvRepeat)
+        public static Rhino.DocObjects.Texture BuildTexture(string filePath, double uvRepeat)
         {
             var tex = new Rhino.DocObjects.Texture();
             tex.FileName     = filePath;

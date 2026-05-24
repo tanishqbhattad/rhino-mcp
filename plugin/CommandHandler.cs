@@ -2287,7 +2287,7 @@ namespace RhinoAIBridge
 
             var r = Ok(("command", cmd), ("success", ok));
             if (newIds.Count > 0) r["new_object_ids"] = new JArray(newIds.Take(20).ToArray<object>());
-            if (!ok) r["message"] = "Command returned false â€” check spelling or required selection";
+            if (!ok) r["message"] = "Command returned false. Use execute_script for Python scripts with print() output.";
             return r;
         }
 
@@ -2761,6 +2761,7 @@ namespace RhinoAIBridge
             double metallic  = p["metallic"]?.ToObject<double>() ?? 0.0;
             double opacity   = p["opacity"]?.ToObject<double>() ?? 1.0;
             string name      = p["name"]?.ToString() ?? $"PBR_{layer}";
+            double uvRepeat  = p["uv_repeat"]?.ToObject<double>() ?? 1.0;
 
             roughness = Math.Max(0, Math.Min(1, roughness));
             metallic  = Math.Max(0, Math.Min(1, metallic));
@@ -2772,11 +2773,37 @@ namespace RhinoAIBridge
             mat.Reflectivity = metallic;
             mat.Transparency = 1.0 - opacity;
 
+            // Apply texture maps if provided
+            var mapsApplied = new List<string>();
+            var textureMaps = p["texture_maps"] as JObject;
+            if (textureMaps != null)
+            {
+                var slotMap = new (string key, TextureType type)[]
+                {
+                    ("albedo",       TextureType.Bitmap),
+                    ("roughness",    TextureType.PBR_Roughness),
+                    ("normal",       TextureType.Bump),
+                    ("metallic",     TextureType.PBR_Metallic),
+                    ("ao",           TextureType.PBR_AmbientOcclusion),
+                    ("displacement", TextureType.PBR_Displacement),
+                };
+                foreach (var (key, texType) in slotMap)
+                {
+                    string path = textureMaps[key]?.ToString();
+                    if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path))
+                    {
+                        var tex = MaterialManager.BuildTexture(path, uvRepeat);
+                        mat.SetTexture(tex, texType);
+                        mapsApplied.Add(key);
+                    }
+                }
+            }
+
             int matIdx = Doc.Materials.Add(mat);
             layerObj.RenderMaterialIndex = matIdx;
             Doc.Layers.Modify(layerObj, li, true);
 
-            return Ok(
+            var result = Ok(
                 ("material_name", name),
                 ("material_index", matIdx),
                 ("layer", layer),
@@ -2784,6 +2811,9 @@ namespace RhinoAIBridge
                 ("roughness", roughness),
                 ("metallic", metallic),
                 ("opacity", opacity));
+            if (mapsApplied.Count > 0)
+                result["maps_applied"] = new JArray(mapsApplied.Cast<object>().ToArray());
+            return result;
         }
 
         // ═══ REVOLVE PROFILE (Tier 1) ══════════════════════════════════════

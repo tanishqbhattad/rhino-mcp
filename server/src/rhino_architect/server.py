@@ -974,7 +974,9 @@ async def set_layer_material(params: LayerMaterialInput) -> dict:
 async def run_command(params: RunCommandInput) -> dict:
     """Execute any Rhino command string via RhinoApp.RunScript.
 
-    Escape hatch for commands not covered by structured tools. Tracks newly created objects.
+    Escape hatch for commands not covered by structured tools. Tracks newly created objects
+    and captures command-line output (including print() from RunPythonScript).
+    For full Python script execution with better output capture, use execute_script instead.
     Prefer structured tools when available — run_command has no rollback guarantee.
 
     Examples:
@@ -1690,11 +1692,17 @@ class SetPbrMaterialInput(BaseModel):
     metallic: float = Field(default=0.0, description="Metalness 0.0 (dielectric) to 1.0 (metal)")
     opacity: float = Field(default=1.0, description="Opacity 0.0 (transparent) to 1.0 (opaque)")
     name: str = Field(default="", description="Material name. Default: PBR_{layer}")
+    texture_maps: dict | None = Field(default=None, description="Optional texture map file paths. Keys: albedo, roughness, normal, metallic, ao, displacement. Values: absolute file paths to image files.")
+    uv_repeat: float = Field(default=1.0, description="UV repeat factor for texture tiling. Use compute_uv_repeat() result for physically accurate sizing.")
 
 
 @mcp.tool(name="set_pbr_material", annotations=WR)
 async def set_pbr_material(params: SetPbrMaterialInput) -> dict:
     """Create a PBR material and assign it to a layer in one call.
+
+    Supports both solid colors AND texture maps (albedo, normal, roughness, metallic, ao, displacement).
+    For texture-based materials, pass texture_maps={"albedo": "/path/to/color.jpg", "normal": "/path/to/normal.jpg", ...}
+    along with uv_repeat for physically accurate tiling.
 
     Replaces the ~12-line boilerplate of CreateBasicMaterial → SimulatedMaterial
     → ToPhysicallyBased → set properties → Add → assign. One call does it all.
@@ -1774,20 +1782,18 @@ async def create_layer_tree(layers: list[dict]) -> dict:
 
 @mcp.tool(name="thumbnail", annotations=RO)
 async def thumbnail(
-    width: int = 240,
-    height: int = 180,
-    quality: int = 60,
-    wireframe: bool = True,
+    width: int = 480,
+    height: int = 360,
+    quality: int = 75,
+    wireframe: bool = False,
 ) -> dict:
-    """Capture a fast, cheap viewport thumbnail. Returns base64 JPEG.
+    """Capture a viewport thumbnail for design QA. Returns base64 JPEG.
 
-    Unlike capture_viewport, this ALWAYS forces wireframe display mode so it
-    completes in <1 second regardless of scene complexity. Use it for quick
-    sanity checks between modeling steps — catching placement errors early
-    is worth far more than a pretty render.
+    Default mode is Shaded (wireframe=False) at 480x360 for readable design checks.
+    Set wireframe=True for fastest capture (<1s) at the cost of visual detail.
 
     Returns image_base64, camera info, and visible object count.
-    Call this after every major modeling step to verify geometry placement.
+    Call this after major modeling steps to verify geometry, materials, and layout.
     """
     return await _exec_simple("thumbnail", {
         "width": width, "height": height,
