@@ -612,7 +612,7 @@ def capabilities() -> str:
 @mcp.resource("rhino://arch-defaults")
 async def arch_defaults_resource() -> dict:
     """Standard architectural defaults: wall thicknesses, opening sizes, layer names."""
-    return orjson.dumps({
+    return {
         "wall": {"height": 3000, "thickness": 200},
         "slab": {"thickness": 200},
         "column": {"width": 400, "depth": 400, "height": 3000},
@@ -621,7 +621,7 @@ async def arch_defaults_resource() -> dict:
         "roof": {"thickness": 200},
         "massing": {"level_height": 3000, "core_layer": "Core"},
         "layers": ["Wall", "Slab", "Column", "Beam", "Opening", "Roof", "Stair", "Furniture", "Site", "Grid", "Annotation", "Massing", "Core::Walls", "Core::Shafts"],
-    }).decode("utf-8")
+    }
 
 
 # Ã¢"â‚¬Ã¢"â‚¬ Tools Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬

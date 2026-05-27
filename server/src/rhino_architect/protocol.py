@@ -67,14 +67,24 @@ class RhinoCommandError(Exception):
 
 
 _connection: Optional["RhinoProtocol"] = None
+_connection_lock: asyncio.Lock | None = None
+
+
+def _get_conn_lock() -> asyncio.Lock:
+    """Lazy-init the connection lock (must be created inside a running event loop)."""
+    global _connection_lock
+    if _connection_lock is None:
+        _connection_lock = asyncio.Lock()
+    return _connection_lock
 
 
 async def get_connection(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> "RhinoProtocol":
     global _connection
-    if _connection is None:
-        _connection = RhinoProtocol(host, port)
-    await _connection._ensure_connected()
-    return _connection
+    async with _get_conn_lock():
+        if _connection is None:
+            _connection = RhinoProtocol(host, port)
+        await _connection._ensure_connected()
+        return _connection
 
 
 class RhinoProtocol:
