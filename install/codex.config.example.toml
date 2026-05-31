@@ -1,0 +1,11 @@
+[mcp_servers.rhino_architect]
+command = "uv"
+args = ["--directory", "C:\\path\\to\\rhino-mcp\\server", "run", "--frozen", "rhino-architect"]
+startup_timeout_sec = 20
+tool_timeout_sec = 120
+enabled = true
+
+[mcp_servers.rhino_architect.env]
+RHINO_HOST = "127.0.0.1"
+RHINO_PORT = "9544"
+RHINO_SAFE_MODE = "0"

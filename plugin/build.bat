@@ -1,7 +1,7 @@
 @echo off
 echo.
 echo   ====================================
-echo    Building Rhino AI Bridge v4.5
+echo    Building Rhino AI Bridge v4.7.6
 echo   ====================================
 echo.
 where dotnet >nul 2>&1
@@ -20,14 +20,10 @@ echo   [3/3] Installing...
 set PD=%APPDATA%\McNeel\Rhinoceros\8.0\Plug-ins\RhinoAIBridge
 set BD=bin\Release\net8.0
 if not exist "%PD%" mkdir "%PD%"
-copy /Y "%BD%\RhinoAIBridge.rhp"              "%PD%\" >nul
-copy /Y "%BD%\RhinoAIBridge.deps.json"        "%PD%\" >nul
-copy /Y "%BD%\RhinoAIBridge.runtimeconfig.json" "%PD%\" >nul
-copy /Y "%BD%\Newtonsoft.Json.dll"            "%PD%\" >nul
-copy /Y "%BD%\System.Drawing.Common.dll"      "%PD%\" >nul
-if exist "%BD%\Microsoft.Win32.SystemEvents.dll" (
-    copy /Y "%BD%\Microsoft.Win32.SystemEvents.dll" "%PD%\" >nul
-)
+del /Q "%PD%\*.dll" "%PD%\*.deps.json" "%PD%\*.runtimeconfig.json" >nul 2>&1
+if exist "%PD%\runtimes" rmdir /S /Q "%PD%\runtimes"
+copy /Y "%BD%\*.*" "%PD%\" >nul
+if exist "%BD%\runtimes" xcopy /E /I /Y "%BD%\runtimes" "%PD%\runtimes" >nul
 echo.
 echo   ====================================
 echo    BUILD SUCCESSFUL

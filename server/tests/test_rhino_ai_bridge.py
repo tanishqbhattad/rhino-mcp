@@ -3,6 +3,7 @@ RhinoAIBridge v4.6 -- Test Suite (offline, no Rhino needed)
 Run: cd server && uv run pytest tests/ -v
 """
 import json, re, struct, gzip, pytest
+from rhino_architect import material_downloader
 
 # -- Wire protocol helpers --
 
@@ -167,3 +168,39 @@ class TestBatchPreview:
         assert r['estimated_deletes']==2
     def test_empty_batch(self):
         assert _preview([])['step_count']==0
+
+# -- 6. Material downloader --
+
+class TestMaterialDownloader:
+    def test_requested_resolution_prefers_tiff_before_lower_resolution(self):
+        downloads = [
+            {"attribute": "2K-PNG", "fullDownloadPath": "two-k.zip"},
+            {"attribute": "4K-TIFF", "fullDownloadPath": "four-k.zip"},
+        ]
+        chosen = material_downloader._pick_download_entry(downloads, "4K")
+        assert chosen["attribute"] == "4K-TIFF"
+
+    def test_requested_resolution_prefers_exr_before_lower_resolution(self):
+        downloads = [
+            {"attribute": "1K-JPG", "fullDownloadPath": "one-k.zip"},
+            {"attribute": "2K-EXR", "fullDownloadPath": "two-k.zip"},
+        ]
+        chosen = material_downloader._pick_download_entry(downloads, "2K")
+        assert chosen["attribute"] == "2K-EXR"
+
+    def test_fetch_json_falls_back_to_last_known_good_cache(self, monkeypatch, tmp_path):
+        class Response:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+            def read(self): return b'{"foundAssets":[{"assetId":"ok"}]}'
+
+        monkeypatch.setattr(material_downloader, "_SCHEMA_CACHE_DIR", tmp_path)
+        monkeypatch.setattr(material_downloader.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+        assert material_downloader._fetch_json("https://example.test/a")["foundAssets"][0]["assetId"] == "ok"
+
+        def fail(*_args, **_kwargs):
+            raise OSError("offline")
+
+        monkeypatch.setattr(material_downloader.urllib.request, "urlopen", fail)
+        cached = material_downloader._fetch_json("https://example.test/a")
+        assert cached["_stale_cache"] is True

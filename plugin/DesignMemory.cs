@@ -31,22 +31,41 @@ namespace RhinoAIBridge
 
         private static RhinoDoc Doc => RhinoDoc.ActiveDoc;
         private static string CurrentSession => $"sess_{DateTime.UtcNow:yyyyMMdd_HHmmss}";
+        private static readonly object _memoryLock = new object();
 
         // -- Document brief
-        public static void SetBrief(string brief) => Doc?.Strings.SetString(K_BRIEF, brief);
+        public static void SetBrief(string brief, bool append = false, bool allowEmpty = false)
+        {
+            if (Doc == null) return;
+            lock (_memoryLock)
+            {
+                string existing = Doc.Strings.GetValue(K_BRIEF) ?? "";
+                if (append)
+                {
+                    if (string.IsNullOrEmpty(brief)) return;
+                    Doc.Strings.SetString(K_BRIEF, string.IsNullOrEmpty(existing) ? brief : existing + "\n" + brief);
+                    return;
+                }
+                if (string.IsNullOrWhiteSpace(brief) && !allowEmpty && !string.IsNullOrEmpty(existing)) return;
+                Doc.Strings.SetString(K_BRIEF, brief);
+            }
+        }
         public static string GetBrief() => Doc?.Strings.GetValue(K_BRIEF) ?? "";
 
         // -- Session log
         public static void AddSession(string summary)
         {
             if (Doc == null) return;
-            var log = GetSessionLog();
-            log.Add(new JObject {
-                ["ts"]      = DateTime.UtcNow.ToString("o"),
-                ["summary"] = summary
-            });
-            while (log.Count > 50) log.RemoveAt(0);
-            Doc.Strings.SetString(K_SESSIONS, log.ToString(Formatting.None));
+            lock (_memoryLock)
+            {
+                var log = GetSessionLog();
+                log.Add(new JObject {
+                    ["ts"]      = DateTime.UtcNow.ToString("o"),
+                    ["summary"] = summary
+                });
+                while (log.Count > 50) log.RemoveAt(0);
+                Doc.Strings.SetString(K_SESSIONS, log.ToString(Formatting.None));
+            }
         }
 
         public static JArray GetSessionLog()
@@ -60,9 +79,12 @@ namespace RhinoAIBridge
         public static void NameGroup(string groupName, IEnumerable<string> ids)
         {
             if (Doc == null) return;
-            var groups = GetAllGroups();
-            groups[groupName] = new JArray(ids);
-            Doc.Strings.SetString(K_GROUPS, groups.ToString(Formatting.None));
+            lock (_memoryLock)
+            {
+                var groups = GetAllGroups();
+                groups[groupName] = new JArray(ids);
+                Doc.Strings.SetString(K_GROUPS, groups.ToString(Formatting.None));
+            }
         }
 
         public static JArray GetGroup(string groupName)
@@ -82,9 +104,12 @@ namespace RhinoAIBridge
         public static void AddRule(string rule)
         {
             if (Doc == null) return;
-            var rules = GetRules();
-            rules.Add(rule);
-            Doc.Strings.SetString(K_RULES, rules.ToString(Formatting.None));
+            lock (_memoryLock)
+            {
+                var rules = GetRules();
+                rules.Add(rule);
+                Doc.Strings.SetString(K_RULES, rules.ToString(Formatting.None));
+            }
         }
 
         public static JArray GetRules()
@@ -153,9 +178,12 @@ namespace RhinoAIBridge
                     hits.Add(new JObject { ["source"] = "group", ["group"] = kv.Key, ["ids"] = kv.Value });
             }
 
+            const int MAX_HITS = 50;
             foreach (var obj in doc.Objects.Where(o => !o.IsDeleted))
             {
+                if (hits.Count >= MAX_HITS) break;
                 var tags = GetObjectTags(obj);
+                if (tags.Count == 0) continue;
                 bool match = tags.Properties().Any(prop => prop.Value.ToString().ToLowerInvariant().Contains(q));
                 if (match)
                     hits.Add(new JObject {
@@ -163,7 +191,6 @@ namespace RhinoAIBridge
                         ["id"]     = obj.Id.ToString(),
                         ["tags"]   = tags
                     });
-                if (hits.Count > 50) break;
             }
 
             return hits;

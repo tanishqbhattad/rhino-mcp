@@ -1,1 +1,1 @@
-# Rhino AI Bridge — MCP Server v4.7.5
+# Rhino AI Bridge — MCP Server v4.7.6

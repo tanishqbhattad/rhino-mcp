@@ -12,23 +12,46 @@ Phase 1 changes vs v3:
 Tier 1 wire protocol (server → client):
   [1 byte: flags] [4 bytes: big-endian payload length] [N bytes: payload]
   flag 0x00 = raw UTF-8 JSON
-  flag 0x01 = gzip-compressed UTF-8 JSON  (kicks in at > 10 KB responses)
+  flag 0x01 = gzip-compressed UTF-8 JSON  (accepted for older plugin builds)
 
 Client → server direction stays at the old 4-byte format (requests are always small).
-Compression yields 5-8x on large object lists, ~2x on base64 image payloads.
+The current plugin sends raw JSON to avoid Rhino plugin-loader runtime dependencies.
 """
 from __future__ import annotations
 
 import asyncio
 import gzip
 import logging
+import os
 import struct
+import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Optional
 
 import orjson
 
 logger = logging.getLogger("rhino_ai_bridge.protocol")
+
+
+def _auth_token_path() -> Path:
+    """Return the per-user token location shared with the Rhino plugin."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    else:
+        base = str(Path.home() / ".config")
+    return Path(base) / "AIBridge" / "token"
+
+
+def _read_auth_token() -> Optional[str]:
+    try:
+        path = _auth_token_path()
+        if path.is_file():
+            token = path.read_text(encoding="utf-8").strip()
+            return token or None
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.warning("Could not read AIBridge auth token: %s", exc)
+    return None
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9544
@@ -113,6 +136,37 @@ class RhinoProtocol:
                         sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
                     except Exception:
                         pass
+
+                token = _read_auth_token()
+                if token:
+                    await self._send({"type": "auth", "token": token})
+                    try:
+                        response = await asyncio.wait_for(self._recv(), timeout=CONNECT_TIMEOUT)
+                    except Exception as exc:
+                        try:
+                            self._writer.close()
+                            await self._writer.wait_closed()
+                        except Exception:
+                            pass
+                        self._writer = None
+                        self._reader = None
+                        raise RhinoConnectionError(f"Auth handshake failed: {exc}") from exc
+                    if response.get("status") == "ok":
+                        logger.info("Authenticated to AIBridge")
+                    elif response.get("error_code") == "AUTH_REQUIRED":
+                        try:
+                            self._writer.close()
+                            await self._writer.wait_closed()
+                        except Exception:
+                            pass
+                        self._writer = None
+                        self._reader = None
+                        raise RhinoConnectionError(
+                            "AIBridge rejected the auth token. Restart AIBridge in Rhino "
+                            "to regenerate it, then retry."
+                        )
+                    else:
+                        logger.info("AIBridge did not require authentication (older plugin?)")
                 logger.info("Connected to Rhino at %s:%d", self.host, self.port)
             except (OSError, asyncio.TimeoutError) as exc:
                 raise RhinoConnectionError(

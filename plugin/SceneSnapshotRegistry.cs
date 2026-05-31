@@ -39,9 +39,7 @@ namespace RhinoAIBridge
             RhinoDoc.EndOpenDocument += OnEndOpenDocument;
             RhinoDoc.CloseDocument += OnCloseDocument;
 
-            // Build snapshots for any docs already open at startup.
-            var active = RhinoDoc.ActiveDoc;
-            if (active != null) GetOrBuild(active);
+            // Build lazily on first use so large documents do not delay the listener.
 
             AIBridgeLogger.Log(LogLevel.INFO, "Scene", "SceneSnapshotRegistry initialized");
         }

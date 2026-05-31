@@ -825,7 +825,7 @@ wheels = [
 
 [[package]]
 name = "rhino-architect"
-version = "4.7.5"
+version = "4.7.6"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },

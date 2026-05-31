@@ -2,4 +2,8 @@
 plugin/obj/
 server/src/rhino_architect/__pycache__/
 server/tests/__pycache__/
+server/.venv/
+server/.uv-cache/
+.pytest_cache/
+server/.pytest_cache/
 *.pyc

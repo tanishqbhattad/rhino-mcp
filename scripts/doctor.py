@@ -76,7 +76,7 @@ else:
 if uv:
     try:
         r = subprocess.run(
-            ["uv", "run", "--directory", str(SERVER_DIR), "python", "-c",
+            ["uv", "--directory", str(SERVER_DIR), "run", "--frozen", "python", "-c",
              "import rhino_architect; print('ok')"],
             capture_output=True, text=True, timeout=15
         )
@@ -91,7 +91,7 @@ if uv:
     for pkg, pip_name in [("fitz", "pymupdf"), ("cv2", "opencv-python"), ("numpy", "numpy")]:
         try:
             r = subprocess.run(
-                ["uv", "run", "--directory", str(SERVER_DIR), "python", "-c", f"import {pkg}; print('ok')"],
+                ["uv", "--directory", str(SERVER_DIR), "run", "--frozen", "python", "-c", f"import {pkg}; print('ok')"],
                 capture_output=True, text=True, timeout=10
             )
             if r.returncode == 0:
@@ -144,7 +144,7 @@ if CODEX_CONFIG.exists():
     if "rhino_architect" in content:
         ok("rhino_architect entry found in ~/.codex/config.toml")
         # Extract and verify server path
-        m = re.search(r'"--directory",\s*\n\s*"([^"]+)"', content)
+        m = re.search(r'"--directory",\s*"([^"]+)"', content)
         if m:
             sd = m.group(1).replace("\\\\", "\\")
             if Path(sd).exists():

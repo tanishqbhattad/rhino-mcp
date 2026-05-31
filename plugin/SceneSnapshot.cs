@@ -97,7 +97,7 @@ namespace RhinoAIBridge
             if (doc == null) return;
 
             foreach (var l in doc.Layers.Where(x => !x.IsDeleted))
-                _layerNames[l.Index] = l.Name;
+                _layerNames[l.Index] = l.FullPath ?? l.Name;
 
             var s = new ObjectEnumeratorSettings { DeletedObjects = false, HiddenObjects = true, LockedObjects = true };
             foreach (var ro in doc.Objects.GetObjectList(s))
@@ -213,7 +213,7 @@ namespace RhinoAIBridge
         {
             _layerNames.Clear();
             foreach (var l in doc.Layers.Where(x => !x.IsDeleted))
-                _layerNames[l.Index] = l.Name;
+                _layerNames[l.Index] = l.FullPath ?? l.Name;
             BumpVersion();
         }
 
@@ -258,6 +258,16 @@ namespace RhinoAIBridge
             int idx = -1;
             foreach (var kv in _layerNames)
                 if (string.Equals(kv.Value, layerName, StringComparison.Ordinal)) { idx = kv.Key; break; }
+            if (idx < 0)
+            {
+                foreach (var kv in _layerNames)
+                {
+                    var leaf = kv.Value;
+                    int separator = leaf.LastIndexOf("::", StringComparison.Ordinal);
+                    if (separator >= 0) leaf = leaf.Substring(separator + 2);
+                    if (string.Equals(leaf, layerName, StringComparison.Ordinal)) { idx = kv.Key; break; }
+                }
+            }
             if (idx < 0) return Array.Empty<ObjectMeta>();
             if (!_byLayerIndex.TryGetValue(idx, out var ids)) return Array.Empty<ObjectMeta>();
             return ids.Select(id => _objects.TryGetValue(id, out var m) ? m : null).Where(m => m != null);

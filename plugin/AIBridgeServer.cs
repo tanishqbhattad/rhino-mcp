@@ -5,7 +5,6 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
@@ -28,11 +27,24 @@ namespace RhinoAIBridge
         private const int PORT = 9544;
         public const string PROTOCOL_VERSION = "4.7";
 
+        // Cap concurrent client connections so a flood of fire-and-forget tasks can't
+        // exhaust threads/sockets. (security hardening #4)
+        private const int MAX_CLIENTS = 8;
+
+        // Idle read timeout (ms). A client that opens the socket and sends nothing
+        // gets dropped instead of parking a thread forever. (bug 1.15)
+        private const int IDLE_READ_TIMEOUT_MS = 60_000;
+
         private TcpListener _listener;
         private CancellationTokenSource _cts;
         private readonly object _lifecycleLock = new object();
         private bool _running;
         private readonly CommandHandler _handler = new CommandHandler();
+
+        // Per-session shared secret. Required as the first frame from every client so a
+        // random local process can't drive Rhino over the loopback socket. (bug 1.2)
+        private string _authToken;
+        private bool _requireAuth;
 
         // Build hash captured once at startup â€” useful when 5 versions of the .rhp are on disk.
         public static string BuildHash { get; private set; } = ComputeBuildHash();
@@ -61,13 +73,34 @@ namespace RhinoAIBridge
                 if (_running) { RhinoApp.WriteLine("AIBridge: Already running"); return; }
                 _running = true;
             }
-            AIBridgeLogger.Initialize();
+            RhinoApp.WriteLine("AIBridge: Starting...");
+            try
+            {
+                AIBridgeLogger.Initialize();
+            }
+            catch (Exception ex)
+            {
+                lock (_lifecycleLock) _running = false;
+                RhinoApp.WriteLine($"AIBridge: Logger init failed - {ex.Message}");
+                return;
+            }
+
+            // Operating mode is enforced in CommandHandler.Dispatch (so it can't be bypassed by
+            // talking raw TCP). Startup is SILENT and non-blocking (this runs inside Rhino's
+            // auto-start Idle handler): take an env override if present, else default to Safe.
+            // The user is asked to choose via the AIBridge command (PromptAndApplyMode). (bug 1.2)
+            CommandHandler.Mode = ModeFromEnvOrDefault();
+            AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Operating mode (startup default): {CommandHandler.Mode}");
+
+            RhinoApp.WriteLine("AIBridge: Preparing local authentication...");
+            InitAuthToken();
             UiDispatcher.Start();
             // SceneSnapshot registry must be initialized BEFORE the listener accepts clients.
             // Otherwise an early read tool could find a missing snapshot.
             // Has to run on the UI thread because it touches RhinoDoc.ActiveDoc and subscribes to events.
             try
             {
+                RhinoApp.WriteLine("AIBridge: Wiring Rhino document events...");
                 if (RhinoApp.InvokeRequired)
                     RhinoApp.InvokeOnUiThread(new Action(() => SceneSnapshotRegistry.Initialize()));
                 else
@@ -92,34 +125,156 @@ namespace RhinoAIBridge
             }
             try
             {
+                RhinoApp.WriteLine("AIBridge: Opening local listener...");
                 _listener = new TcpListener(IPAddress.Parse("127.0.0.1"), PORT);
                 _listener.Start();
                 _cts = new CancellationTokenSource();
                 _ = Task.Run(() => AcceptLoop(_cts.Token));
 
                 RhinoApp.WriteLine("==================================================");
-                RhinoApp.WriteLine("  Rhino AI Bridge v4.5 (C#)");
+                RhinoApp.WriteLine("  Rhino AI Bridge v4.7.6 (C#)");
                 RhinoApp.WriteLine($"  Listening on 127.0.0.1:{PORT}  build:{BuildHash}");
                 RhinoApp.WriteLine("  Phase 1: deferred redraw, async I/O, lean responses");
                 RhinoApp.WriteLine("  Phase 2: scene snapshot cache + scene_version etag");
                 RhinoApp.WriteLine("  Phase 3: atomic batches + reference resolution ($1.object_ids[0])");
                 RhinoApp.WriteLine("  Phase 5: architect intelligence (massing, floors, core, facade, schedules)");
-                RhinoApp.WriteLine("  Phase 6: consolidated 28-tool MCP surface");
+                RhinoApp.WriteLine("  Phase 6: consolidated 90-tool MCP surface");
                 RhinoApp.WriteLine("  Logs: %APPDATA%\\AIBridge\\logs\\");
                 RhinoApp.WriteLine("==================================================");
                 AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Started on 127.0.0.1:{PORT} build:{BuildHash}");
             }
             catch (Exception e)
             {
-                RhinoApp.WriteLine($"AIBridge: Failed â€” {e.Message}");
+                RhinoApp.WriteLine($"AIBridge: Failed — {e.Message}");
                 AIBridgeLogger.Log(LogLevel.ERROR, "Server", "Start failed", error: e.Message);
                 Stop();
             }
         }
 
-        // Track active client connections for force-shutdown
-        private readonly System.Collections.Concurrent.ConcurrentBag<TcpClient> _activeClients 
-            = new System.Collections.Concurrent.ConcurrentBag<TcpClient>();
+        // ─── Operating-mode selection (bug 1.2 / v4.7.6 mode picker) ──────────────────────
+        // IMPORTANT: the server AUTO-STARTS during Rhino's startup Idle event
+        // (AIBridgePlugin.OnIdle). We must NOT pop a modal dialog there — doing so blocks the
+        // idle handler and the dialog opens invisibly/un-parented. So startup is silent:
+        // Start() picks the mode from the environment, or defaults to Safe. The user is then
+        // asked interactively by the AIBridge command (PromptAndApplyMode), which shows a
+        // native Rhino dialog that is reliably visible.
+
+        // Returns the env-forced mode, or null when no override is set.
+        //   RHINO_AIBRIDGE_MODE = safe | standard | developer   (explicit)
+        //   RHINO_AIBRIDGE_SAFE_MODE = 1 / true                 (legacy => Safe)
+        private static CommandHandler.BridgeMode? ModeFromEnv()
+        {
+            var modeEnv = Environment.GetEnvironmentVariable("RHINO_AIBRIDGE_MODE");
+            if (!string.IsNullOrWhiteSpace(modeEnv))
+            {
+                switch (modeEnv.Trim().ToLowerInvariant())
+                {
+                    case "safe":      return CommandHandler.BridgeMode.Safe;
+                    case "standard":  return CommandHandler.BridgeMode.Standard;
+                    case "developer":
+                    case "dev":       return CommandHandler.BridgeMode.Developer;
+                }
+            }
+            var smEnv = Environment.GetEnvironmentVariable("RHINO_AIBRIDGE_SAFE_MODE");
+            if (smEnv == "1" || string.Equals(smEnv, "true", StringComparison.OrdinalIgnoreCase))
+                return CommandHandler.BridgeMode.Safe;
+            return null;
+        }
+
+        // Non-blocking, no UI. Used at auto-start so Rhino launch never stalls.
+        private static CommandHandler.BridgeMode ModeFromEnvOrDefault()
+            => ModeFromEnv() ?? CommandHandler.BridgeMode.Safe;
+
+        // Called by the AIBridge command. Shows a native, reliably-visible Rhino dialog and
+        // applies the chosen mode live (enforcement reads CommandHandler.Mode per dispatch).
+        // An env override wins and skips the dialog; scripted runs keep the current mode.
+        public static CommandHandler.BridgeMode PromptAndApplyMode(bool interactive)
+        {
+            var forced = ModeFromEnv();
+            if (forced.HasValue) { CommandHandler.Mode = forced.Value; return forced.Value; }
+            if (!interactive) return CommandHandler.Mode;
+
+            try
+            {
+                var items = new System.Collections.Generic.List<string> { "Safe", "Standard", "Developer" };
+                object pick = Rhino.UI.Dialogs.ShowComboListBox(
+                    "Rhino AI Bridge — Access Mode",
+                    "Choose how much access the AI has, then click OK:\r\n\r\n" +
+                    "Safe — blocks code + destructive edits (recommended)\r\n" +
+                    "Standard — allows delete/boolean, still blocks code\r\n" +
+                    "Developer — full access, everything allowed",
+                    items);
+
+                if (pick is string s)
+                {
+                    switch (s)
+                    {
+                        case "Standard":  CommandHandler.Mode = CommandHandler.BridgeMode.Standard; break;
+                        case "Developer": CommandHandler.Mode = CommandHandler.BridgeMode.Developer; break;
+                        default:          CommandHandler.Mode = CommandHandler.BridgeMode.Safe; break;
+                    }
+                }
+                // pick == null  => user cancelled; keep the current mode.
+            }
+            catch (Exception ex)
+            {
+                AIBridgeLogger.Log(LogLevel.WARN, "Server",
+                    "Mode dialog failed; keeping current mode", error: ex.ToString());
+            }
+
+            AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Operating mode set to {CommandHandler.Mode}");
+            return CommandHandler.Mode;
+        }
+
+        // Track active client connections for force-shutdown. Keyed dictionary so each
+        // connection is removed on normal disconnect, not leaked until Rhino shutdown. (bug 1.14)
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<Guid, TcpClient> _activeClients
+            = new System.Collections.Concurrent.ConcurrentDictionary<Guid, TcpClient>();
+
+        // ─── Auth token plumbing (bug 1.2) ────────────────────────────────
+        // The token lives in a per-user, user-scoped location that the MCP server (running as
+        // the same OS user) can read. On Unix it's chmod 600; on Windows the per-user
+        // LOCALAPPDATA path is already inaccessible to other users.
+        private static string TokenPath()
+        {
+            string baseDir;
+            if (OperatingSystem.IsWindows())
+                baseDir = Environment.GetEnvironmentVariable("LOCALAPPDATA")
+                          ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            else
+                baseDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config");
+            return Path.Combine(baseDir, "AIBridge", "token");
+        }
+
+        private void InitAuthToken()
+        {
+            try
+            {
+                var bytes = new byte[32];
+                using (var rng = System.Security.Cryptography.RandomNumberGenerator.Create())
+                    rng.GetBytes(bytes);
+                _authToken = Convert.ToHexString(bytes).ToLowerInvariant();
+
+                var path = TokenPath();
+                Directory.CreateDirectory(Path.GetDirectoryName(path));
+                File.WriteAllText(path, _authToken);
+                if (!OperatingSystem.IsWindows())
+                {
+                    try { File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { }
+                }
+                _requireAuth = true;
+                AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Auth token written to {path}");
+            }
+            catch (Exception ex)
+            {
+                // If we can't persist a token the MCP client can't read it, which would brick
+                // every connection. Fall back to no-auth with a loud warning rather than lock out.
+                _requireAuth = false;
+                _authToken = null;
+                AIBridgeLogger.Log(LogLevel.WARN, "Server",
+                    "Could not establish auth token; running WITHOUT authentication", error: ex.ToString());
+            }
+        }
 
         public void Stop()
         {
@@ -135,6 +290,7 @@ namespace RhinoAIBridge
             try { SceneSnapshotRegistry.Shutdown(); } catch { }
             RhinoApp.WriteLine("AIBridge: Stopped");
             AIBridgeLogger.Log(LogLevel.INFO, "Server", "Stopped");
+            AIBridgeLogger.Shutdown();
         }
 
         /// <summary>
@@ -146,11 +302,12 @@ namespace RhinoAIBridge
             try { _cts?.Cancel(); } catch { }
             try { _listener?.Stop(); } catch { }
             // Force-close every tracked client socket
-            while (_activeClients.TryTake(out var client))
+            foreach (var kv in _activeClients)
             {
-                try { client?.Close(); } catch { }
-                try { client?.Dispose(); } catch { }
+                try { kv.Value?.Close(); } catch { }
+                try { kv.Value?.Dispose(); } catch { }
             }
+            _activeClients.Clear();
             AIBridgeLogger.Log(LogLevel.INFO, "Server", "ForceRelease: all connections closed");
         }
 
@@ -171,16 +328,29 @@ namespace RhinoAIBridge
                     continue;
                 }
 
+                // Reject excess connections so a flood can't exhaust threads/sockets. (security #4)
+                if (_activeClients.Count >= MAX_CLIENTS)
+                {
+                    AIBridgeLogger.Log(LogLevel.WARN, "Server", $"Connection refused: client cap ({MAX_CLIENTS}) reached");
+                    try { client.Close(); } catch { }
+                    continue;
+                }
+
                 // Fire-and-forget per-client task. Background thread.
-                _activeClients.Add(client);
-                _ = Task.Run(() => HandleClient(client, ct));
+                var clientId = Guid.NewGuid();
+                _activeClients[clientId] = client;
+                _ = Task.Run(() => HandleClient(clientId, client, ct));
             }
         }
 
-        private void HandleClient(TcpClient client, CancellationToken ct)
+        private void HandleClient(Guid clientId, TcpClient client, CancellationToken ct)
         {
             var ep = client.Client.RemoteEndPoint?.ToString() ?? "?";
             AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Client connected: {ep}");
+            // Drop idle sockets instead of parking a thread forever, and close on shutdown. (bug 1.15)
+            try { client.ReceiveTimeout = IDLE_READ_TIMEOUT_MS; } catch { }
+            using var ctReg = ct.Register(() => { try { client.Close(); } catch { } });
+            bool authed = !_requireAuth;
             try
             {
                 using (client)
@@ -197,6 +367,24 @@ namespace RhinoAIBridge
                         if (ReadExact(stream, buf, len) < len) break;
 
                         var cmd = JObject.Parse(Encoding.UTF8.GetString(buf));
+
+                        // Auth gate: the first frame on every connection must be a valid auth
+                        // frame before any command (including ping) is honored. (bug 1.2)
+                        if (!authed)
+                        {
+                            var supplied = cmd["token"]?.ToString();
+                            if ((cmd["type"]?.ToString() == "auth") && supplied != null &&
+                                System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                                    Encoding.UTF8.GetBytes(supplied), Encoding.UTF8.GetBytes(_authToken ?? "")))
+                            {
+                                authed = true;
+                                WriteFrame(stream, new JObject { ["status"] = "ok", ["authenticated"] = true });
+                                continue;
+                            }
+                            WriteFrame(stream, new JObject { ["status"] = "error", ["error_code"] = "AUTH_REQUIRED", ["message"] = "authentication required" });
+                            AIBridgeLogger.Log(LogLevel.WARN, "Server", $"Auth failed/missing from {ep}; closing");
+                            break;
+                        }
                         var timer = AIBridgeLogger.StartTimer();
                         string cmdType = cmd["type"]?.ToString() ?? "?";
                         JObject result;
@@ -266,39 +454,7 @@ namespace RhinoAIBridge
                             AIBridgeLogger.LogCommand(cmdType, "{}", timer, "error", e.ToString());
                         }
 
-                        // â”€â”€ Serialize + optional gzip compression â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                        // Protocol (server â†’ client): [1-byte flag][4-byte big-endian length][payload]
-                        //   flag 0x00 = raw UTF-8 JSON
-                        //   flag 0x01 = gzip-compressed UTF-8 JSON
-                        // Compress when payload > 10 KB â€” typical gains: 5-8Ã— on object lists,
-                        // ~2Ã— on base64 image data. CompressionLevel.Fastest keeps CPU cost low.
-                        const int GzipThreshold = 10_000;
-                        var raw = Encoding.UTF8.GetBytes(result.ToString(Formatting.None));
-                        byte flag;
-                        byte[] payload;
-                        if (raw.Length > GzipThreshold)
-                        {
-                            using var ms = new MemoryStream(raw.Length / 2);
-                            using (var gz = new GZipStream(ms, CompressionLevel.Fastest, leaveOpen: true))
-                                gz.Write(raw, 0, raw.Length);
-                            payload = ms.ToArray();
-                            flag = 0x01;
-                        }
-                        else
-                        {
-                            payload = raw;
-                            flag = 0x00;
-                        }
-                        stream.WriteByte(flag);
-                        stream.Write(new byte[]
-                        {
-                            (byte)(payload.Length >> 24),
-                            (byte)(payload.Length >> 16),
-                            (byte)(payload.Length >> 8),
-                            (byte)payload.Length
-                        }, 0, 4);
-                        stream.Write(payload, 0, payload.Length);
-                        stream.Flush();
+                        WriteFrame(stream, result);
                     }
                 }
             }
@@ -308,8 +464,29 @@ namespace RhinoAIBridge
             }
             finally
             {
+                _activeClients.TryRemove(clientId, out _);   // remove on disconnect, not just at shutdown (bug 1.14)
                 AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Client disconnected: {ep}");
             }
+        }
+
+        // Serialize + optional gzip compression. Server → client framing:
+        //   [1-byte flag][4-byte big-endian length][payload]
+        //   flag 0x00 = raw UTF-8 JSON, 0x01 = gzip-compressed UTF-8 JSON
+        // Compress when payload > 10 KB (5-8× on object lists, ~2× on base64 images).
+        private static void WriteFrame(NetworkStream stream, JObject result)
+        {
+            // Current responses are always raw JSON (flag 0x00). Clients retain legacy gzip support.
+            var payload = Encoding.UTF8.GetBytes(result.ToString(Formatting.None));
+            stream.WriteByte(0x00);
+            stream.Write(new byte[]
+            {
+                (byte)(payload.Length >> 24),
+                (byte)(payload.Length >> 16),
+                (byte)(payload.Length >> 8),
+                (byte)payload.Length
+            }, 0, 4);
+            stream.Write(payload, 0, payload.Length);
+            stream.Flush();
         }
 
         private JObject HandlePing(JObject p)
@@ -341,14 +518,15 @@ namespace RhinoAIBridge
                     "architect_intelligence",
                     "consolidated_surface",
                     "auto_thumbnail",
-                    "gzip_compression",
                     "pbr_materials",
                     "run_command",
                     "set_camera", "dry_run",
                     "viewport_metadata", "query_modes", "design_memory", "scene_sync", "semantic_intelligence",
                 },
                 ["capabilities_resource"] = "rhino://capabilities",
-                ["safe_mode"] = false,
+                ["safe_mode"] = CommandHandler.SafeMode,
+                ["mode"] = CommandHandler.Mode.ToString().ToLowerInvariant(),
+                ["auth_required"] = _requireAuth,
             };
         }
 

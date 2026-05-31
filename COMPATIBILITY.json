@@ -1,8 +1,8 @@
 {
-  "plugin_version": "4.7.5",
+  "plugin_version": "4.7.6",
   "protocol_version": "4.7",
   "min_rhino_version": "8.0",
-  "min_python_version": "3.11",
+  "min_python_version": "3.10",
   "tested_on": ["Rhino 8.10", "Rhino 8.11", "Rhino 8.12"],
   "mcp_clients": {
     "claude_desktop": {
@@ -18,9 +18,13 @@
     "codex": {
       "supported": true,
       "min_version": "1.0",
-      "config_file": "codex.mcp.json"
+      "config_file": ".codex/config.toml"
+    },
+    "gemini_antigravity": {
+      "supported": true,
+      "config_file": ".gemini/antigravity/mcp_config.json"
     }
   },
   "breaking_changes": [],
-  "notes": "All v4.5-v4.7.4 callers are forward-compatible. v4.7.5 adds 15 missing dispatch entries and fixes double-serialization on 35+ tools."
+  "notes": "All v4.5-v4.7.5 callers are forward-compatible. v4.7.6 adds live-tested Rhino 8 runtime compatibility, local auth, startup access modes, security hardening, and installer fixes."
 }

@@ -73,21 +73,30 @@ def check_port():
     print(f"\n{BOLD}[4] Port {PLUGIN_PORT} (Rhino plugin){RESET}")
     try:
         with socket.create_connection((PLUGIN_HOST, PLUGIN_PORT), timeout=2.0) as s:
-            # Send a ping
             import gzip
-            payload = b'{"type":"ping","params":{}}'
-            s.sendall(struct.pack(">I", len(payload)) + payload)
             s.settimeout(5.0)
-            flag = s.recv(1)
-            (length,) = struct.unpack(">I", s.recv(4))
-            data = b""
-            while len(data) < length:
-                chunk = s.recv(length - len(data))
-                if not chunk: break
-                data += chunk
-            if flag and flag[0] == 0x01:
-                data = gzip.decompress(data)
-            pong = json.loads(data)
+
+            def exchange(command):
+                payload = json.dumps(command).encode("utf-8")
+                s.sendall(struct.pack(">I", len(payload)) + payload)
+                flag = s.recv(1)
+                (length,) = struct.unpack(">I", s.recv(4))
+                data = b""
+                while len(data) < length:
+                    chunk = s.recv(length - len(data))
+                    if not chunk: break
+                    data += chunk
+                if flag and flag[0] == 0x01:
+                    data = gzip.decompress(data)
+                return json.loads(data)
+
+            from .protocol import _read_auth_token
+            token = _read_auth_token()
+            if token:
+                auth = exchange({"type": "auth", "token": token})
+                if auth.get("status") != "ok" and auth.get("error_code") == "AUTH_REQUIRED":
+                    raise RuntimeError("local authentication failed; restart AIBridge in Rhino")
+            pong = exchange({"type": "ping", "params": {}})
             build = pong.get("build_hash", "?")
             units = pong.get("unit_system", pong.get("units", "?"))
             ok(f"Rhino plugin reachable -- build:{build}, units:{units}")

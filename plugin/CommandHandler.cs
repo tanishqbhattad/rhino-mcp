@@ -43,6 +43,16 @@ namespace RhinoAIBridge
         // at the end of a batch rather than one per sub-op. Set to true inside DispatchBatch.
         private int _batchDepth = 0;
 
+        public enum BridgeMode { Safe, Standard, Developer }
+        public static BridgeMode Mode = BridgeMode.Safe;
+        public static bool SafeMode => Mode == BridgeMode.Safe;
+
+        private static readonly HashSet<string> CodeExecCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { "execute_script", "run_command" };
+
+        private static readonly HashSet<string> DestructiveCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { "delete_objects", "boolean_operation" };
+
         public CommandHandler()
         {
             _commands = new Dictionary<string, Func<JObject, JObject>>
@@ -167,7 +177,10 @@ namespace RhinoAIBridge
         {
             string type = cmd["type"]?.ToString() ?? "";
 
-            // Trust-level check replaces legacy _SAFE_MODE
+            if (CodeExecCommands.Contains(type) && Mode != BridgeMode.Developer)
+                return Err($"Command '{type}' requires Developer mode.", "MODE_BLOCKED");
+            if (DestructiveCommands.Contains(type) && Mode == BridgeMode.Safe)
+                return Err($"Command '{type}' is blocked in Safe mode.", "MODE_BLOCKED");
 
             var p = cmd["params"] as JObject ?? new JObject();
             if (type == "batch")
@@ -368,8 +381,14 @@ namespace RhinoAIBridge
         JToken ResolvePath(JToken root, string path)
         {
             var cur = root;
+            int pos = 0;
             foreach (Match part in Regex.Matches(path, @"([^\.\[\]]+)|(\[(\d+)\])"))
             {
+                var gap = path.Substring(pos, part.Index - pos);
+                if (gap.Trim('.').Length != 0)
+                    throw new InvalidOperationException($"Malformed reference path near '{path.Substring(pos)}'");
+                pos = part.Index + part.Length;
+
                 if (part.Groups[1].Success)
                 {
                     cur = cur?[part.Groups[1].Value];
@@ -382,6 +401,8 @@ namespace RhinoAIBridge
                 }
                 if (cur == null) return null;
             }
+            if (path.Substring(pos).Trim('.').Length != 0)
+                throw new InvalidOperationException($"Malformed reference path: '{path}'");
             return cur;
         }
 
@@ -510,6 +531,30 @@ namespace RhinoAIBridge
         }
 
         // Snapshot accessor â€” null safe.
+        static List<string> CaptureAddedIds(Action action)
+        {
+            var added = new List<string>();
+            EventHandler<Rhino.DocObjects.RhinoObjectEventArgs> handler = (s, e) =>
+            {
+                try { if (e.TheObject == null || ReferenceEquals(e.TheObject.Document, Doc)) added.Add(e.ObjectId.ToString()); }
+                catch { }
+            };
+            RhinoDoc.AddRhinoObject += handler;
+            try { action(); }
+            finally { RhinoDoc.AddRhinoObject -= handler; }
+            return added;
+        }
+
+        static string SanitizeFileName(string raw)
+        {
+            if (string.IsNullOrEmpty(raw)) return null;
+            string baseName = Path.GetFileName(raw.Trim());
+            if (string.IsNullOrEmpty(baseName) || baseName == "." || baseName == "..") return null;
+            foreach (var c in Path.GetInvalidFileNameChars()) baseName = baseName.Replace(c, '_');
+            baseName = baseName.Replace("/", "_").Replace("\\", "_").Trim();
+            return string.IsNullOrEmpty(baseName) ? null : baseName;
+        }
+
         static SceneSnapshot Snap => SceneSnapshotRegistry.Get(Doc);
 
         static List<string> ResIds(JToken t)
@@ -775,7 +820,10 @@ namespace RhinoAIBridge
         {
             var sp = Pt(p["start_point"]); var ep = Pt(p["end_point"]);
             double h = p["height"]?.ToObject<double>() ?? 3000, t = p["thickness"]?.ToObject<double>() ?? 200;
-            var d = ep - sp; d.Unitize(); var n = new Vector3d(-d.Y, d.X, 0); n.Unitize(); var off = n * (t / 2);
+            var horiz = new Vector3d(ep.X - sp.X, ep.Y - sp.Y, 0);
+            if (horiz.Length < 1e-9)
+                return Err("Vertical wall: start_point and end_point need distinct X/Y coordinates.", "INVALID_GEOMETRY");
+            horiz.Unitize(); var n = new Vector3d(-horiz.Y, horiz.X, 0); n.Unitize(); var off = n * (t / 2);
             var crv = new Polyline(new[] { sp + off, ep + off, ep - off, sp - off, sp + off }).ToNurbsCurve();
             var b = ExtrudeCC(crv, new Vector3d(0, 0, h));
             if (b == null) return Err("Wall failed");
@@ -1154,8 +1202,9 @@ namespace RhinoAIBridge
                 double tx = Math.Round(c.X / g) * g - c.X;
                 double ty = Math.Round(c.Y / g) * g - c.Y;
                 double tz = p["snap_z"]?.ToObject<bool>() == true ? Math.Round(c.Z / g) * g - c.Z : 0;
-                Doc.Objects.Transform(o.Id, Transform.Translation(tx, ty, tz), false);
-                moved.Add(new JObject { ["id"] = sid, ["translation"] = new JArray(Math.Round(tx, 2), Math.Round(ty, 2), Math.Round(tz, 2)) });
+                var newGuid = Doc.Objects.Transform(o.Id, Transform.Translation(tx, ty, tz), true);
+                var newId = newGuid != Guid.Empty ? newGuid.ToString() : sid;
+                moved.Add(new JObject { ["id"] = newId, ["old_id"] = sid, ["translation"] = new JArray(Math.Round(tx, 2), Math.Round(ty, 2), Math.Round(tz, 2)) });
             }
             RedrawScope.Mark();
             return Ok(("aligned", moved), ("count", moved.Count), ("grid_spacing", g));
@@ -1388,7 +1437,7 @@ namespace RhinoAIBridge
                 xf *= Transform.Scale(Doc.Objects.FindId(gid).Geometry.GetBoundingBox(true).Center, p["scale"].ToObject<double>());
                 hx = true;
             }
-            if (hx) Doc.Objects.Transform(gid, xf, false);
+            if (hx) { var newGuid = Doc.Objects.Transform(gid, xf, true); if (newGuid != Guid.Empty) gid = newGuid; }
 
             RedrawScope.Mark();
             return CrResult(gid, p["layer"]?.ToString(), WantMeasure(p));
@@ -1439,7 +1488,7 @@ namespace RhinoAIBridge
                 xf *= Transform.Scale(obj.Geometry.GetBoundingBox(true).Center, p["scale"].ToObject<double>());
                 hx = true;
             }
-            if (hx) Doc.Objects.Transform(obj.Id, xf, false);
+            if (hx) { var newGuid = Doc.Objects.Transform(obj.Id, xf, true); if (newGuid != Guid.Empty) obj = Doc.Objects.FindId(newGuid); }
 
             RedrawScope.Mark();
             var ri = OI(Doc.Objects.FindId(obj.Id)); ri["status"] = "ok"; return ri;
@@ -1482,9 +1531,12 @@ namespace RhinoAIBridge
         {
             var pts = p["points"].Select(t => Pt(t)).ToList();
             if (p["closed"]?.ToObject<bool>() == true && pts.First().DistanceTo(pts.Last()) > 0.01) pts.Add(pts[0]);
+            bool isClosed = pts.Count > 2 && pts.First().DistanceTo(pts.Last()) <= 0.01;
             var gid = Doc.Objects.AddPolyline(new Polyline(pts), MkAttr(p));
             RedrawScope.Mark();
-            return CrResult(gid, p["layer"]?.ToString(), false);
+            var result = CrResult(gid, p["layer"]?.ToString(), false);
+            result["closed"] = isClosed;
+            return result;
         }
 
         // â”€â”€â”€ ADVANCED GEOMETRY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1567,6 +1619,12 @@ namespace RhinoAIBridge
             return Ok(("object_ids", ni));
         }
 
+        Plane CurveOffsetPlane(Curve curve)
+        {
+            if (curve != null && curve.TryGetPlane(out var plane, Tol)) return plane;
+            return Plane.WorldXY;
+        }
+
         JObject OffsetCurve(JObject p)
         {
             var oid = p["object_id"]?.ToString();
@@ -1574,11 +1632,12 @@ namespace RhinoAIBridge
             var o = Doc.Objects.FindId(new Guid(oid));
             if (o?.Geometry is not Curve crv) return Err("Curve not found");
             double d = p["distance"].ToObject<double>(); var ni = new JArray();
-            var o1 = crv.Offset(Plane.WorldXY, d, Tol, CurveOffsetCornerStyle.Sharp);
+            var plane = CurveOffsetPlane(crv);
+            var o1 = crv.Offset(plane, d, Tol, CurveOffsetCornerStyle.Sharp);
             if (o1 != null) foreach (var c in o1) ni.Add(Doc.Objects.AddCurve(c, o.Attributes).ToString());
             if (p["both_sides"]?.ToObject<bool>() == true)
             {
-                var o2 = crv.Offset(Plane.WorldXY, -d, Tol, CurveOffsetCornerStyle.Sharp);
+                var o2 = crv.Offset(plane, -d, Tol, CurveOffsetCornerStyle.Sharp);
                 if (o2 != null) foreach (var c in o2) ni.Add(Doc.Objects.AddCurve(c, o.Attributes).ToString());
             }
             RedrawScope.Mark();
@@ -1628,8 +1687,9 @@ namespace RhinoAIBridge
             {
                 var o = Doc.Objects.FindId(new Guid(sid));
                 if (o?.Geometry is not Curve crv) continue;
-                var o1 = crv.Offset(Plane.WorldXY, th / 2, Tol, CurveOffsetCornerStyle.Sharp);
-                var o2 = crv.Offset(Plane.WorldXY, -th / 2, Tol, CurveOffsetCornerStyle.Sharp);
+                var plane = CurveOffsetPlane(crv);
+                var o1 = crv.Offset(plane, th / 2, Tol, CurveOffsetCornerStyle.Sharp);
+                var o2 = crv.Offset(plane, -th / 2, Tol, CurveOffsetCornerStyle.Sharp);
                 if (o1 != null && o2 != null)
                 {
                     var all = o1.Concat(o2).Concat(new[] {
@@ -1658,7 +1718,7 @@ namespace RhinoAIBridge
                 var gid = new Guid(sid);
                 var o = Doc.Objects.FindId(gid); if (o == null) continue;
                 if (cp) { var g = o.Geometry.Duplicate(); g.Transform(xf); ni.Add(Doc.Objects.Add(g, o.Attributes).ToString()); }
-                else { Doc.Objects.Transform(gid, xf, false); ni.Add(sid); }
+                else { var newGuid = Doc.Objects.Transform(gid, xf, true); ni.Add((newGuid != Guid.Empty ? newGuid : gid).ToString()); }
             }
             RedrawScope.Mark();
             return Ok(("object_ids", ni));
@@ -2004,8 +2064,10 @@ namespace RhinoAIBridge
                 else if (format == "jpeg" || format == "jpg") usePng = false;
                 else
                 {
-                    var dm = vp.DisplayMode?.EnglishName?.ToLower() ?? "";
-                    usePng = dm.Contains("wire") || dm.Contains("ghost") || dm.Contains("hidden");
+                    var dm = vp.DisplayMode?.EnglishName ?? "";
+                    var pngModes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+                        { "Wireframe", "Ghosted", "Hidden", "Technical", "Artistic", "Pen" };
+                    usePng = pngModes.Contains(dm);
                 }
 
                 byte[] bytes = null;
@@ -2059,7 +2121,7 @@ namespace RhinoAIBridge
             finally
             {
                 // â”€â”€ Restore state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                if (restore && (viewOverride != null || modeOverride != null))
+                if (restore)
                 {
                     try
                     {
@@ -2260,7 +2322,7 @@ namespace RhinoAIBridge
             {
                 Doc.Materials.Modify(mat, matIdx, true);
             }
-            Doc.Layers.Modify(layer, li, false);
+            Doc.Layers.Modify(layer, li, true);
             RedrawScope.Mark();
             return Ok(("layer", layerName), ("material_index", matIdx), ("applied", true));
         }
@@ -2278,12 +2340,9 @@ namespace RhinoAIBridge
             if (Doc == null) return Err("No active document", "RHINO_NOT_RUNNING");
             bool echo = p["echo"]?.ToObject<bool>() ?? false;
 
-            var before = new HashSet<string>(AllObjs().Select(o => o.Id.ToString()));
-            bool ok = RhinoApp.RunScript(cmd, echo);
+            bool ok = false;
+            var newIds = CaptureAddedIds(() => ok = RhinoApp.RunScript(cmd, echo));
             RedrawScope.Mark();
-
-            var after = new HashSet<string>(AllObjs().Select(o => o.Id.ToString()));
-            var newIds = after.Except(before).ToList();
 
             var r = Ok(("command", cmd), ("success", ok));
             if (newIds.Count > 0) r["new_object_ids"] = new JArray(newIds.Take(20).ToArray<object>());
@@ -2311,12 +2370,10 @@ namespace RhinoAIBridge
         JObject SelectObjects(JObject p)
         {
             if (p["clear_selection"]?.ToObject<bool>() != false) Doc.Objects.UnselectAll();
-            int c = 0;
-            foreach (var id in p["object_ids"].ToObject<List<string>>())
-            {
-                var o = Doc.Objects.FindId(new Guid(id));
-                if (o != null) { o.Select(true); c++; }
-            }
+            var guids = p["object_ids"].ToObject<List<string>>()
+                .Select(id => Guid.TryParse(id, out var guid) ? guid : Guid.Empty)
+                .Where(guid => guid != Guid.Empty).ToList();
+            int c = Doc.Objects.Select(guids, true);
             RedrawScope.Mark();
             return Ok(("selected_count", c));
         }
@@ -2579,7 +2636,6 @@ namespace RhinoAIBridge
         JObject ExecuteScript(JObject p)
         {
             string code = p["code"]?.ToString();
-            var before = new HashSet<string>(AllObjs().Select(o => o.Id.ToString()));
             uint uid = Doc.BeginUndoRecord(p["undo_name"]?.ToString() ?? "AI: Script");
             try
             {
@@ -2608,12 +2664,11 @@ namespace RhinoAIBridge
                     "        print(\'[BOOLEAN_FAIL] %s returned empty/None (total: %d)\' % (op_name, _rab_bool_fails[0]))\n" +
                     "        return None\n" +
                     "    return result\n";
-                bool ok = py.ExecuteScript(preamble + code);
+                bool ok = false;
+                var newIds = CaptureAddedIds(() => ok = py.ExecuteScript(preamble + code));
 
                 RedrawScope.Mark();   // outer scope flushes; no double redraw
 
-                var after = new HashSet<string>(AllObjs().Select(o => o.Id.ToString()));
-                var newIds = after.Except(before).ToList();
                 var warns = new JArray();
                 foreach (var nid in newIds.Take(10))
                 {
@@ -2665,9 +2720,10 @@ namespace RhinoAIBridge
         JObject DoUndo(JObject p)
         {
             int c = p["count"]?.ToObject<int>() ?? 1;
-            for (int i = 0; i < c; i++) Doc.Undo();
+            int done = 0;
+            for (int i = 0; i < c; i++) { if (!Doc.Undo()) break; done++; }
             RedrawScope.Mark();
-            return Ok(("undone", c));
+            return Ok(("undone", done), ("requested", c));
         }
         JObject DoRedo(JObject p)
         {
@@ -2931,7 +2987,7 @@ namespace RhinoAIBridge
                     var matEntry = entry["material"] as JObject;
                     if (matEntry != null)
                     {
-                        var matP = new JObject { ["layer"] = parts.Last().Trim() };
+                        var matP = new JObject { ["layer"] = path };
                         foreach (var kv in matEntry) matP[kv.Key] = kv.Value;
                         SetPbrMaterial(matP);
                     }
@@ -3028,16 +3084,34 @@ namespace RhinoAIBridge
                 string ext = format switch { "obj" => ".obj", "step" => ".stp", "iges" => ".igs", "3dm" => ".3dm", _ => ".stl" };
                 path = Path.Combine(Path.GetTempPath(), $"aibridge_export_{DateTime.Now:yyyyMMdd_HHmmss}{ext}");
             }
+            else
+            {
+                string directory = Path.GetDirectoryName(path);
+                if (string.IsNullOrEmpty(directory))
+                {
+                    string safeName = SanitizeFileName(path);
+                    if (safeName == null) return Err("Invalid export file name.", "INVALID_NAME");
+                    path = Path.Combine(Path.GetTempPath(), safeName);
+                }
+                else
+                {
+                    try { path = Path.GetFullPath(path); }
+                    catch { return Err("Invalid export path.", "INVALID_PATH"); }
+                    string parent = Path.GetDirectoryName(path);
+                    if (string.IsNullOrEmpty(parent) || !Directory.Exists(parent))
+                        return Err("Export directory does not exist.", "INVALID_PATH");
+                    if (string.IsNullOrEmpty(Path.GetFileName(path)))
+                        return Err("Export path must include a file name.", "INVALID_PATH");
+                }
+            }
 
             // Select objects to export
             if (!allObjects)
             {
                 Doc.Objects.UnselectAll();
-                foreach (var idStr in ids)
-                {
-                    var obj = Doc.Objects.FindId(new Guid(idStr));
-                    if (obj != null) obj.Select(true);
-                }
+                var guids = ids.Select(id => Guid.TryParse(id, out var guid) ? guid : Guid.Empty)
+                               .Where(guid => guid != Guid.Empty).ToList();
+                Doc.Objects.Select(guids, true);
             }
 
             string cmd;
@@ -3070,8 +3144,10 @@ namespace RhinoAIBridge
 
         JObject SaveCheckpoint(JObject p)
         {
-            string name = p["name"]?.ToString();
-            if (string.IsNullOrEmpty(name)) return Err("name is required");
+            string rawName = p["name"]?.ToString();
+            if (string.IsNullOrEmpty(rawName)) return Err("name is required");
+            string name = SanitizeFileName(rawName);
+            if (name == null) return Err("Invalid checkpoint name.", "INVALID_NAME");
 
             string dir = Path.Combine(Path.GetTempPath(), "aibridge_checkpoints");
             Directory.CreateDirectory(dir);
@@ -3102,8 +3178,9 @@ namespace RhinoAIBridge
 
         JObject RestoreCheckpoint(JObject p)
         {
-            string name = p["name"]?.ToString();
-            if (string.IsNullOrEmpty(name)) return Err("name is required");
+            string rawName = p["name"]?.ToString();
+            if (string.IsNullOrEmpty(rawName)) return Err("name is required");
+            string name = SanitizeFileName(rawName) ?? rawName;
 
             if (!_checkpoints.TryGetValue(name, out var filePath) || !File.Exists(filePath))
                 return Err($"Checkpoint '{name}' not found");
@@ -3187,9 +3264,15 @@ namespace RhinoAIBridge
         JObject SetDesignBrief(JObject p)
         {
             var brief = p["brief"]?.ToString() ?? "";
-            if (string.IsNullOrWhiteSpace(brief)) return Err("brief required");
-            DesignMemory.SetBrief(brief);
-            return new JObject { ["status"] = "ok", ["brief"] = brief };
+            bool append = p["append"]?.ToObject<bool>() ?? false;
+            bool clear = p["clear"]?.ToObject<bool>() ?? false;
+            if (!clear && string.IsNullOrWhiteSpace(brief)) return Err("brief required");
+            DesignMemory.SetBrief(brief, append: append, allowEmpty: clear);
+            return new JObject {
+                ["status"] = "ok",
+                ["brief"] = DesignMemory.GetBrief(),
+                ["mode"] = clear ? "clear" : (append ? "append" : "replace")
+            };
         }
 
         JObject GetDesignBrief(JObject p) =>
