@@ -2,7 +2,7 @@
 RhinoAIBridge — Gemini Antigravity config patcher
 by tanishqb (https://github.com/tanishqbhattad/rhino-mcp)
 
-Writes the rhino-architect MCP entry to %USERPROFILE%\.gemini\antigravity\mcp_config.json
+Writes the rhino-architect MCP entry to %USERPROFILE%\\.gemini\\antigravity\\mcp_config.json
 so that Gemini Antigravity picks up the server automatically.
 
 Usage: python patch_antigravity_config.py <server_directory>
@@ -51,6 +51,7 @@ def main():
             "--directory",
             server_dir,
             "run",
+            "--frozen",
             "rhino-architect",
         ],
     }

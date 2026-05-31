@@ -55,34 +55,48 @@ function Send-RhinoPing {
     try {
         $tcp    = New-Object System.Net.Sockets.TcpClient($host_, $port_)
         $stream = $tcp.GetStream()
-        $cmd    = [System.Text.Encoding]::UTF8.GetBytes('{"type":"ping","params":{}}')
-        $len    = [System.BitConverter]::GetBytes([uint32]$cmd.Length)
-        if ([System.BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
-        $stream.Write($len, 0, 4)
-        $stream.Write($cmd, 0, $cmd.Length)
-        $stream.Flush()
+        function Exchange-Frame([string]$json) {
+            $cmd = [System.Text.Encoding]::UTF8.GetBytes($json)
+            $len = [System.BitConverter]::GetBytes([uint32]$cmd.Length)
+            if ([System.BitConverter]::IsLittleEndian) { [Array]::Reverse($len) }
+            $stream.Write($len, 0, 4)
+            $stream.Write($cmd, 0, $cmd.Length)
+            $stream.Flush()
 
-        # Read response: 1 flag byte + 4 length bytes + payload
-        $header = New-Object byte[] 5
-        $read   = 0
-        while ($read -lt 5) {
-            $n = $stream.Read($header, $read, 5 - $read)
-            if ($n -eq 0) { break }
-            $read += $n
+            $header = New-Object byte[] 5
+            $read = 0
+            while ($read -lt 5) {
+                $n = $stream.Read($header, $read, 5 - $read)
+                if ($n -eq 0) { break }
+                $read += $n
+            }
+            $lenBytes = $header[1..4]
+            if ([System.BitConverter]::IsLittleEndian) { [Array]::Reverse($lenBytes) }
+            $payLen = [System.BitConverter]::ToUInt32($lenBytes, 0)
+            $payload = New-Object byte[] $payLen
+            $read2 = 0
+            while ($read2 -lt $payLen) {
+                $n = $stream.Read($payload, $read2, $payLen - $read2)
+                if ($n -eq 0) { break }
+                $read2 += $n
+            }
+            return [System.Text.Encoding]::UTF8.GetString($payload)
         }
-        $flag    = $header[0]
-        $lenBytes = $header[1..4]
-        if ([System.BitConverter]::IsLittleEndian) { [Array]::Reverse($lenBytes) }
-        $payLen  = [System.BitConverter]::ToUInt32($lenBytes, 0)
-        $payload = New-Object byte[] $payLen
-        $read2   = 0
-        while ($read2 -lt $payLen) {
-            $n = $stream.Read($payload, $read2, $payLen - $read2)
-            if ($n -eq 0) { break }
-            $read2 += $n
+
+        $tokenPath = Join-Path $env:LOCALAPPDATA "AIBridge\token"
+        if (Test-Path $tokenPath) {
+            $token = (Get-Content $tokenPath -Raw -Encoding UTF8).Trim()
+            if ($token) {
+                $auth = Exchange-Frame ('{"type":"auth","token":"' + $token + '"}')
+                $authJson = $auth | ConvertFrom-Json
+                if ($authJson.status -ne "ok" -and $authJson.error_code -eq "AUTH_REQUIRED") {
+                    throw "Local authentication failed. Restart AIBridge in Rhino."
+                }
+            }
         }
+        $payload = Exchange-Frame '{"type":"ping","params":{}}'
         $stream.Close(); $tcp.Close()
-        return [System.Text.Encoding]::UTF8.GetString($payload)
+        return $payload
     } catch {
         return $null
     }
@@ -128,8 +142,8 @@ if ($resp) {
 
 # ── 5. Python MCP server process ──────────────────────────────────────────────
 Banner "5. Python MCP server process"
-$pyProcs = Get-Process -Name "python*","uv" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -match "rhino.architect|rhino-architect" }
+$pyProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match "python|uv" -and $_.CommandLine -match "rhino.architect|rhino-architect" }
 if ($pyProcs) {
     OK "MCP server process found (PID $($pyProcs[0].Id))"
 } else {

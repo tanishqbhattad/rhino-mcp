@@ -9,7 +9,6 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Threading;
-using System.Threading.Channels;
 using System.Threading.Tasks;
 using Rhino;
 
@@ -20,7 +19,7 @@ namespace RhinoAIBridge
     /// <summary>
     /// Async logger. v3 wrote to disk synchronously inside a lock on every command,
     /// which serialized commands behind disk I/O. v4 fire-and-forget enqueues to a
-    /// Channel<LogEntry> and a single background task drains it to disk.
+    /// bounded queue and a single background task drains it to disk.
     /// </summary>
     public static class AIBridgeLogger
     {
@@ -32,7 +31,9 @@ namespace RhinoAIBridge
 
         // Bounded channel — if logging falls behind, oldest pending entries get dropped
         // before we ever block a Rhino command. Logging is never on the critical path.
-        private static Channel<LogEntry> _channel;
+        private static readonly ConcurrentQueue<LogEntry> _pendingEntries = new();
+        private static readonly AutoResetEvent _pendingSignal = new AutoResetEvent(false);
+        private const int MAX_PENDING = 4096;
         private static Task _writerTask;
         private static CancellationTokenSource _cts;
 
@@ -62,13 +63,6 @@ namespace RhinoAIBridge
             // Clean logs older than 7 days
             try { foreach (var f in Directory.GetFiles(_logDir, "*.log").Where(f => File.GetCreationTime(f) < DateTime.Now.AddDays(-7))) File.Delete(f); } catch { }
 
-            // Bounded channel: 4096 entries. DropOldest so we never block the producer.
-            _channel = Channel.CreateBounded<LogEntry>(new BoundedChannelOptions(4096)
-            {
-                FullMode = BoundedChannelFullMode.DropOldest,
-                SingleReader = true,
-                SingleWriter = false,
-            });
             _cts = new CancellationTokenSource();
             _writerTask = Task.Run(() => WriterLoop(_cts.Token));
 
@@ -79,8 +73,8 @@ namespace RhinoAIBridge
         {
             try
             {
-                _channel?.Writer.TryComplete();
                 _cts?.Cancel();
+                _pendingSignal.Set();
                 _writerTask?.Wait(TimeSpan.FromSeconds(2));
             }
             catch { }
@@ -92,21 +86,24 @@ namespace RhinoAIBridge
             _currentLogFile = Path.Combine(_logDir, $"aibridge_{_currentDate:yyyy-MM-dd}.log");
         }
 
-        private static async Task WriterLoop(CancellationToken ct)
+        private static void WriterLoop(CancellationToken ct)
         {
             // Batch entries into a single file write per drain cycle.
             // The reader awaits, so this thread is parked unless work arrives.
             var batch = new StringBuilder(8192);
             try
             {
-                await foreach (var entry in _channel.Reader.ReadAllAsync(ct))
+                while (!ct.IsCancellationRequested)
                 {
+                    _pendingSignal.WaitOne(TimeSpan.FromSeconds(1));
+                    if (ct.IsCancellationRequested) break;
+                    if (!_pendingEntries.TryDequeue(out var entry)) continue;
                     if (DateTime.Now.Date != _currentDate) RotateLogFile();
                     batch.Clear();
                     batch.AppendLine(entry.ToString());
 
                     // Drain anything else already queued — coalesce writes.
-                    while (_channel.Reader.TryRead(out var more))
+                    while (_pendingEntries.TryDequeue(out var more))
                     {
                         batch.AppendLine(more.ToString());
                     }
@@ -114,7 +111,6 @@ namespace RhinoAIBridge
                     try { File.AppendAllText(_currentLogFile, batch.ToString()); } catch { }
                 }
             }
-            catch (OperationCanceledException) { }
             catch { /* writer must never crash the plugin */ }
         }
 
@@ -137,7 +133,9 @@ namespace RhinoAIBridge
             while (_recentEntries.Count > MAX_RECENT) _recentEntries.TryDequeue(out _);
 
             // Disk: fire-and-forget enqueue. Bounded + DropOldest, so this never blocks.
-            _channel?.Writer.TryWrite(entry);
+            _pendingEntries.Enqueue(entry);
+            while (_pendingEntries.Count > MAX_PENDING) _pendingEntries.TryDequeue(out _);
+            _pendingSignal.Set();
 
             if (level == LogLevel.ERROR)
             {

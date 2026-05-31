@@ -1,4 +1,4 @@
-# RhinoAIBridge v4.7.5 — AI Control of Rhino 8 via MCP
+# RhinoAIBridge v4.7.6 — AI Control of Rhino 8 via MCP
 
 > **The most powerful Rhino MCP server.** 90 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 — create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
@@ -19,7 +19,7 @@
 This is the **fastest, most feature-complete Rhino AI integration available**:
 
 - **Sub-millisecond ping** with in-process scene cache (no full scene walks)
-- **Gzip wire compression** — 5-8x smaller payloads on large scenes
+- **Local authenticated TCP bridge** — per-user token handshake on `127.0.0.1`
 - **Auto-thumbnails** — every mutation returns a viewport JPEG so the AI sees what it built
 - **Atomic batches** — multi-step operations roll back as one unit on failure
 - **No .NET SDK required** on target machines — plugin is pre-built
@@ -34,11 +34,11 @@ This is the **fastest, most feature-complete Rhino AI integration available**:
 ### Windows
 
 1. **Download** the latest release zip and unzip anywhere
-2. **Double-click `INSTALL.bat`** — copies the plugin, installs dependencies, patches Claude Desktop/Codex config automatically
+2. **Close Rhino**, then **double-click `INSTALL.bat`** — copies the pre-built plugin, installs dependencies, and patches Claude Desktop, Codex, and Gemini Antigravity automatically
 3. **Open Rhino 8** → type `PluginManager` → Install → browse to:
    `%APPDATA%\McNeel\Rhinoceros\8.0\Plug-ins\RhinoAIBridge\RhinoAIBridge.rhp`
    *(First time only — auto-loads on future starts)*
-4. **In Rhino command line**, type: `AIBridge`
+4. **In Rhino command line**, type: `AIBridge`, then choose Safe, Standard, or Developer mode
 5. **Restart Claude Desktop** → ask: *"ping Rhino"*
 
 That is it. No Visual Studio. No .NET SDK. No manual config editing.
@@ -213,7 +213,7 @@ Manual config — `~/.codex/config.toml`:
 ```toml
 [mcp_servers.rhino_architect]
 command = "uv"
-args = ["--directory", "C:\\path\\to\\rhino-mcp\\server", "run", "rhino-architect"]
+args = ["--directory", "C:\\path\\to\\rhino-mcp\\server", "run", "--frozen", "rhino-architect"]
 startup_timeout_sec = 20
 tool_timeout_sec = 120
 enabled = true
@@ -221,16 +221,21 @@ enabled = true
 [mcp_servers.rhino_architect.env]
 RHINO_HOST = "127.0.0.1"
 RHINO_PORT = "9544"
-RHINO_SAFE_MODE = "1"
+RHINO_SAFE_MODE = "0"
 ```
 
 Or via CLI:
 ```powershell
-codex mcp add rhino_architect --env RHINO_SAFE_MODE=1 -- uv --directory "C:\path\to\rhino-mcp\server" run rhino-architect
+codex mcp add rhino_architect --env RHINO_SAFE_MODE=0 -- uv --directory "C:\path\to\rhino-mcp\server" run --frozen rhino-architect
 codex mcp list
 ```
 
 Then in Rhino run `AIBridge`, and ask Codex: *"ping Rhino"*
+
+### Gemini Antigravity
+`INSTALL.bat` configures `%USERPROFILE%\.gemini\antigravity\mcp_config.json` automatically when Antigravity is detected.
+
+Restart Antigravity after installation, run `AIBridge` in Rhino, choose an access mode, and ask: *"ping Rhino"*
 
 ### ChatGPT
 ```
@@ -264,15 +269,15 @@ Claude Desktop / ChatGPT / Codex / Ollama
          v
   server/src/rhino_architect/server.py   <- FastMCP Python server (90 tools)
          |  TCP 127.0.0.1:9544
-         |  [1-byte flag][4-byte len][gzip payload]
+         |  local auth token + [1-byte flag][4-byte len][JSON payload]
          v
-  plugin/RhinoAIBridge.rhp              <- C# Rhino 8 plugin (.NET 7)
+  plugin/RhinoAIBridge.rhp              <- C# Rhino 8 plugin (.NET 8)
          |  UI thread dispatch + deferred redraw
          v
   Rhino 8 Document
 ```
 
-**Wire protocol:** Responses over 10 KB are gzip-compressed. Large floor-stack responses see 5-8x reduction. The scene snapshot cache means repeated `query_scene` calls are O(1) regardless of object count.
+**Wire protocol:** The local bridge requires a per-user auth token before it accepts commands. Responses use raw JSON framing to avoid Rhino plugin-loader runtime dependency failures. The scene snapshot cache means repeated `query_scene` calls are O(1) regardless of object count.
 
 **Atomic batches:** Send `batch(commands=[...], atomic=true)` and the entire sequence runs inside one Rhino undo record. Any failure triggers `Doc.Undo()` — the scene is left exactly as it was.
 
@@ -284,14 +289,14 @@ Claude Desktop / ChatGPT / Codex / Ollama
 
 Only needed if you want to modify the C# plugin. Target machines do NOT need the .NET SDK.
 
-Requirements: .NET 7 SDK, Rhino 8 (for RhinoCommon)
+Requirements: .NET 8 SDK, Rhino 8 (for RhinoCommon)
 
 ```
 cd plugin
 dotnet build --configuration Release
 ```
 
-Output: `plugin/bin/Release/net7.0/`. Copy `.rhp` + DLLs to the Rhino plugin folder.
+Output: `plugin/bin/Release/net8.0/`. Copy `.rhp`, DLLs, JSON runtime files, and `runtimes/` to the Rhino plugin folder.
 
 ---
 
@@ -301,7 +306,7 @@ Output: `plugin/bin/Release/net7.0/`. Copy `.rhp` + DLLs to the Rhino plugin fol
 
 **Plugin does not appear in Claude** — Restart Claude Desktop after install. Check `%APPDATA%\Claude\claude_desktop_config.json` contains the `rhino-architect` server entry.
 
-**Protocol version mismatch** — Run `INSTALL.bat` again to copy the latest plugin binary. The v4.7.5 plugin reports protocol 4.7.
+**Protocol version mismatch** — Run `INSTALL.bat` again to copy the latest plugin binary. The v4.7.6 plugin reports protocol 4.7.
 
 **uv not found** — Open a new terminal after install (PATH change does not apply to the current session).
 
@@ -311,7 +316,7 @@ Output: `plugin/bin/Release/net7.0/`. Copy `.rhp` + DLLs to the Rhino plugin fol
 
 **Run health check** — `cd server && uv run python ../scripts/doctor.py` checks plugin, port, Claude Desktop, and Codex config in one pass.
 
-**Codex TOML parse error** — Re-run INSTALL.bat option [4]. v4.7.5 uses inline array format that all TOML parsers accept.
+**Codex TOML parse error** — Re-run `INSTALL.bat`. v4.7.6 uses inline array format that all TOML parsers accept.
 
 **Codex not seeing the server** — Run `codex mcp list` and confirm `rhino_architect` is listed and `enabled = true`. Re-run INSTALL.bat option [4] if missing.
 
@@ -319,7 +324,14 @@ Output: `plugin/bin/Release/net7.0/`. Copy `.rhp` + DLLs to the Rhino plugin fol
 
 ## Changelog
 
-### v4.7.5 (current)
+### v4.7.6 (current)
+- **Rhino 8 runtime compatibility** — removes plugin-loader dependencies on `System.Threading.Channels` and response compression assemblies
+- **Authenticated localhost bridge** — per-user token handshake, client cap, idle timeout, and connection cleanup
+- **Startup access modes** — run `AIBridge` and choose Safe, Standard, or Developer mode
+- **Geometry correctness fixes** — live transform GUIDs, planar offsets, vertical wall validation, layer full paths, and closed polyline reporting
+- **Clean SDK-free installer** — deploys the complete pre-built .NET 8 payload and configures Claude Desktop, Codex, and Gemini Antigravity
+
+### v4.7.5
 - **90 tools** — up from 32 in v4.5
 - **15 missing dispatch entries fixed** — `set_design_brief`, `get_design_brief`, `tag_object`, `get_provenance`, `search_memory`, `get_related_objects`, `name_group`, `get_group`, `get_all_groups`, `add_design_rule`, `log_session`, `get_scene_diff`, `get_change_log`, `get_tracker_version`, and `get_design_rules` now properly registered in the C# plugin
 - **Double-serialization fix** — 35+ tools were wrapping JSON in `json.dumps()` causing clients to receive escaped strings. All tools now return native dicts

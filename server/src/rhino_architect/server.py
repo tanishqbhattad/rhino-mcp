@@ -1,14 +1,14 @@
-# RhinoAIBridge v4.7.5 — MCP Server
+# RhinoAIBridge v4.7.6 MCP Server
 # by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
 
-"""Rhino AI Bridge v4.7.5 — MCP Server.
+"""Rhino AI Bridge v4.7.6 MCP Server.
 
 This release combines:
   Phase 1 — lean responses (dicts Ã¢â€ ' FastMCP Ã¢â€ ' orjson on wire)
   Phase 2 — scene_version etag surfaced on every response (cache key for the model)
   Phase 3 — atomic batches + reference resolution ($1.object_ids[0] chaining)
   Phase 5 — architect intelligence layer (massing, floors, core, facade, schedules)
-  Phase 6 — consolidated 28-tool MCP surface (was 66 in v3)
+  Phase 6 — consolidated 90-tool MCP surface
 
 Phase 4 (multiplexed protocol) and Phase 7 (System.Text.Json) intentionally deferred —
 both buy less than the cache + tool-surface work, and both have correctness pitfalls
@@ -41,7 +41,8 @@ logger = logging.getLogger("rhino_ai_bridge")
 import os
 
 # ── Safe mode ─────────────────────────────────────────────────────────────────
-# Set RHINO_SAFE_MODE=1 to block destructive commands.
+# Optional Python-side defense: set RHINO_SAFE_MODE=1 to block destructive commands.
+# The Rhino plugin independently enforces the Safe / Standard / Developer mode chosen in Rhino.
 # Safe, trusted (default), or developer — controlled by env var.
 _SAFE_MODE = os.environ.get("RHINO_SAFE_MODE", "").strip().lower() in ("1", "true", "yes")
 _TRUSTED_MODE = not _SAFE_MODE  # default
@@ -511,7 +512,7 @@ class RunCommandInput(BaseModel):
 # Ã¢"â‚¬Ã¢"â‚¬ Capabilities Resource Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬Ã¢"â‚¬
 # Long-tail commands (still callable inside `batch`) and discoverable workflows.
 CAPABILITIES: dict[str, Any] = {
-    "version": "4.7.5",
+    "version": "4.7.6",
     "phase": "1+2+3+5+6",
     "deferred_phases": {
         "phase_4": "multiplexed protocol — deferred (UI-thread serialization makes the gain marginal)",
@@ -641,7 +642,7 @@ async def ping(params: Empty) -> dict:
         data["capabilities_resource"] = "rhino://capabilities"
         data["safe_mode"] = _SAFE_MODE
         data["mcp_python"] = _sys.executable
-        data["mcp_version"] = "4.7.5"
+        data["mcp_version"] = "4.7.6"
         # Check optional dependencies
         dep_status = {}
         for pkg in ["pymupdf", "cv2", "numpy"]:
@@ -651,11 +652,12 @@ async def ping(params: Empty) -> dict:
             except ImportError:
                 dep_status[pkg] = "missing"
         data["optional_dependencies"] = dep_status
-        # Version compatibility check
+        # Protocol 4.x releases remain wire-compatible.
         plugin_ver = data.get("protocol_version", "")
-        if plugin_ver and plugin_ver != "4.7":
-            data["version_warning"] = (f"MCP server expects protocol 4.7; plugin reports {plugin_ver}. "
-                                       f"Update the .rhp plugin to v4.7.5 for full compatibility.")
+        plugin_major = plugin_ver.split(".", 1)[0] if plugin_ver else ""
+        if plugin_ver and plugin_major != "4":
+            data["version_warning"] = (f"MCP server expects protocol 4.x; plugin reports {plugin_ver}. "
+                                       "Update the .rhp plugin for full compatibility.")
         return data
     except Exception as e:
         return {"status": "error", "message": str(e),

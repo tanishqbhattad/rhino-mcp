@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 :: ============================================================
 ::   RhinoAIBridge -- Smart Installer
 ::   by tanishqb  |  https://github.com/tanishqbhattad/rhino-mcp
-::   Version 4.7.5  |  Auto-detects Claude Desktop, Codex, Antigravity
+::   Version 4.7.6  |  Auto-detects Claude Desktop, Codex, Antigravity
 ::   Pre-built plugin -- .NET SDK NOT required.
 :: ============================================================
 
@@ -63,13 +63,33 @@ echo.
 echo  [1/3] Installing Rhino plugin...
 
 if not exist "%DIST_DIR%\RhinoAIBridge.rhp" goto :err_no_rhp
+powershell -NoProfile -Command "if (Get-Process -Name Rhino -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }"
+if not errorlevel 1 goto :err_rhino_open
 if not exist "%RHINO_PLUGIN_DIR%" mkdir "%RHINO_PLUGIN_DIR%"
-copy /Y "%DIST_DIR%\RhinoAIBridge.rhp"                    "%RHINO_PLUGIN_DIR%\" >nul
-copy /Y "%DIST_DIR%\Newtonsoft.Json.dll"                  "%RHINO_PLUGIN_DIR%\" >nul
-if exist "%DIST_DIR%\System.Drawing.Common.dll"           copy /Y "%DIST_DIR%\System.Drawing.Common.dll"        "%RHINO_PLUGIN_DIR%\" >nul
-if exist "%DIST_DIR%\Microsoft.Win32.SystemEvents.dll"    copy /Y "%DIST_DIR%\Microsoft.Win32.SystemEvents.dll" "%RHINO_PLUGIN_DIR%\" >nul
+if errorlevel 1 goto :err_plugin_copy
+del /Q "%RHINO_PLUGIN_DIR%\*.dll" "%RHINO_PLUGIN_DIR%\*.deps.json" "%RHINO_PLUGIN_DIR%\*.runtimeconfig.json" >nul 2>&1
+if exist "%RHINO_PLUGIN_DIR%\runtimes" rmdir /S /Q "%RHINO_PLUGIN_DIR%\runtimes"
+copy /Y "%DIST_DIR%\*.*" "%RHINO_PLUGIN_DIR%\" >nul
+if errorlevel 1 goto :err_plugin_copy
+if exist "%DIST_DIR%\runtimes" xcopy /E /I /Y "%DIST_DIR%\runtimes" "%RHINO_PLUGIN_DIR%\runtimes" >nul
+if errorlevel 1 goto :err_plugin_copy
 echo  OK  ^(plugin installed to %RHINO_PLUGIN_DIR%^)
 goto :step2
+
+:err_plugin_copy
+echo.
+echo  ERROR: Could not copy the Rhino plugin files.
+echo  Close Rhino completely and run INSTALL.bat again.
+echo.
+pause
+exit /b 1
+
+:err_rhino_open
+echo.
+echo  ERROR: Rhino is open. Close Rhino completely, then run INSTALL.bat again.
+echo.
+pause
+exit /b 1
 
 :err_no_rhp
 echo.
@@ -121,8 +141,13 @@ echo  OK
 :: -- Install Python MCP server dependencies ------------------------------------
 echo  Installing Python server dependencies...
 cd /d "%SERVER_DIR%"
-uv sync
+uv sync --frozen
+if not errorlevel 1 goto :uv_sync_ok
+echo  Global uv cache could not be used. Retrying with a local cache...
+set "UV_CACHE_DIR=%SERVER_DIR%\.uv-cache"
+uv sync --frozen
 if errorlevel 1 goto :err_uv_sync
+:uv_sync_ok
 echo  OK  ^(MCP server ready^)
 goto :config
 
@@ -193,7 +218,7 @@ if "!CONFIGURED!"=="0" (
 
 :: -- Done -----------------------------------------------------------------------
 echo  ============================================================
-echo    INSTALLATION COMPLETE  ^|  RhinoAIBridge v4.7.5 by tanishqb
+echo    INSTALLATION COMPLETE  ^|  RhinoAIBridge v4.7.6 by tanishqb
 echo  ============================================================
 echo.
 echo  NEXT STEPS:

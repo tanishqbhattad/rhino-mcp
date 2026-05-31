@@ -54,6 +54,7 @@ def main():
             "--directory",
             server_dir,
             "run",
+            "--frozen",
             "rhino-architect",
         ],
     }

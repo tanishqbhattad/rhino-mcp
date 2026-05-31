@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import zipfile
 import fnmatch
+import hashlib
 from pathlib import Path
 
 CACHE_DIR = Path(os.environ.get("APPDATA", "")) / "AIBridge" / "materials"
@@ -16,7 +17,11 @@ _BASE_URL = "https://ambientcg.com/api/v2/full_json"
 _RESOLUTION_PREFERENCE = [
     "2K-PNG", "2K-JPG", "1K-PNG", "1K-JPG",
     "4K-PNG", "4K-JPG", "512-PNG", "512-JPG",
+    "2K-TIFF", "1K-TIFF", "4K-TIFF",
+    "2K-EXR", "1K-EXR", "4K-EXR",
 ]
+_FORMAT_PREFERENCE = ["PNG", "JPG", "TIFF", "EXR"]
+_SCHEMA_CACHE_DIR = CACHE_DIR / "_api_cache"
 
 # Map patterns to texture slot names
 _MAP_PATTERNS = {
@@ -30,10 +35,28 @@ _MAP_PATTERNS = {
 
 
 def _fetch_json(url: str) -> dict:
-    """Fetch a URL and return parsed JSON."""
-    req = urllib.request.Request(url, headers={"User-Agent": "RhinoAIBridge/4.7.5"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    """Fetch parsed JSON, falling back to the last known good response."""
+    cache_file = _SCHEMA_CACHE_DIR / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "RhinoAIBridge/4.7.6"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        try:
+            _SCHEMA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_file.write_text(json.dumps(data), encoding="utf-8")
+        except Exception:
+            pass
+        return data
+    except Exception as exc:
+        if cache_file.is_file():
+            try:
+                data = json.loads(cache_file.read_text(encoding="utf-8"))
+                data["_stale_cache"] = True
+                data["_fetch_error"] = str(exc)
+                return data
+            except Exception:
+                pass
+        raise
 
 
 def _extract_downloads(asset: dict) -> list[dict]:
@@ -193,12 +216,11 @@ def get_material_info(asset_id: str) -> dict:
 
 def _pick_download_entry(downloads: list[dict], resolution: str) -> dict | None:
     """Find the best matching download entry for the requested resolution."""
-    pref_attr = "{}-PNG".format(resolution)
-    pref_attr_jpg = "{}-JPG".format(resolution)
+    requested = [f"{resolution}-{fmt}" for fmt in _FORMAT_PREFERENCE]
 
-    ordered = [pref_attr, pref_attr_jpg] + [
+    ordered = requested + [
         p for p in _RESOLUTION_PREFERENCE
-        if p not in (pref_attr, pref_attr_jpg)
+        if p not in requested
     ]
 
     attr_map = {
@@ -287,7 +309,7 @@ def download_material(asset_id: str, resolution: str = "2K") -> dict:
         tmp_path = Path(tmp.name)
 
     try:
-        req = urllib.request.Request(download_url, headers={"User-Agent": "RhinoAIBridge/4.7.5"})
+        req = urllib.request.Request(download_url, headers={"User-Agent": "RhinoAIBridge/4.7.6"})
         with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as out:
             shutil.copyfileobj(resp, out)
 

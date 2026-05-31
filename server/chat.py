@@ -35,6 +35,7 @@ import json
 import os
 import struct
 import sys
+from pathlib import Path
 from typing import Any
 
 # â”€â”€ Dependency check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -59,6 +60,13 @@ class RhinoBridge:
         self._sock = socket.create_connection((host, port), timeout=5.0)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(60.0)
+        token_path = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "AIBridge" / "token"
+        if token_path.is_file():
+            token = token_path.read_text(encoding="utf-8").strip()
+            if token:
+                response = self._send_recv({"type": "auth", "token": token})
+                if response.get("status") != "ok" and response.get("error_code") == "AUTH_REQUIRED":
+                    raise ConnectionError("Rhino rejected the local auth token. Restart AIBridge in Rhino.")
 
     def _send_recv(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = orjson.dumps(payload)

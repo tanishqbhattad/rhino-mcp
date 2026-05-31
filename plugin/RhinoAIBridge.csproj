@@ -1,12 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>net7.0</TargetFramework>
+    <TargetFramework>net8.0</TargetFramework>
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <TargetExt>.rhp</TargetExt>
     <NoWarn>NU1701</NoWarn>
-    <Version>4.7.5</Version>
+    <Version>4.7.6</Version>
     <Title>RhinoAIBridge</Title>
-    <Description>AI Bridge for Rhino 8 - v4.7.5 (90 tools, sections, display modes, materials, PDF tracing)</Description>
+    <Description>AI Bridge for Rhino 8 - v4.7.6 (90 tools, sections, display modes, materials, PDF tracing)</Description>
     <AssemblyName>RhinoAIBridge</AssemblyName>
     <RootNamespace>RhinoAIBridge</RootNamespace>
     <LangVersion>latest</LangVersion>
