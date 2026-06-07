@@ -1,4 +1,4 @@
-// RhinoAIBridge v4.5 â€” CommandHandler.cs
+// RhinoAIBridge v4.5 - CommandHandler.cs
 // by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
 
 using System;
@@ -7,6 +7,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -23,7 +24,7 @@ namespace RhinoAIBridge
     ///      the outer scope (opened in AIBridgeServer per command) flushes one redraw.
     ///      Batches now redraw exactly ONCE no matter how many sub-ops.
     ///   2. AreaMassProperties / VolumeMassProperties are opt-in via params.measure=true.
-    ///      Default response shape returns ids + bbox only â€” what the next tool call actually needs.
+    ///      Default response shape returns ids + bbox only - what the next tool call actually needs.
     ///      For the common architect flow (extrude, transform, section, repeat) this saves
     ///      a Brep integration on every single create.
     ///   3. capture_viewport now uses MemoryStream + JPEG default + bitmap downscale
@@ -48,10 +49,13 @@ namespace RhinoAIBridge
         public static bool SafeMode => Mode == BridgeMode.Safe;
 
         private static readonly HashSet<string> CodeExecCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        { "execute_script", "run_command" };
+        { "execute_script", "run_python", "run_command" };
 
         private static readonly HashSet<string> DestructiveCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "delete_objects", "boolean_operation" };
+
+        private static readonly HashSet<string> AutoCheckpointUndoNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        { "Boolean", "Delete", "DelLayer", "Restore", "RhinoCmd", "Script", "TrimPlanes" };
 
         public CommandHandler()
         {
@@ -59,13 +63,13 @@ namespace RhinoAIBridge
             {
                 // Context & Scene
                 ["get_context"] = W(GetContext), ["get_selection"] = W(GetSelection),
-                ["get_scene_summary"] = W(GetSceneSummary), ["get_objects"] = W(GetObjects),
+                ["get_scene_summary"] = W(GetSceneSummary), ["get_objects"] = W(GetObjects), ["list_objects"] = W(GetObjects),
                 ["get_object_details"] = W(GetObjectDetails), ["get_object_info"] = W(GetObjectDetails),
                 // Architecture
                 ["create_wall"] = U("Wall", CreateWall), ["create_slab"] = U("Slab", CreateSlab),
                 ["create_column"] = U("Column", CreateColumn), ["create_opening"] = U("Opening", CreateOpening),
                 ["create_roof"] = U("Roof", CreateRoof),
-                // Phase 5 â€” Architect intelligence layer
+                // Phase 5 - Architect intelligence layer
                 ["query_scene"] = W(QueryScene),
                 ["create_massing"] = U("Massing", CreateMassing),
                 ["derive_floors_from_mass"] = U("FloorsFromMass", DeriveFloorsFromMass),
@@ -81,8 +85,13 @@ namespace RhinoAIBridge
                 ["create_sphere"] = U("Sphere", CreateSphere), ["create_line"] = U("Line", CreateLine),
                 ["create_polyline"] = U("Polyline", CreatePolyline),
                 // Advanced
-                ["loft"] = U("Loft", Loft), ["sweep1"] = U("Sweep", Sweep1),
-                ["pipe"] = U("Pipe", Pipe), ["extrude_curve"] = U("Extrude", ExtrudeCurve),
+                ["loft"] = U("Loft", Loft), ["loft_surface"] = U("Loft", Loft),
+                ["sweep1"] = U("Sweep", Sweep1), ["sweep2"] = U("Sweep2", Sweep2),
+                ["pipe"] = U("Pipe", Pipe), ["pipe_curve"] = U("Pipe", Pipe),
+                ["extrude_curve"] = U("Extrude", ExtrudeCurve),
+                ["network_surface"] = U("NetworkSurface", NetworkSurface),
+                ["sphere_patch"] = U("SpherePatch", SpherePatch),
+                ["trim_with_planes"] = U("TrimPlanes", TrimWithPlanes),
                 // Smart ops
                 ["fillet_edges"] = U("Fillet", FilletEdges), ["offset_curve"] = U("Offset", OffsetCurve),
                 ["extrude_curves"] = U("Extrude", ExtrudeCurves), ["join_curves"] = U("Join", JoinCurves),
@@ -102,13 +111,16 @@ namespace RhinoAIBridge
                 ["check_intersection"] = W(CheckIntersection), ["validate_objects"] = W(ValidateObjects),
                 // Viewport
                 ["set_view"] = W(SetView), ["set_display_mode"] = W(SetDisplayMode),
-                ["capture_viewport"] = W(CaptureViewport), ["select_objects"] = W(SelectObjects),
+                ["capture_viewport"] = W(CaptureViewport), ["get_viewport_image"] = W(CaptureViewport),
+                ["capture_inspection_view"] = W(CaptureInspectionView),
+                ["select_objects"] = W(SelectObjects), ["set_selection"] = W(SelectObjects),
                 ["set_camera"] = W(SetCamera), ["get_rhino_commands"] = W(GetRhinoCommands),
                 // Materials & Commands
                 ["set_layer_material"] = W(SetLayerMaterial),
                 ["run_command"] = U("RhinoCmd", RunCommand),
                 // Workflow (Tier 2)
                 ["get_cross_section"] = U("Section", GetCrossSection),
+                ["get_section_profile"] = W(GetSectionProfile), ["get_silhouette"] = W(GetSilhouette),
                 ["create_floor_stack"] = U("Floors", CreateFloorStack),
                 ["group_objects"] = U("Group", GroupObjects), ["ungroup_objects"] = U("Ungroup", UngroupObjects),
                 ["get_groups"] = W(GetGroups), ["hollow_solid"] = U("Hollow", HollowSolid),
@@ -117,7 +129,8 @@ namespace RhinoAIBridge
                 ["validate_architecture"] = W(ValidateArch), ["suggest_tools"] = W(SuggestTools),
                 ["lint_script"] = W(LintScript), ["get_camera_target"] = W(GetCameraTarget),
                 // Script & Undo & Logs
-                ["execute_script"] = W(ExecuteScript), ["undo"] = W(DoUndo), ["redo"] = W(DoRedo),
+                ["execute_script"] = W(ExecuteScript), ["run_python"] = W(ExecuteScript),
+                ["undo"] = W(DoUndo), ["redo"] = W(DoRedo),
                 ["get_log"] = W(GetLog), ["get_log_stats"] = W(GetLogStats),
                 // v4.7: Sections, Elevations, Plans
                 ["create_section"] = W(CreateSectionCmd), ["create_elevation"] = W(CreateElevationCmd),
@@ -190,11 +203,11 @@ namespace RhinoAIBridge
             return _commands.TryGetValue(type, out var h) ? h(p) : Err($"Unknown command: {type}");
         }
 
-        // â”€â”€â”€ Phase 3: atomic batches + reference resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Phase 3: atomic batches + reference resolution --------------------------------------------------
         // 
         // A batch is { type: "batch", commands: [...], atomic: bool, stop_on_error: bool }.
         // 
-        // - atomic=true  â†’ wrap whole batch in one Rhino undo record. On any failure, roll back
+        // - atomic=true  -> wrap whole batch in one Rhino undo record. On any failure, roll back
         //                  via Doc.Undo() and return error with all results so Claude sees what
         //                  happened. The U decorator's per-op undo records are suppressed via
         //                  _atomicBatchDepth so the single outer record holds everything.
@@ -202,7 +215,7 @@ namespace RhinoAIBridge
         // - References: any string starting with "$N" inside a sub-op's params resolves to the
         //               Nth (1-indexed) prior result, with optional dot/bracket path. So you can
         //               feed "$1.object_ids[0]" into op 2 to chain ops without an extra round-trip.
-        //               This is the architect's superpower: build â†’ derive â†’ punch in one batch.
+        //               This is the architect's superpower: build -> derive -> punch in one batch.
         JObject DispatchBatch(JObject cmd)
         {
             var commands = cmd["commands"] as JArray ?? new JArray();
@@ -322,7 +335,7 @@ namespace RhinoAIBridge
                 ["count"] = results.Count,
                 ["results"] = results
             };
-            // One thumbnail for the entire batch â€” Claude sees the final state without an
+            // One thumbnail for the entire batch - Claude sees the final state without an
             // extra capture_viewport round-trip.
             var batchThumb = TryCaptureThumbnail();
             if (batchThumb != null) batchOk["thumbnail_base64"] = batchThumb;
@@ -406,25 +419,34 @@ namespace RhinoAIBridge
             return cur;
         }
 
-        // â”€â”€â”€ Decorators â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Decorators --------------------------------------------------
         // U = mutating: open a Rhino undo record + a deferred-redraw scope.
         // Inside an atomic batch, suppress per-op undo records so the batch-level record
         // holds the full atomic unit (allowing single-Doc.Undo() rollback).
         // Auto-thumbnail: after the RedrawScope exits (so viewport is updated), captures a small
-        // JPEG and embeds it in the response â€” only at the top level, not inside any batch.
+        // JPEG and embeds it in the response - only at the top level, not inside any batch.
         Func<JObject, JObject> U(string name, Func<JObject, JObject> fn) => (p) =>
         {
             uint uid = 0;
             if (_atomicBatchDepth == 0) uid = Doc.BeginUndoRecord($"AI: {name}");
             JObject result;
+            JObject autoCheckpoint = null;
             try
             {
+                if (_batchDepth == 0 && _atomicBatchDepth == 0
+                    && p?["auto_checkpoint"]?.ToObject<bool>() != false
+                    && AutoCheckpointUndoNames.Contains(name))
+                {
+                    autoCheckpoint = SaveAutoCheckpoint(name);
+                }
                 using (RedrawScope.Defer())
                 {
                     result = fn(p);
                 }
-                // RedrawScope has exited â€” exactly one Redraw() has fired. Capture thumbnail
-                // only at the top level (not inside a batch â€” batch adds its own at the end).
+                if (autoCheckpoint != null)
+                    result["auto_checkpoint"] = autoCheckpoint;
+                // RedrawScope has exited - exactly one Redraw() has fired. Capture thumbnail
+                // only at the top level (not inside a batch - batch adds its own at the end).
                 if (_batchDepth == 0 && result?["status"]?.ToString() == "ok")
                 {
                     var thumb = TryCaptureThumbnail();
@@ -434,7 +456,9 @@ namespace RhinoAIBridge
             catch (Exception e)
             {
                 AIBridgeLogger.Log(LogLevel.ERROR, "Cmd", e.Message, name, error: e.ToString());
-                result = Err(e.Message);
+                result = ErrFromException(e, name);
+                if (autoCheckpoint != null)
+                    result["auto_checkpoint"] = autoCheckpoint;
             }
             finally { if (uid > 0) Doc.EndUndoRecord(uid); }
             return result;
@@ -447,11 +471,11 @@ namespace RhinoAIBridge
             catch (Exception e)
             {
                 AIBridgeLogger.Log(LogLevel.ERROR, "Cmd", e.Message, error: e.ToString());
-                return Err(e.Message);
+                return ErrFromException(e);
             }
         };
 
-        // â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- Helpers --------------------------------------------------
         static RhinoDoc Doc => RhinoDoc.ActiveDoc;
         static double Tol => Doc.ModelAbsoluteTolerance;
 
@@ -465,8 +489,72 @@ namespace RhinoAIBridge
         static JObject Err(string m, string code = "COMMAND_FAILED", JObject diag = null)
         {
             var j = new JObject { ["status"] = "error", ["error_code"] = code, ["message"] = m };
+            j["recoverable"] = code is not ("AUTH_FAILED" or "MODE_BLOCKED" or "INVALID_REQUEST");
+            j["retry_hint"] = code switch
+            {
+                "LAYER_NOT_FOUND" => "Use list_layers or pass the full Parent::Child layer path.",
+                "OBJECT_NOT_FOUND" => "Call query_scene/list_objects again and use the current object id.",
+                "NOT_A_CURVE" => "Pass a curve id, or create/extract a curve first.",
+                "NOT_A_BREP" => "Pass a Brep or polysurface id for this operation.",
+                "CAPTURE_FAILED" => "Try smaller dimensions, a lighter display mode, or wireframe=true.",
+                "MODE_BLOCKED" => "Switch AIBridge to Standard or Developer mode in Rhino, then retry.",
+                "COMMAND_FAILED" => "Check diagnostics and simplify the inputs; this is usually a geometry validity issue.",
+                _ => null
+            };
             if (diag != null) j["diagnostics"] = diag;
             return j;
+        }
+
+        static JObject ErrFromException(Exception e, string commandName = null)
+        {
+            var diag = new JObject { ["exception_type"] = e.GetType().Name };
+            if (!string.IsNullOrEmpty(commandName)) diag["command"] = commandName;
+            return Err(e.Message, ClassifyErrorCode(e), diag);
+        }
+
+        static string ClassifyErrorCode(Exception e)
+        {
+            var m = e.Message ?? "";
+            if (e is FormatException || e is ArgumentException) return "INVALID_REQUEST";
+            if (m.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0) return "OBJECT_NOT_FOUND";
+            if (m.IndexOf("not a curve", StringComparison.OrdinalIgnoreCase) >= 0) return "NOT_A_CURVE";
+            if (m.IndexOf("not a brep", StringComparison.OrdinalIgnoreCase) >= 0) return "NOT_A_BREP";
+            if (m.IndexOf("layer", StringComparison.OrdinalIgnoreCase) >= 0 &&
+                m.IndexOf("not", StringComparison.OrdinalIgnoreCase) >= 0) return "LAYER_NOT_FOUND";
+            if (m.IndexOf("capture", StringComparison.OrdinalIgnoreCase) >= 0) return "CAPTURE_FAILED";
+            return "COMMAND_FAILED";
+        }
+
+        JObject SaveAutoCheckpoint(string operation)
+        {
+            try
+            {
+                var name = $"auto_{operation}_{DateTime.Now:yyyyMMdd_HHmmss}";
+                var cp = SaveCheckpoint(new JObject { ["name"] = name });
+                if (cp?["status"]?.ToString() == "ok")
+                {
+                    return new JObject
+                    {
+                        ["checkpoint"] = cp["checkpoint"],
+                        ["path"] = cp["path"],
+                        ["size_kb"] = cp["size_kb"],
+                        ["operation"] = operation
+                    };
+                }
+                return new JObject
+                {
+                    ["status"] = "warning",
+                    ["message"] = cp?["message"]?.ToString() ?? "Auto-checkpoint failed"
+                };
+            }
+            catch (Exception e)
+            {
+                return new JObject
+                {
+                    ["status"] = "warning",
+                    ["message"] = $"Auto-checkpoint failed: {e.Message}"
+                };
+            }
         }
 
         static Point3d Pt(JToken t)
@@ -495,6 +583,79 @@ namespace RhinoAIBridge
                 ["z"] = Math.Round(b.Max.Z - b.Min.Z, 2)
             }
         };
+
+        static JArray PointsJson(IEnumerable<Point3d> pts)
+        {
+            var a = new JArray();
+            foreach (var pt in pts) a.Add(PA(pt));
+            return a;
+        }
+
+        static List<Point3d> SampleCurvePoints(Curve c, int samples = 80)
+        {
+            var pts = new List<Point3d>();
+            if (c == null) return pts;
+            var div = c.DivideByCount(Math.Max(4, samples), true);
+            if (div != null && div.Length > 0)
+            {
+                pts.AddRange(div.Select(t => c.PointAt(t)));
+            }
+            else
+            {
+                pts.Add(c.PointAtStart);
+                pts.Add(c.PointAtEnd);
+            }
+            return pts;
+        }
+
+        static JObject PolylinesPayload(IEnumerable<List<Point3d>> polylines, string projection = "xy")
+        {
+            var lines = polylines.Where(l => l.Count > 0).ToList();
+            var arr = new JArray();
+            foreach (var line in lines) arr.Add(PointsJson(line));
+
+            var all = lines.SelectMany(l => l).ToList();
+            var bbox = all.Count > 0 ? new BoundingBox(all) : BoundingBox.Empty;
+            return new JObject
+            {
+                ["polylines"] = arr,
+                ["polyline_count"] = lines.Count,
+                ["bbox"] = bbox.IsValid ? BB(bbox) : null,
+                ["svg"] = BuildSvg(lines, projection)
+            };
+        }
+
+        static string BuildSvg(IEnumerable<List<Point3d>> polylines, string projection = "xy")
+        {
+            var lines = polylines.Where(l => l.Count > 0).ToList();
+            if (lines.Count == 0) return "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1\" height=\"1\" />";
+            Func<Point3d, (double x, double y)> map = projection.ToLowerInvariant() switch
+            {
+                "xz" => p => (p.X, p.Z),
+                "yz" => p => (p.Y, p.Z),
+                _ => p => (p.X, p.Y)
+            };
+            var flat = lines.SelectMany(l => l).Select(map).ToList();
+            double minX = flat.Min(p => p.x), maxX = flat.Max(p => p.x);
+            double minY = flat.Min(p => p.y), maxY = flat.Max(p => p.y);
+            double w = Math.Max(1, maxX - minX), h = Math.Max(1, maxY - minY);
+            var sb = new StringBuilder();
+            sb.Append($"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{minX:F3} {-maxY:F3} {w:F3} {h:F3}\">");
+            sb.Append("<g fill=\"none\" stroke=\"black\" stroke-width=\"1\" vector-effect=\"non-scaling-stroke\">");
+            foreach (var line in lines)
+            {
+                var d = new StringBuilder();
+                for (int i = 0; i < line.Count; i++)
+                {
+                    var (x, y) = map(line[i]);
+                    d.Append(i == 0 ? "M " : " L ");
+                    d.Append($"{x:F3} {-y:F3}");
+                }
+                sb.Append($"<path d=\"{d}\" />");
+            }
+            sb.Append("</g></svg>");
+            return sb.ToString();
+        }
 
         static int EnsureLayer(string name, int[] color = null)
         {
@@ -530,7 +691,7 @@ namespace RhinoAIBridge
             return Doc.Objects.GetObjectList(s).ToList();
         }
 
-        // Snapshot accessor â€” null safe.
+        // Snapshot accessor - null safe.
         static List<string> CaptureAddedIds(Action action)
         {
             var added = new List<string>();
@@ -592,10 +753,10 @@ namespace RhinoAIBridge
         static Brep GetBrep(RhinoObject o) => o?.Geometry is Brep b ? b : o?.Geometry is Extrusion e ? e.ToBrep() : null;
 
         /// <summary>
-        /// Build a creation result. By default returns just ids + bbox â€” what the next tool call needs.
+        /// Build a creation result. By default returns just ids + bbox - what the next tool call needs.
         /// Pass measure:true in params (or set asBatch:false in the caller's caller) to include area/volume.
         /// 
-        /// In v3, AreaMassProperties.Compute and VolumeMassProperties.Compute ran on every single create â€”
+        /// In v3, AreaMassProperties.Compute and VolumeMassProperties.Compute ran on every single create -
         /// for an architect doing "create_floor_stack levels=30" that's 30 unwanted Brep integrations.
         /// In v4 this is opt-in. Callers that need it (measure_object, validate_architecture) ask explicitly.
         /// </summary>
@@ -622,7 +783,7 @@ namespace RhinoAIBridge
             return r;
         }
 
-        // Convenience â€” pulls measure flag from params, defaulting false.
+        // Convenience - pulls measure flag from params, defaulting false.
         static bool WantMeasure(JObject p) => p["measure"]?.ToObject<bool>() ?? false;
 
         static JObject OI(RhinoObject o)
@@ -646,7 +807,7 @@ namespace RhinoAIBridge
             return null;
         }
 
-        // â”€â”€â”€ CONTEXT & SCENE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- CONTEXT & SCENE --------------------------------------------------
         // Phase 2: these read tools now resolve through SceneSnapshotRegistry,
         // turning O(N) walks into O(1)/O(M). The snapshot is populated lazily on
         // first read after server start, then maintained by Rhino doc events.
@@ -656,7 +817,7 @@ namespace RhinoAIBridge
         JObject GetContext(JObject p)
         {
             var snap = Snap;
-            // Selection state is intentionally NOT cached â€” it's noisy and not central to architect workflow.
+            // Selection state is intentionally NOT cached - it's noisy and not central to architect workflow.
             // Pull selected directly; everything else from the snapshot.
             var sel = Doc.Objects.GetSelectedObjects(false, false).Take(20).Select(OI);
             var layers = Doc.Layers.Where(l => !l.IsDeleted).Select(l => new JObject
@@ -686,7 +847,7 @@ namespace RhinoAIBridge
             var snap = Snap;
             if (snap == null)
             {
-                // Cold path â€” should be unreachable in v4 but keep correctness.
+                // Cold path - should be unreachable in v4 but keep correctness.
                 return GetSceneSummaryFallback();
             }
 
@@ -694,7 +855,7 @@ namespace RhinoAIBridge
             var byLayer = snap.CountsByLayerName();
 
             // Build the layers array from the live LayerTable so visibility/locked are fresh.
-            // The counts come from the snapshot index â€” no per-object loop.
+            // The counts come from the snapshot index - no per-object loop.
             var layers = new JArray();
             foreach (var l in Doc.Layers.Where(x => !x.IsDeleted))
             {
@@ -792,7 +953,7 @@ namespace RhinoAIBridge
             return Ok(("objects", new JArray(res)), ("count", res.Count));
         }
 
-        // Build the lite-object view from cached snapshot metadata â€” avoids re-fetching geometry.
+        // Build the lite-object view from cached snapshot metadata - avoids re-fetching geometry.
         static JObject MetaToOI(SceneSnapshot.ObjectMeta m, SceneSnapshot snap)
         {
             return new JObject
@@ -815,7 +976,7 @@ namespace RhinoAIBridge
             return r;
         }
 
-        // â”€â”€â”€ ARCHITECTURE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- ARCHITECTURE --------------------------------------------------
         JObject CreateWall(JObject p)
         {
             var sp = Pt(p["start_point"]); var ep = Pt(p["end_point"]);
@@ -892,13 +1053,13 @@ namespace RhinoAIBridge
             return CrResult(gid, p["layer"]?.ToString() ?? "Roof", WantMeasure(p));
         }
 
-        // â”€â”€â”€ PHASE 5 â€” ARCHITECT INTELLIGENCE LAYER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- PHASE 5 - ARCHITECT INTELLIGENCE LAYER --------------------------------------------------
         //
         // These tools match how architects actually think: massing first, then floors,
         // then core, then facade rhythm, then alignment, then schedules. Each is shaped
         // to be the canonical "next move" in that workflow rather than a generic primitive.
 
-        // query_scene â€” replaces 5 separate getters (get_scene_summary, get_objects,
+        // query_scene - replaces 5 separate getters (get_scene_summary, get_objects,
         // list_layers, get_object_details by-layer/type/name) with one parameterized tool.
         // Served from the snapshot (Phase 2), so all branches are O(1) or O(M).
         JObject QueryScene(JObject p)
@@ -909,7 +1070,7 @@ namespace RhinoAIBridge
             var f = p["filter"] as JObject ?? new JObject();
             int limit = p["limit"]?.ToObject<int>() ?? (detail == "full" ? 200 : 80);
 
-            // scope=summary â†’ full scene summary (the GetSceneSummary payload)
+            // scope=summary -> full scene summary (the GetSceneSummary payload)
             if (scope == "summary" || scope == "scene")
             {
                 var r = GetSceneSummary(p);
@@ -918,7 +1079,7 @@ namespace RhinoAIBridge
                 return r;
             }
 
-            // scope=layers â†’ layer list with counts
+            // scope=layers -> layer list with counts
             if (scope == "layers")
             {
                 var r = ListLayers(p);
@@ -926,7 +1087,7 @@ namespace RhinoAIBridge
                 return r;
             }
 
-            // scope=objects (default) â€” apply filter and detail level
+            // scope=objects (default) - apply filter and detail level
             var lookupParams = new JObject();
             if (f["layer"] != null) lookupParams["layer"] = f["layer"];
             if (f["object_type"] != null || f["type"] != null) lookupParams["object_type"] = f["object_type"] ?? f["type"];
@@ -951,7 +1112,7 @@ namespace RhinoAIBridge
             {
                 // Already lite; pass through.
             }
-            // detail="full" returns whatever GetObjects gave us (currently lite â€” future: add geometry stats)
+            // detail="full" returns whatever GetObjects gave us (currently lite - future: add geometry stats)
 
             var result = new JObject
             {
@@ -964,7 +1125,7 @@ namespace RhinoAIBridge
             return result;
         }
 
-        // create_massing â€” site footprint â†’ solid mass. The canonical first move.
+        // create_massing - site footprint -> solid mass. The canonical first move.
         // Returns a `mass_id` key explicitly so the next tool (derive_floors_from_mass)
         // can consume it via reference: derive_floors_from_mass mass_id=$1.mass_id.
         JObject CreateMassing(JObject p)
@@ -991,9 +1152,9 @@ namespace RhinoAIBridge
             return r;
         }
 
-        // derive_floors_from_mass â€” section a solid at floor heights, extrude each section
+        // derive_floors_from_mass - section a solid at floor heights, extrude each section
         // downward into a slab. Variable level_heights[] supports non-uniform floor heights
-        // (ground floor taller, mezzanines, etc) â€” the architect-realistic case.
+        // (ground floor taller, mezzanines, etc) - the architect-realistic case.
         JObject DeriveFloorsFromMass(JObject p)
         {
             var o = Doc.Objects.FindId(new Guid(p["mass_id"].ToString()));
@@ -1027,7 +1188,7 @@ namespace RhinoAIBridge
             return Ok(("object_ids", ids), ("floors_created", ids.Count), ("z_levels", zLevels), ("source_mass_id", p["mass_id"]));
         }
 
-        // create_core â€” core walls + lift/stair/shaft modules + optional punch-through
+        // create_core - core walls + lift/stair/shaft modules + optional punch-through
         // of those modules into target massing solids. One call instead of dozens.
         JObject CreateCore(JObject p)
         {
@@ -1121,7 +1282,7 @@ namespace RhinoAIBridge
             }
 
             // Punch-through: subtract core modules from listed massing solids. This is the
-            // architect-felt magic â€” the core actually carves voids in the floor stack.
+            // architect-felt magic - the core actually carves voids in the floor stack.
             var punched = new JArray();
             var punchIds = p["punch_through"]?.ToObject<List<string>>() ?? new List<string>();
             if (punchIds.Count > 0 && coreBreps.Count > 0)
@@ -1141,7 +1302,7 @@ namespace RhinoAIBridge
             return Ok(("object_ids", ids), ("core_object_ids", ids), ("punched_mass_ids", punched), ("count", ids.Count));
         }
 
-        // place_openings_on_facade â€” distribute windows at a constant rhythm along walls.
+        // place_openings_on_facade - distribute windows at a constant rhythm along walls.
         // The whole facade in one call instead of N CreateOpening calls.
         JObject PlaceOpeningsOnFacade(JObject p)
         {
@@ -1186,7 +1347,7 @@ namespace RhinoAIBridge
             return Ok(("object_ids", ids), ("openings_created", ids.Count), ("errors", errors));
         }
 
-        // align_to_grid â€” snap object centers to grid spacing. Architect grid alignment
+        // align_to_grid - snap object centers to grid spacing. Architect grid alignment
         // for column/wall regularization. snap_z controls whether vertical alignment also snaps.
         JObject AlignToGrid(JObject p)
         {
@@ -1210,9 +1371,9 @@ namespace RhinoAIBridge
             return Ok(("aligned", moved), ("count", moved.Count), ("grid_spacing", g));
         }
 
-        // report_areas â€” GFA / NFA / by-floor schedule. The thing every architect asks for.
+        // report_areas - GFA / NFA / by-floor schedule. The thing every architect asks for.
         // Plan-area estimation: for solid Breps with a known volume and bbox height,
-        // plan_area â‰ˆ volume / height. Falls back to top-face area, then to bbox footprint.
+        // plan_area ~ volume / height. Falls back to top-face area, then to bbox footprint.
         JObject ReportAreas(JObject p)
         {
             string by = (p["by"]?.ToString() ?? "layer").ToLowerInvariant();
@@ -1270,7 +1431,7 @@ namespace RhinoAIBridge
             return best;
         }
 
-        // transform_objects â€” Phase 6 universal transform. Replaces move/rotate/scale/mirror/array
+        // transform_objects - Phase 6 universal transform. Replaces move/rotate/scale/mirror/array
         // as separate tools. Accepts either flat shorthand fields or a sequenced operations[] array.
         // Sequenced ops are useful in batches: each op's output object_ids feed into the next.
         JObject TransformObjects(JObject p)
@@ -1309,7 +1470,7 @@ namespace RhinoAIBridge
                 pp["object_ids"] = new JArray(current);
                 pp["copy"] = tok["copy"]?.DeepClone() ?? JToken.FromObject(copy);
 
-                // rotate shorthand â€” accept rotation:[rx,ry,rz] degrees as alternative to angle_degrees
+                // rotate shorthand - accept rotation:[rx,ry,rz] degrees as alternative to angle_degrees
                 if ((kind == "rotate") && pp["angle_degrees"] == null && pp["rotation"] != null)
                 {
                     var rv = pp["rotation"].ToObject<double[]>();
@@ -1337,14 +1498,14 @@ namespace RhinoAIBridge
             return Ok(("object_ids", new JArray(current)), ("operations", opResults), ("count", current.Count));
         }
 
-        // â”€â”€â”€ UNIVERSAL CREATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- UNIVERSAL CREATE --------------------------------------------------
         JObject CreateObject(JObject p)
         {
             string type = (p["type"]?.ToString() ?? "BOX").ToUpper();
             var gp = p["params"] as JObject ?? new JObject();
 
             // Phase 6: this is the universal creation entry point. The MCP surface uses
-            // create_object for primitives AND architect-level objects (massing, core, wallâ€¦).
+            // create_object for primitives AND architect-level objects (massing, core, wall...).
             // The legacy dedicated commands are still callable directly (e.g. inside batches),
             // but most callers go through here.
             JObject MergeParams()
@@ -1494,7 +1655,7 @@ namespace RhinoAIBridge
             var ri = OI(Doc.Objects.FindId(obj.Id)); ri["status"] = "ok"; return ri;
         }
 
-        // â”€â”€â”€ PRIMITIVES â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- PRIMITIVES --------------------------------------------------
         JObject CreateBox(JObject p)
         {
             var o = Pt(p["origin"]);
@@ -1539,7 +1700,7 @@ namespace RhinoAIBridge
             return result;
         }
 
-        // â”€â”€â”€ ADVANCED GEOMETRY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- ADVANCED GEOMETRY --------------------------------------------------
         JObject Loft(JObject p)
         {
             var ids = p["curve_ids"].ToObject<List<string>>();
@@ -1601,7 +1762,123 @@ namespace RhinoAIBridge
             return CrResult(gid, p["layer"]?.ToString(), WantMeasure(p));
         }
 
-        // â”€â”€â”€ SMART OPS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- SMART OPS --------------------------------------------------
+        JObject Sweep2(JObject p)
+        {
+            var r1 = Doc.Objects.FindId(new Guid(p["rail1_id"].ToString()));
+            var r2 = Doc.Objects.FindId(new Guid(p["rail2_id"].ToString()));
+            if (r1?.Geometry is not Curve rail1) return Err("rail1_id is not a curve", "NOT_A_CURVE");
+            if (r2?.Geometry is not Curve rail2) return Err("rail2_id is not a curve", "NOT_A_CURVE");
+
+            var profiles = new List<Curve>();
+            foreach (var id in p["profile_ids"]?.ToObject<List<string>>() ?? new List<string>())
+            {
+                var o = Doc.Objects.FindId(new Guid(id));
+                if (o?.Geometry is Curve c) profiles.Add(c);
+            }
+            if (profiles.Count == 0) return Err("profile_ids must contain at least one curve", "INVALID_REQUEST");
+
+            var sw = new SweepTwoRail { SweepTolerance = Tol, AngleToleranceRadians = Doc.ModelAngleToleranceRadians };
+            var breps = sw.PerformSweep(rail1, rail2, profiles);
+            if (breps == null || breps.Length == 0) return Err("Sweep2 failed");
+
+            var a = MkAttr(p);
+            var ni = new JArray();
+            foreach (var b in breps) ni.Add(Doc.Objects.AddBrep(b, a).ToString());
+            RedrawScope.Mark();
+            return Ok(("object_ids", ni), ("count", breps.Length));
+        }
+
+        JObject NetworkSurface(JObject p)
+        {
+            var curves = new List<Curve>();
+            foreach (var id in p["curve_ids"]?.ToObject<List<string>>() ?? new List<string>())
+            {
+                var o = Doc.Objects.FindId(new Guid(id));
+                if (o?.Geometry is Curve c) curves.Add(c);
+            }
+            if (curves.Count < 3) return Err("network_surface needs at least 3 boundary/section curves", "INVALID_REQUEST");
+
+            var brep = Brep.CreateEdgeSurface(curves);
+            if (brep == null) return Err("Network/edge surface failed");
+            var gid = Doc.Objects.AddBrep(brep, MkAttr(p));
+            RedrawScope.Mark();
+            return CrResult(gid, p["layer"]?.ToString(), WantMeasure(p));
+        }
+
+        JObject SpherePatch(JObject p)
+        {
+            var center = Pt(p["center"]);
+            double radius = p["radius"]?.ToObject<double>() ?? 1000.0;
+            double u0 = RhinoMath.ToRadians(p["u_start_deg"]?.ToObject<double>() ?? -45.0);
+            double u1 = RhinoMath.ToRadians(p["u_end_deg"]?.ToObject<double>() ?? 45.0);
+            double v0 = RhinoMath.ToRadians(p["v_start_deg"]?.ToObject<double>() ?? -20.0);
+            double v1 = RhinoMath.ToRadians(p["v_end_deg"]?.ToObject<double>() ?? 45.0);
+            int uCount = Math.Clamp(p["u_count"]?.ToObject<int>() ?? 12, 4, 64);
+            int vCount = Math.Clamp(p["v_count"]?.ToObject<int>() ?? 8, 4, 64);
+
+            var pts = new List<Point3d>(uCount * vCount);
+            for (int v = 0; v < vCount; v++)
+            {
+                double vv = v0 + (v1 - v0) * v / Math.Max(1, vCount - 1);
+                for (int u = 0; u < uCount; u++)
+                {
+                    double uu = u0 + (u1 - u0) * u / Math.Max(1, uCount - 1);
+                    double cv = Math.Cos(vv);
+                    pts.Add(new Point3d(
+                        center.X + radius * cv * Math.Cos(uu),
+                        center.Y + radius * cv * Math.Sin(uu),
+                        center.Z + radius * Math.Sin(vv)));
+                }
+            }
+
+            var srf = NurbsSurface.CreateThroughPoints(pts, uCount, vCount, 3, 3, false, false);
+            if (srf == null) return Err("Sphere patch surface failed");
+            var gid = Doc.Objects.AddSurface(srf, MkAttr(p));
+            RedrawScope.Mark();
+            return CrResult(gid, p["layer"]?.ToString(), WantMeasure(p));
+        }
+
+        JObject TrimWithPlanes(JObject p)
+        {
+            var o = Doc.Objects.FindId(new Guid(p["object_id"].ToString()));
+            var source = GetBrep(o);
+            if (source == null) return Err("object_id is not a Brep", "NOT_A_BREP");
+
+            var pieces = new List<Brep> { source.DuplicateBrep() };
+            foreach (var planeToken in p["planes"] ?? new JArray())
+            {
+                Plane plane;
+                if (planeToken["origin"] != null && planeToken["normal"] != null)
+                    plane = new Plane(Pt(planeToken["origin"]), Vec(planeToken["normal"]));
+                else
+                {
+                    var coeff = planeToken.ToObject<double[]>();
+                    if (coeff == null || coeff.Length < 4) return Err("Each plane must be {origin, normal} or [a,b,c,d]", "INVALID_REQUEST");
+                    var normal = new Vector3d(coeff[0], coeff[1], coeff[2]);
+                    if (!normal.Unitize()) return Err("Plane normal cannot be zero", "INVALID_REQUEST");
+                    plane = new Plane(new Point3d(normal.X * -coeff[3], normal.Y * -coeff[3], normal.Z * -coeff[3]), normal);
+                }
+
+                var next = new List<Brep>();
+                foreach (var brep in pieces)
+                {
+                    var trimmed = brep.Trim(plane, Tol);
+                    if (trimmed != null) next.AddRange(trimmed);
+                }
+                pieces = next;
+                if (pieces.Count == 0) break;
+            }
+            if (pieces.Count == 0) return Err("All geometry was trimmed away");
+
+            var a = MkAttr(p);
+            var ni = new JArray();
+            foreach (var b in pieces) ni.Add(Doc.Objects.AddBrep(b, a).ToString());
+            if (p["delete_input"]?.ToObject<bool>() != false) Doc.Objects.Delete(o, true);
+            RedrawScope.Mark();
+            return Ok(("object_ids", ni), ("count", pieces.Count));
+        }
+
         JObject FilletEdges(JObject p)
         {
             var ids = ResIds(p["object_ids"]); double r = p["radius"].ToObject<double>(); var ni = new JArray();
@@ -1708,7 +1985,7 @@ namespace RhinoAIBridge
             return Ok(("object_ids", ni));
         }
 
-        // â”€â”€â”€ TRANSFORMS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- TRANSFORMS --------------------------------------------------
         JObject TfObjs(JObject p, Transform xf)
         {
             var ids = ResIds(p["object_ids"]); bool cp = p["copy"]?.ToObject<bool>() ?? false;
@@ -1798,7 +2075,7 @@ namespace RhinoAIBridge
             return Ok(("object_ids", ni));
         }
 
-        // â”€â”€â”€ LAYERS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- LAYERS --------------------------------------------------
         static readonly Dictionary<string, int[]> LC = new()
         {
             ["Wall"] = new[] { 180, 60, 60 },
@@ -1878,7 +2155,7 @@ namespace RhinoAIBridge
             return Ok(("layers", cr));
         }
 
-        // â”€â”€â”€ ANALYSIS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- ANALYSIS --------------------------------------------------
         JObject MeasureObject(JObject p)
         {
             var o = Doc.Objects.FindId(new Guid(p["object_id"].ToString()));
@@ -1964,7 +2241,7 @@ namespace RhinoAIBridge
             return Ok(("checked", objs.Count), ("issues", issues));
         }
 
-        // â”€â”€â”€ VIEWPORT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- VIEWPORT --------------------------------------------------
         JObject SetView(JObject p)
         {
             var n = p["view_name"].ToString().ToLower();
@@ -1992,7 +2269,7 @@ namespace RhinoAIBridge
         /// <summary>
         /// Phase 1 capture_viewport rewrite:
         ///   - MemoryStream, no disk I/O
-        ///   - JPEG default for shaded/rendered (5â€“10x smaller than PNG, imperceptible quality loss for AI vision)
+        ///   - JPEG default for shaded/rendered (5-10x smaller than PNG, imperceptible quality loss for AI vision)
         ///   - Bitmap.Resize for downscale instead of re-rendering Rhino at lower resolution
         ///   - Quality-stepped fallback to fit max_bytes (4 attempts max instead of 5 re-renders)
         /// Phase 6 (McNeel parity):
@@ -2014,7 +2291,7 @@ namespace RhinoAIBridge
             var vp = Doc.Views.ActiveView?.ActiveViewport;
             if (vp == null) return Err("No active viewport");
 
-            // â”€â”€ Save state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            // -- Save state --------------------------------------------------
             var savedTarget   = vp.CameraTarget;
             var savedLocation = vp.CameraLocation;
             var savedUp       = vp.CameraUp;
@@ -2023,7 +2300,7 @@ namespace RhinoAIBridge
 
             try
             {
-                // â”€â”€ Apply requested view/mode overrides â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                // -- Apply requested view/mode overrides --------------------------------------------------
                 if (!string.IsNullOrEmpty(viewOverride))
                 {
                     var proj = viewOverride.ToLower() switch
@@ -2044,7 +2321,7 @@ namespace RhinoAIBridge
                     if (dm != null) vp.DisplayMode = dm;
                 }
 
-                // â”€â”€ Capture â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                // -- Capture --------------------------------------------------
                 // Phase 7: Disable viewport redraw during capture to prevent
                 // Rhino from re-rendering the scene mid-capture on complex models.
                 // This is the #1 cause of set_camera / capture_viewport hangs.
@@ -2120,7 +2397,7 @@ namespace RhinoAIBridge
             }
             finally
             {
-                // â”€â”€ Restore state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                // -- Restore state --------------------------------------------------
                 if (restore)
                 {
                     try
@@ -2138,11 +2415,87 @@ namespace RhinoAIBridge
         }
 
         /// <summary>
-        /// set_camera â€” two modes:
+        /// set_camera - two modes:
         ///   1. Explicit location+target: positions camera directly.
         ///   2. Bounding-box framing (box_min + box_max): computes camera distance to fit bbox.
         ///      Mirrors McNeel's boxMin/boxMax parameter.
         /// </summary>
+        JObject CaptureInspectionView(JObject p)
+        {
+            var vp = Doc.Views.ActiveView?.ActiveViewport;
+            if (vp == null) return Err("No active viewport");
+
+            var savedTarget = vp.CameraTarget;
+            var savedLocation = vp.CameraLocation;
+            var savedUp = vp.CameraUp;
+            var savedMode = vp.DisplayMode;
+            bool savedParallel = vp.IsParallelProjection;
+
+            try
+            {
+                if (p["projection"]?.ToString()?.ToLowerInvariant() == "parallel")
+                    vp.ChangeToParallelProjection(true);
+                else if (p["projection"]?.ToString()?.ToLowerInvariant() == "perspective")
+                    vp.ChangeToPerspectiveProjection(true, 50);
+
+                if (p["display_mode"] != null)
+                {
+                    var dm = Rhino.Display.DisplayModeDescription.FindByName(p["display_mode"].ToString());
+                    if (dm != null) vp.DisplayMode = dm;
+                }
+
+                if ((p["location"] != null || p["camera_location"] != null) &&
+                    (p["target"] != null || p["camera_target"] != null))
+                {
+                    var loc = Pt(p["location"] ?? p["camera_location"]);
+                    var tgt = Pt(p["target"] ?? p["camera_target"]);
+                    vp.SetCameraLocations(tgt, loc);
+                }
+                else if (p["direction"] != null && p["target"] != null)
+                {
+                    var target = Pt(p["target"]);
+                    var dir = Vec(p["direction"]);
+                    if (!dir.Unitize()) return Err("direction cannot be zero", "INVALID_REQUEST");
+                    double distance = p["distance"]?.ToObject<double>() ?? 20000.0;
+                    vp.SetCameraLocations(target, target - dir * distance);
+                }
+                else if (p["box_min"] != null && p["box_max"] != null)
+                {
+                    var bbox = new BoundingBox(Pt(p["box_min"]), Pt(p["box_max"]));
+                    vp.ZoomBoundingBox(bbox);
+                }
+
+                var captureParams = new JObject
+                {
+                    ["width"] = p["width"] ?? 900,
+                    ["height"] = p["height"] ?? 650,
+                    ["max_bytes"] = p["max_bytes"] ?? 900000,
+                    ["format"] = p["format"] ?? "auto",
+                    ["quality"] = p["quality"] ?? 80,
+                    ["restore_state"] = false
+                };
+                var r = CaptureViewport(captureParams);
+                r["inspection"] = true;
+                r["offscreen"] = false;
+                r["viewport_restored"] = true;
+                r["note"] = "Captured from an inspection camera and restored the active viewport.";
+                return r;
+            }
+            finally
+            {
+                try
+                {
+                    if (savedParallel) vp.ChangeToParallelProjection(true);
+                    else vp.ChangeToPerspectiveProjection(true, 50);
+                    vp.SetCameraLocations(savedTarget, savedLocation);
+                    vp.CameraUp = savedUp;
+                    vp.DisplayMode = savedMode;
+                    Doc.Views.ActiveView?.Redraw();
+                }
+                catch { }
+            }
+        }
+
         JObject SetCamera(JObject p)
         {
             var vp = Doc.Views.ActiveView?.ActiveViewport;
@@ -2194,7 +2547,7 @@ namespace RhinoAIBridge
         }
 
         /// <summary>
-        /// get_rhino_commands â€” live command discoverability via Command.GetCommandNames.
+        /// get_rhino_commands - live command discoverability via Command.GetCommandNames.
         /// Mirrors McNeel's get_commands tool. Capped at 200 results.
         /// </summary>
         JObject GetRhinoCommands(JObject p)
@@ -2211,7 +2564,7 @@ namespace RhinoAIBridge
             return r;
         }
 
-        // â”€â”€â”€ AUTO-THUMBNAIL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- AUTO-THUMBNAIL --------------------------------------------------
         /// <summary>
         /// Captures a small JPEG thumbnail of the active viewport.
         /// Called automatically after every top-level mutation and after every batch.
@@ -2239,9 +2592,9 @@ namespace RhinoAIBridge
             catch { return null; }
         }
 
-        // â”€â”€â”€ MATERIALS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- MATERIALS --------------------------------------------------
         /// <summary>
-        /// set_layer_material â€” set PBR material properties on a layer.
+        /// set_layer_material - set PBR material properties on a layer.
         /// Parity with McNeel's set_layer_material tool.
         /// color: [R, G, B] or [R, G, B, A] 0-255 ints.
         /// roughness / metallic / opacity: 0.0-1.0 floats.
@@ -2327,9 +2680,9 @@ namespace RhinoAIBridge
             return Ok(("layer", layerName), ("material_index", matIdx), ("applied", true));
         }
 
-        // â”€â”€â”€ RUN COMMAND â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- RUN COMMAND --------------------------------------------------
         /// <summary>
-        /// run_command â€” execute any Rhino command string via RhinoApp.RunScript.
+        /// run_command - execute any Rhino command string via RhinoApp.RunScript.
         /// First-class MCP tool mirroring McNeel's approach. Tracks newly created objects.
         /// echo=false suppresses Rhino's command-line echo (default, keeps UI clean).
         /// </summary>
@@ -2378,7 +2731,7 @@ namespace RhinoAIBridge
             return Ok(("selected_count", c));
         }
 
-        // â”€â”€â”€ WORKFLOW (Tier 2) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- WORKFLOW (Tier 2) --------------------------------------------------
         JObject GetCrossSection(JObject p)
         {
             var o = Doc.Objects.FindId(new Guid(p["object_id"].ToString()));
@@ -2388,12 +2741,73 @@ namespace RhinoAIBridge
             if (!Intersection.BrepPlane(b, new Plane(new Point3d(0, 0, z), Vector3d.ZAxis), Tol, out var curves, out _) || curves.Length == 0)
             {
                 var bb = b.GetBoundingBox(true);
-                return Err($"No intersection at z={z}. Range: {bb.Min.Z:F0}â€“{bb.Max.Z:F0}");
+                return Err($"No intersection at z={z}. Range: {bb.Min.Z:F0}-{bb.Max.Z:F0}");
             }
             var a = MkAttr(p); var ni = new JArray();
             foreach (var c in curves) ni.Add(Doc.Objects.AddCurve(c, a).ToString());
             RedrawScope.Mark();
             return Ok(("object_ids", ni), ("z_height", z), ("curve_count", curves.Length));
+        }
+
+        JObject GetSectionProfile(JObject p)
+        {
+            var o = Doc.Objects.FindId(new Guid(p["object_id"].ToString()));
+            if (o == null) return Err("Not found", "OBJECT_NOT_FOUND");
+            var b = GetBrep(o);
+            if (b == null) return Err("Not a Brep", "NOT_A_BREP");
+
+            double z = p["z_height"]?.ToObject<double>() ?? 0.0;
+            int samples = Math.Clamp(p["samples"]?.ToObject<int>() ?? 80, 8, 300);
+            if (!Intersection.BrepPlane(b, new Plane(new Point3d(0, 0, z), Vector3d.ZAxis), Tol, out var curves, out _) || curves.Length == 0)
+            {
+                var bb = b.GetBoundingBox(true);
+                return Err($"No intersection at z={z}. Range: {bb.Min.Z:F0}-{bb.Max.Z:F0}", "NO_INTERSECTION",
+                    new JObject { ["z_min"] = bb.Min.Z, ["z_max"] = bb.Max.Z });
+            }
+
+            var payload = PolylinesPayload(curves.Select(c => SampleCurvePoints(c, samples)), "xy");
+            payload["status"] = "ok";
+            payload["z_height"] = z;
+            payload["curve_count"] = curves.Length;
+            return payload;
+        }
+
+        JObject GetSilhouette(JObject p)
+        {
+            var ids = p["object_ids"] != null
+                ? ResIds(p["object_ids"]).ToList()
+                : Doc.Objects.Where(o => !o.IsDeleted && o.Visible).Select(o => o.Id.ToString()).ToList();
+            string view = p["view"]?.ToString()?.ToLowerInvariant() ?? "front";
+            string projection = view switch
+            {
+                "top" => "xy",
+                "right" or "left" => "yz",
+                _ => "xz"
+            };
+
+            var polylines = new List<List<Point3d>>();
+            foreach (var id in ids.Take(250))
+            {
+                var ro = Doc.Objects.FindId(new Guid(id));
+                var bb = ro?.Geometry?.GetBoundingBox(true) ?? BoundingBox.Empty;
+                if (!bb.IsValid) continue;
+
+                var min = bb.Min;
+                var max = bb.Max;
+                if (projection == "xy")
+                    polylines.Add(new List<Point3d> { new(min.X, min.Y, 0), new(max.X, min.Y, 0), new(max.X, max.Y, 0), new(min.X, max.Y, 0), new(min.X, min.Y, 0) });
+                else if (projection == "yz")
+                    polylines.Add(new List<Point3d> { new(0, min.Y, min.Z), new(0, max.Y, min.Z), new(0, max.Y, max.Z), new(0, min.Y, max.Z), new(0, min.Y, min.Z) });
+                else
+                    polylines.Add(new List<Point3d> { new(min.X, 0, min.Z), new(max.X, 0, min.Z), new(max.X, 0, max.Z), new(min.X, 0, max.Z), new(min.X, 0, min.Z) });
+            }
+
+            var payload = PolylinesPayload(polylines, projection);
+            payload["status"] = "ok";
+            payload["view"] = view;
+            payload["projection"] = projection;
+            payload["note"] = "Cheap silhouette from object bounding boxes; use capture_viewport for final visual QA.";
+            return payload;
         }
 
         JObject CreateFloorStack(JObject p)
@@ -2519,7 +2933,7 @@ namespace RhinoAIBridge
             return Ok(("total_created", ni.Count), ("object_ids", ni));
         }
 
-        // â”€â”€â”€ INTELLIGENCE (Tier 3) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- INTELLIGENCE (Tier 3) --------------------------------------------------
         JObject ValidateArch(JObject p)
         {
             // Phase 2: counts + layer filtering via snapshot. Brep validity still needs live geometry.
@@ -2582,18 +2996,18 @@ namespace RhinoAIBridge
                 var objs = AllObjs();
                 var byLayerFb = objs.GroupBy(o => Doc.Layers[o.Attributes.LayerIndex]?.Name ?? "Default").ToDictionary(g => g.Key, g => g.Count());
                 if (objs.Any(o => { var bb = o.Geometry?.GetBoundingBox(true); return bb.HasValue && bb.Value.Max.Z - bb.Value.Min.Z > 5000; }) && !byLayerFb.ContainsKey("Slab"))
-                    s.Add("Tall massing but no Slab layer â€” use create_floor_stack");
-                if (byLayerFb.GetValueOrDefault("Default", 0) > 10) s.Add("Organize â€” use setup_arch_layers then set_object_layer");
-                if (Doc.Groups.Count == 0 && objs.Count > 20) s.Add($"{objs.Count} ungrouped objects â€” use group_objects");
+                    s.Add("Tall massing but no Slab layer - use create_floor_stack");
+                if (byLayerFb.GetValueOrDefault("Default", 0) > 10) s.Add("Organize - use setup_arch_layers then set_object_layer");
+                if (Doc.Groups.Count == 0 && objs.Count > 20) s.Add($"{objs.Count} ungrouped objects - use group_objects");
                 return Ok(("suggestions", s), ("scene_summary", JObject.FromObject(byLayerFb)));
             }
 
             var byLayer = snap.CountsByLayerName();
-            // "Tall massing" check â€” uses cached bboxes, no geometry refetch.
+            // "Tall massing" check - uses cached bboxes, no geometry refetch.
             bool tallMassing = snap.All().Any(m => m.Bbox.IsValid && (m.Bbox.Max.Z - m.Bbox.Min.Z) > 5000);
-            if (tallMassing && !byLayer.ContainsKey("Slab")) s.Add("Tall massing but no Slab layer â€” use create_floor_stack");
-            if (byLayer.GetValueOrDefault("Default", 0) > 10) s.Add("Organize â€” use setup_arch_layers then set_object_layer");
-            if (Doc.Groups.Count == 0 && snap.Count > 20) s.Add($"{snap.Count} ungrouped objects â€” use group_objects");
+            if (tallMassing && !byLayer.ContainsKey("Slab")) s.Add("Tall massing but no Slab layer - use create_floor_stack");
+            if (byLayer.GetValueOrDefault("Default", 0) > 10) s.Add("Organize - use setup_arch_layers then set_object_layer");
+            if (Doc.Groups.Count == 0 && snap.Count > 20) s.Add($"{snap.Count} ungrouped objects - use group_objects");
             return Ok(("suggestions", s), ("scene_summary", JObject.FromObject(byLayer)));
         }
 
@@ -2632,10 +3046,13 @@ namespace RhinoAIBridge
             return r;
         }
 
-        // â”€â”€â”€ SCRIPT & UNDO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- SCRIPT & UNDO --------------------------------------------------
         JObject ExecuteScript(JObject p)
         {
             string code = p["code"]?.ToString();
+            JObject autoCheckpoint = p?["auto_checkpoint"]?.ToObject<bool>() == false
+                ? null
+                : SaveAutoCheckpoint("Script");
             uint uid = Doc.BeginUndoRecord(p["undo_name"]?.ToString() ?? "AI: Script");
             try
             {
@@ -2644,7 +3061,7 @@ namespace RhinoAIBridge
                 var output = new List<string>();
                 try { py.Output += s => output.Add(s?.ToString() ?? ""); } catch { }
                 // Preamble injected before every AI-generated script. System is needed for
-                // System.Drawing.Color, System.Guid, etc. â€” scripts don't need to import it.
+                // System.Drawing.Color, System.Guid, etc. - scripts don't need to import it.
                 // Double-importing is a no-op, so user code may also import these safely.
                 // Phase 7: Auto-import Rhino.Geometry (every script uses it) and
                 // inject a boolean-failure tracking wrapper so silent failures
@@ -2678,7 +3095,7 @@ namespace RhinoAIBridge
                         var bb = o.Geometry.GetBoundingBox(true);
                         double mx = Math.Max(bb.Max.X - bb.Min.X, Math.Max(bb.Max.Y - bb.Min.Y, bb.Max.Z - bb.Min.Z));
                         if (Doc.ModelUnitSystem == UnitSystem.Millimeters && mx < 10)
-                            warns.Add($"{nid[..8]} is {mx:F1}mm â€” meters?");
+                            warns.Add($"{nid[..8]} is {mx:F1}mm - meters?");
                     }
                 }
                 if (p["default_layer"] != null)
@@ -2711,9 +3128,15 @@ namespace RhinoAIBridge
                 }
                 if (warns.Count > 0) r["warnings"] = warns;
                 if (!ok) r["message"] = "Script failed";
+                if (autoCheckpoint != null) r["auto_checkpoint"] = autoCheckpoint;
                 return r;
             }
-            catch (Exception e) { return Err(e.Message); }
+            catch (Exception e)
+            {
+                var r = ErrFromException(e, "Script");
+                if (autoCheckpoint != null) r["auto_checkpoint"] = autoCheckpoint;
+                return r;
+            }
             finally { if (uid > 0) Doc.EndUndoRecord(uid); }
         }
 
@@ -3228,7 +3651,7 @@ namespace RhinoAIBridge
         }
 
 
-        // â”€â”€â”€ LOGGING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // --- LOGGING --------------------------------------------------
         JObject GetLog(JObject p)
         {
             int c = p["count"]?.ToObject<int>() ?? 50;

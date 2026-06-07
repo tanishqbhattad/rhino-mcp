@@ -9,6 +9,12 @@ detected AI clients.
 
 - Adds Safe, Standard, and Developer access modes. Run `AIBridge` in Rhino to
   choose or change the active mode.
+- Adds direct MCP image returns for viewport capture, thumbnails, and PDF
+  previews, plus JSON variants for metadata.
+- Adds McNeel-compatible aliases: `get_viewport_image`, `list_objects`,
+  `set_selection`, and `run_python`.
+- Adds inspection captures, surface primitives, SVG section/silhouette feedback,
+  structured retry hints, and automatic checkpoints before risky operations.
 - Adds local token authentication for the loopback bridge.
 - Removes the Rhino plugin-loader dependency on `System.Threading.Channels`.
 - Ships the full .NET 8 runtime payload required by Rhino.
@@ -31,8 +37,9 @@ detected AI clients.
 ## Verification
 
 - Rhino plugin: `dotnet build --configuration Release` passes with 0 errors.
-- Python MCP server: 45 tests pass.
-- Windows installer: Rhino-open refusal and broken-global-`uv`-cache recovery
-  paths verified.
-- Live bridge: authenticated protocol ping and health check pass against Rhino
-  8.
+- Python MCP server: `uv run python -m py_compile src\rhino_architect\server.py`
+  passes.
+- Python dependencies: `uv lock` refreshed for NumPy and OpenCV.
+- Installer payload: `dist/plugin` refreshed from the successful Release build.
+- Live bridge smoke test still recommended after installing this package in Rhino
+  8, especially for the new visual and surface tools.

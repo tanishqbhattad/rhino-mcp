@@ -1,7 +1,7 @@
 [project]
 name = "rhino-architect"
 version = "4.7.6"
-description = "AI Bridge MCP server for Rhino 8 — v4.7.6 (sections, display modes, materials, PDF tracing, 90 tools)"
+description = "AI Bridge MCP server for Rhino 8 — v4.7.6 (vision loop, surface tools, PDF tracing, 109 tools)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
@@ -10,6 +10,8 @@ dependencies = [
     "pydantic>=2.0",
     "orjson>=3.10",
     "pymupdf>=1.24.0",      # PDF tools: get_pdf_info, preview_pdf_page, trace_pdf
+    "numpy>=1.26",           # numerical geometry helpers and PDF/image analysis
+    "opencv-python-headless>=4.9",  # image processing without GUI dependencies
     "openai>=1.0",          # used by chat.py â€” works for OpenAI, Ollama, and any OAI-compatible endpoint
 ]
 

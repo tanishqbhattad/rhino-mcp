@@ -1,6 +1,6 @@
 # RhinoAIBridge v4.7.6 — AI Control of Rhino 8 via MCP
 
-> **The most powerful Rhino MCP server.** 90 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 — create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
+> **The most powerful Rhino MCP server.** 109 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 — create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rhino 8](https://img.shields.io/badge/Rhino-8.x-blue)](https://www.rhino3d.com/)
@@ -23,7 +23,7 @@ This is the **fastest, most feature-complete Rhino AI integration available**:
 - **Auto-thumbnails** — every mutation returns a viewport JPEG so the AI sees what it built
 - **Atomic batches** — multi-step operations roll back as one unit on failure
 - **No .NET SDK required** on target machines — plugin is pre-built
-- **90 MCP tools** across 12 categories
+- **109 MCP tools** across 12 categories
 
 ---
 
@@ -47,7 +47,7 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 
 ---
 
-## 90 MCP Tools
+## 109 MCP Tools
 
 ### Scene & Context
 | Tool | What it does |
@@ -267,7 +267,7 @@ uv run python chat.py --provider anthropic --model claude-opus-4-6
 Claude Desktop / ChatGPT / Codex / Ollama
          |  MCP (stdio)
          v
-  server/src/rhino_architect/server.py   <- FastMCP Python server (90 tools)
+  server/src/rhino_architect/server.py   <- FastMCP Python server (109 tools)
          |  TCP 127.0.0.1:9544
          |  local auth token + [1-byte flag][4-byte len][JSON payload]
          v
@@ -328,6 +328,7 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp`, DLLs, JSON runtime files, and
 - **Rhino 8 runtime compatibility** — removes plugin-loader dependencies on `System.Threading.Channels` and response compression assemblies
 - **Authenticated localhost bridge** — per-user token handshake, client cap, idle timeout, and connection cleanup
 - **Startup access modes** — run `AIBridge` and choose Safe, Standard, or Developer mode
+- **109 MCP tools** — direct MCP images, inspection captures, McNeel-compatible aliases, surface primitives, SVG section/silhouette feedback, and JSON fallbacks
 - **Geometry correctness fixes** — live transform GUIDs, planar offsets, vertical wall validation, layer full paths, and closed polyline reporting
 - **Clean SDK-free installer** — deploys the complete pre-built .NET 8 payload and configures Claude Desktop, Codex, and Gemini Antigravity
 
