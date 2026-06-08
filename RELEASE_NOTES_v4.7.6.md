@@ -11,6 +11,11 @@ detected AI clients.
   choose or change the active mode.
 - Adds direct MCP image returns for viewport capture, thumbnails, and PDF
   previews, plus JSON variants for metadata.
+- Adds the better vision loop: `capture_review_set` for multi-angle hero/plan/
+  elevation/detail captures, and `compare_before_after` for visual diff QA.
+- Adds `execute_python3`, a Rhino 8 CPython 3 execution path through McNeel's
+  RhinoCode `rhinocode` CLI. Requires Rhino 8.11+, `StartScriptServer`, and
+  Developer mode.
 - Adds McNeel-compatible aliases: `get_viewport_image`, `list_objects`,
   `set_selection`, and `run_python`.
 - Adds inspection captures, surface primitives, SVG section/silhouette feedback,

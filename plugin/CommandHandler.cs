@@ -49,7 +49,7 @@ namespace RhinoAIBridge
         public static bool SafeMode => Mode == BridgeMode.Safe;
 
         private static readonly HashSet<string> CodeExecCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        { "execute_script", "run_python", "run_command" };
+        { "execute_script", "run_python", "execute_python3", "start_script_server", "run_command" };
 
         private static readonly HashSet<string> DestructiveCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "delete_objects", "boolean_operation" };
@@ -130,6 +130,7 @@ namespace RhinoAIBridge
                 ["lint_script"] = W(LintScript), ["get_camera_target"] = W(GetCameraTarget),
                 // Script & Undo & Logs
                 ["execute_script"] = W(ExecuteScript), ["run_python"] = W(ExecuteScript),
+                ["start_script_server"] = W(StartScriptServer),
                 ["undo"] = W(DoUndo), ["redo"] = W(DoRedo),
                 ["get_log"] = W(GetLog), ["get_log_stats"] = W(GetLogStats),
                 // v4.7: Sections, Elevations, Plans
@@ -583,6 +584,8 @@ namespace RhinoAIBridge
                 ["z"] = Math.Round(b.Max.Z - b.Min.Z, 2)
             }
         };
+
+        static JArray CA(Color c) => new JArray { c.R, c.G, c.B };
 
         static JArray PointsJson(IEnumerable<Point3d> pts)
         {
@@ -2266,6 +2269,37 @@ namespace RhinoAIBridge
             return Ok(("mode", p["mode"].ToString()));
         }
 
+        JArray CaptureAnnotations(JObject p)
+        {
+            string scope = (p["annotation_scope"]?.ToString() ?? "selected").ToLowerInvariant();
+            int max = Math.Max(0, Math.Min(200, p["max_annotations"]?.ToObject<int>() ?? 20));
+            if (max == 0) return new JArray();
+
+            IEnumerable<RhinoObject> objs = scope == "visible"
+                ? Doc.Objects.Where(o => !o.IsDeleted && o.Visible)
+                : Doc.Objects.GetSelectedObjects(false, false);
+
+            var arr = new JArray();
+            foreach (var o in objs.Take(max))
+            {
+                if (o?.Geometry == null) continue;
+                var layer = o.Attributes.LayerIndex >= 0 ? Doc.Layers[o.Attributes.LayerIndex] : null;
+                var bb = o.Geometry.GetBoundingBox(true);
+                arr.Add(new JObject
+                {
+                    ["id"] = o.Id.ToString(),
+                    ["short_id"] = o.Id.ToString("N").Substring(0, 8),
+                    ["name"] = string.IsNullOrWhiteSpace(o.Name) ? null : o.Name,
+                    ["object_type"] = o.ObjectType.ToString(),
+                    ["selected"] = o.IsSelected(false) != 0,
+                    ["layer"] = layer?.FullPath ?? layer?.Name ?? "",
+                    ["layer_color"] = layer != null ? CA(layer.Color) : null,
+                    ["bbox"] = bb.IsValid ? BB(bb) : null
+                });
+            }
+            return arr;
+        }
+
         /// <summary>
         /// Phase 1 capture_viewport rewrite:
         ///   - MemoryStream, no disk I/O
@@ -2287,6 +2321,7 @@ namespace RhinoAIBridge
             bool restore = p["restore_state"]?.ToObject<bool>() ?? true;
             string viewOverride = p["view"]?.ToString();
             string modeOverride = p["display_mode"]?.ToString();
+            bool annotate = p["annotate"]?.ToObject<bool>() ?? false;
 
             var vp = Doc.Views.ActiveView?.ActiveViewport;
             if (vp == null) return Err("No active viewport");
@@ -2392,6 +2427,11 @@ namespace RhinoAIBridge
                         ["visible_objects"] = Doc.Objects.Count(o => !o.IsDeleted && o.Visible),
                         ["total_objects"]   = snap2?.Count ?? 0
                     };
+                    if (annotate)
+                    {
+                        r["annotations"] = CaptureAnnotations(p);
+                        r["annotation_scope"] = p["annotation_scope"]?.ToString() ?? "selected";
+                    }
                 } catch { /* metadata best-effort */ }
                 return r;
             }
@@ -3047,6 +3087,25 @@ namespace RhinoAIBridge
         }
 
         // --- SCRIPT & UNDO --------------------------------------------------
+        JObject StartScriptServer(JObject p)
+        {
+            try
+            {
+                bool ok = RhinoApp.RunScript("_-StartScriptServer", false);
+                if (!ok) ok = RhinoApp.RunScript("_StartScriptServer", false);
+                return Ok(
+                    ("started", ok),
+                    ("message", ok
+                        ? "RhinoCode script server start command issued."
+                        : "StartScriptServer command returned false. Rhino 8.11+ is required for rhinocode CLI execution."),
+                    ("requires", "Rhino 8.11+ with the RhinoCode script server"));
+            }
+            catch (Exception e)
+            {
+                return Err($"Failed to start RhinoCode script server: {e.Message}", "SCRIPT_SERVER_FAILED");
+            }
+        }
+
         JObject ExecuteScript(JObject p)
         {
             string code = p["code"]?.ToString();

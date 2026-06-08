@@ -8,7 +8,7 @@ This release combines:
   Phase 2 - scene_version etag surfaced on every response (cache key for the model)
   Phase 3 - atomic batches + reference resolution ($1.object_ids[0] chaining)
   Phase 5 - architect intelligence layer (massing, floors, core, facade, schedules)
-  Phase 6 - consolidated 109-tool MCP surface
+  Phase 6 - consolidated 112-tool MCP surface
 
 Phase 4 (multiplexed protocol) and Phase 7 (System.Text.Json) intentionally deferred -
 both buy less than the cache + tool-surface work, and both have correctness pitfalls
@@ -20,13 +20,21 @@ that maps cleanly to how architects work.
 """
 from __future__ import annotations
 
-import logging
-import sys
-from typing import Any, Optional
-
+import asyncio
 import base64
 import json
+import logging
+import os
 import orjson
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+from pathlib import Path
+from typing import Any, Optional
+
 from mcp.server.fastmcp import FastMCP, Image
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -39,16 +47,18 @@ from rhino_architect.protocol import (
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("rhino_ai_bridge")
 
-import os
 
-# ── Safe mode ─────────────────────────────────────────────────────────────────
+# Safe mode --------------------------------------------------
 # Optional Python-side defense: set RHINO_SAFE_MODE=1 to block destructive commands.
 # The Rhino plugin independently enforces the Safe / Standard / Developer mode chosen in Rhino.
-# Safe, trusted (default), or developer — controlled by env var.
+# Safe, trusted (default), or developer - controlled by env var.
 _SAFE_MODE = os.environ.get("RHINO_SAFE_MODE", "").strip().lower() in ("1", "true", "yes")
 _TRUSTED_MODE = not _SAFE_MODE  # default
 
-_SAFE_MODE_BLOCKED = {"execute_script", "run_command", "delete_objects", "boolean_operation"}
+_SAFE_MODE_BLOCKED = {
+    "execute_script", "run_python", "execute_python3", "run_command",
+    "delete_objects", "boolean_operation",
+}
 
 def _check_safe_mode(tool_name: str) -> dict | None:
     """Return an error dict if safe mode blocks this tool, else None."""
@@ -62,15 +72,11 @@ def _check_safe_mode(tool_name: str) -> dict | None:
             "blocked_tools": sorted(_SAFE_MODE_BLOCKED),
         }
     return None
-# Phase 7: Heartbeat watchdog — auto-exit when Rhino closes.
+# Phase 7: Heartbeat watchdog - auto-exit when Rhino closes.
 # Runs in a daemon thread (not asyncio) so it works regardless of the MCP event loop.
 # Checks every 15s whether the Rhino TCP port is still accepting connections.
 # After 3 consecutive failures (~45s), exits the process so the MCP client knows
 # the server is gone and can restart it when Rhino reopens.
-import asyncio
-import socket
-import threading
-
 _HEARTBEAT_INTERVAL = 15   # seconds between checks
 _HEARTBEAT_MAX_FAILS = 3   # consecutive failures before exit
 
@@ -201,6 +207,118 @@ def _image_with_metadata(result: dict, key: str = "image_base64", default_format
     meta.pop("thumbnail_base64", None)
     meta["content"] = {"image": {"format": fmt, "bytes": result.get("bytes")}}
     return [meta, Image(data=base64.b64decode(b64), format=fmt)]
+
+
+def _named_image_content(name: str, result: dict, key: str = "image_base64", default_format: str = "png") -> list[Any]:
+    """Return [metadata, Image] for one named capture, or [error metadata] if capture failed."""
+    if result.get("status") != "ok":
+        err = dict(result)
+        err["capture_name"] = name
+        return [err]
+    b64 = result.get(key) or result.get("thumbnail_base64")
+    if not b64:
+        meta = dict(result)
+        meta["capture_name"] = name
+        meta["content"] = {"image": None}
+        return [meta]
+    fmt = str(result.get("format") or default_format).lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    meta = dict(result)
+    meta.pop("image_base64", None)
+    meta.pop("thumbnail_base64", None)
+    meta["capture_name"] = name
+    meta["content"] = {"image": {"format": fmt, "bytes": result.get("bytes")}}
+    return [meta, Image(data=base64.b64decode(b64), format=fmt)]
+
+
+def _compare_base64_images(before_b64: str | None, after_b64: str | None) -> dict[str, Any]:
+    """Best-effort image comparison using OpenCV when available."""
+    if not before_b64 or not after_b64:
+        return {"status": "unavailable", "message": "Missing before/after image data."}
+    try:
+        import cv2  # type: ignore
+        import numpy as np  # type: ignore
+
+        before = cv2.imdecode(np.frombuffer(base64.b64decode(before_b64), np.uint8), cv2.IMREAD_COLOR)
+        after = cv2.imdecode(np.frombuffer(base64.b64decode(after_b64), np.uint8), cv2.IMREAD_COLOR)
+        if before is None or after is None:
+            return {"status": "unavailable", "message": "Could not decode one or both images."}
+        if before.shape != after.shape:
+            after = cv2.resize(after, (before.shape[1], before.shape[0]))
+        diff = cv2.absdiff(before, after)
+        gray = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+        mean_delta = float(gray.mean())
+        changed_ratio = float((gray > 18).mean())
+        _, png = cv2.imencode(".png", cv2.applyColorMap(gray, cv2.COLORMAP_INFERNO))
+        return {
+            "status": "ok",
+            "mean_pixel_delta": round(mean_delta, 3),
+            "changed_ratio": round(changed_ratio, 4),
+            "diff_base64": base64.b64encode(png.tobytes()).decode("ascii"),
+            "format": "png",
+            "interpretation": "changed_ratio is the approximate fraction of pixels that changed visibly.",
+        }
+    except Exception as e:
+        return {
+            "status": "unavailable",
+            "message": f"Image comparison requires numpy/opencv in the MCP environment: {e}",
+        }
+
+
+def _find_rhinocode() -> str | None:
+    """Locate Rhino 8's rhinocode CLI."""
+    found = shutil.which("rhinocode")
+    if found:
+        return found
+    candidates = [
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Rhino 8" / "System" / "rhinocode.exe",
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Rhino 8" / "System" / "rhinocode",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+async def _run_process(args: list[str], timeout_seconds: int) -> dict[str, Any]:
+    """Run a subprocess without blocking the MCP event loop."""
+    def _run() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout_seconds)
+
+    try:
+        proc = await asyncio.to_thread(_run)
+        return {
+            "returncode": proc.returncode,
+            "stdout": proc.stdout.strip(),
+            "stderr": proc.stderr.strip(),
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": f"Timed out after {timeout_seconds}s",
+        }
+
+
+async def _developer_mode_required() -> dict | None:
+    """Block code execution unless the Rhino plugin is currently in Developer mode."""
+    blocked = _check_safe_mode("execute_python3")
+    if blocked:
+        return blocked
+    ping = await _exec_simple("ping", {})
+    if ping.get("status") != "ok":
+        return ping
+    mode = str(ping.get("mode") or "").lower()
+    if mode != "developer":
+        return {
+            "status": "error",
+            "error_code": "MODE_BLOCKED",
+            "message": "execute_python3 requires Developer mode in Rhino because it can run arbitrary code.",
+            "current_mode": mode or "unknown",
+            "retry_hint": "Run AIBridge in Rhino and choose Developer mode, then retry.",
+        }
+    return None
 
 
 async def _exec_batch(
@@ -476,6 +594,9 @@ class CaptureInput(BaseModel):
     restore_state: bool = Field(default=True, description="Restore viewport camera and display mode after capture. Default True - the AI can inspect the model from any angle without disrupting the user's current view.")
     view: Optional[str] = Field(default=None, description="Temporarily switch to this named view before capturing (Top, Front, Right, Perspective, etc.). Restored if restore_state=True.")
     display_mode: Optional[str] = Field(default=None, description="Temporarily switch to this display mode before capturing (Wireframe, Shaded, Rendered, Arctic, etc.). Restored if restore_state=True.")
+    annotate: bool = Field(default=False, description="Include structured capture annotations: selected labels, bounding boxes, and layer colors.")
+    annotation_scope: str = Field(default="selected", description="'selected' or 'visible'. Visible is capped by max_annotations.")
+    max_annotations: int = Field(default=20, ge=0, le=200)
 
 
 class InspectionCaptureInput(CaptureInput):
@@ -487,6 +608,36 @@ class InspectionCaptureInput(CaptureInput):
     projection: Optional[str] = Field(None, description="'perspective' | 'parallel'. Defaults to current.")
     box_min: Optional[list[float]] = Field(None, description="Bounding box min [x,y,z] to frame.")
     box_max: Optional[list[float]] = Field(None, description="Bounding box max [x,y,z] to frame.")
+
+
+class ReviewCaptureInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    views: list[str] = Field(
+        default_factory=lambda: ["hero", "plan", "front", "right", "detail"],
+        description="Review views to capture. Options: hero, plan, front, right, left, back, detail.",
+    )
+    width: int = 1100
+    height: int = 800
+    max_bytes: int = 850000
+    format: str = "auto"
+    quality: int = Field(default=78, ge=1, le=100)
+    display_mode: Optional[str] = Field(default=None, description="Temporary display mode for all captures.")
+    include_annotations: bool = True
+    annotation_scope: str = Field(default="selected", description="'selected' or 'visible'.")
+    max_annotations: int = Field(default=25, ge=0, le=200)
+    target: Optional[list[float]] = Field(None, description="Optional target point for hero/detail cameras.")
+    distance: Optional[float] = Field(None, description="Optional camera distance for hero view.")
+    box_min: Optional[list[float]] = Field(None, description="Optional bbox min for detail framing.")
+    box_max: Optional[list[float]] = Field(None, description="Optional bbox max for detail framing.")
+
+
+class BeforeAfterInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    commands: list[BatchSubCommand]
+    atomic: bool = True
+    stop_on_error: Optional[bool] = None
+    capture: CaptureInput = Field(default_factory=lambda: CaptureInput(width=1000, height=720, max_bytes=850000, annotate=True))
+    include_diff_image: bool = True
 
 
 class ViewInput(BaseModel):
@@ -620,6 +771,14 @@ class ScriptInput(BaseModel):
     default_layer: Optional[str] = None
 
 
+class Python3Input(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    code: str = Field(..., description="CPython 3 code to run in Rhino 8 via RhinoCode/rhinocode.")
+    timeout_seconds: int = Field(default=45, ge=1, le=300)
+    rhino_id: Optional[str] = Field(None, description="Optional rhinocode pipe id from `rhinocode list --json`.")
+    keep_script: bool = Field(default=False, description="Keep the temporary .py file for debugging.")
+
+
 class UndoInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     count: int = 1
@@ -667,7 +826,7 @@ class RunCommandInput(BaseModel):
 CAPABILITIES: dict[str, Any] = {
     "version": "4.7.6",
     "phase": "1+2+3+5+6",
-    "tool_count": 109,
+    "tool_count": 112,
     "deferred_phases": {
         "phase_4": "multiplexed protocol - deferred (UI-thread serialization makes the gain marginal)",
         "phase_7": "System.Text.Json source generators - deferred (low ROI vs. wider risk)",
@@ -675,7 +834,8 @@ CAPABILITIES: dict[str, Any] = {
     "tool_surface": "consolidated",
     "preferred_tools": [
         "query_scene", "create_object", "transform_objects", "batch", "report_areas",
-        "capture_viewport", "get_viewport_image", "capture_inspection_view", "get_section_profile",
+        "capture_viewport", "get_viewport_image", "capture_review_set", "compare_before_after",
+        "capture_inspection_view", "get_section_profile", "execute_python3",
         "loft_surface", "sphere_patch", "derive_floors_from_mass", "place_openings_on_facade",
     ],
     "mcneel_compatibility_aliases": {
@@ -683,6 +843,15 @@ CAPABILITIES: dict[str, Any] = {
         "list_objects": "query_scene(scope='objects')",
         "set_selection": "select_objects",
         "run_python": "execute_script",
+    },
+    "vision_loop": {
+        "multi_angle_review": "capture_review_set returns hero/plan/elevation/detail image blocks in one call",
+        "before_after_diff": "compare_before_after captures, edits, captures, and reports pixel-change metrics",
+        "annotations": "capture tools can include selected/visible object labels, bboxes, and layer colors",
+    },
+    "python_engines": {
+        "ironpython": "execute_script / run_python",
+        "cpython3": "execute_python3 via Rhino 8.11+ RhinoCode rhinocode CLI; Developer mode required",
     },
     "universal_create_types": {
         "architecture": ["wall", "slab", "floor", "column", "opening", "window", "door", "roof", "massing", "building_mass", "core"],
@@ -1044,6 +1213,112 @@ async def capture_inspection_view_json(params: InspectionCaptureInput) -> dict:
     return await _exec_simple("capture_inspection_view", params.model_dump(exclude_none=True))
 
 
+@mcp.tool(name="capture_review_set", annotations=RO)
+async def capture_review_set(params: ReviewCaptureInput) -> Any:
+    """Capture a multi-angle architectural review set in one call.
+
+    Returns metadata + image blocks for hero, plan, elevation, and detail views.
+    Use this after geometry edits so the AI can self-debug without asking the user
+    to rotate the Rhino viewport.
+    """
+    target = params.target or [0.0, 0.0, 0.0]
+    box_min = params.box_min
+    box_max = params.box_max
+    distance = params.distance or 22000.0
+    display_mode = params.display_mode
+
+    # Try to use the actual scene bbox when the caller did not provide one.
+    if box_min is None or box_max is None or params.target is None:
+        scene = await _exec_simple("query_scene", {"scope": "summary"})
+        bbox = scene.get("bbox") or scene.get("bounding_box") or {}
+        mn = bbox.get("min") if isinstance(bbox, dict) else None
+        mx = bbox.get("max") if isinstance(bbox, dict) else None
+        if isinstance(mn, list) and isinstance(mx, list) and len(mn) >= 3 and len(mx) >= 3:
+            box_min = box_min or mn[:3]
+            box_max = box_max or mx[:3]
+            if params.target is None:
+                target = [(mn[i] + mx[i]) / 2.0 for i in range(3)]
+                diag = sum((mx[i] - mn[i]) ** 2 for i in range(3)) ** 0.5
+                distance = params.distance or max(diag * 1.6, 1000.0)
+
+    base = {
+        "width": params.width,
+        "height": params.height,
+        "max_bytes": params.max_bytes,
+        "format": params.format,
+        "quality": params.quality,
+        "display_mode": display_mode,
+        "annotate": params.include_annotations,
+        "annotation_scope": params.annotation_scope,
+        "max_annotations": params.max_annotations,
+    }
+    view_map: dict[str, dict[str, Any]] = {
+        "hero": {
+            **base, "target": target, "direction": [1.0, -1.0, -0.55],
+            "distance": distance, "projection": "perspective",
+        },
+        "plan": {**base, "view": "Top", "display_mode": display_mode or "Technical"},
+        "front": {**base, "view": "Front", "display_mode": display_mode or "Technical"},
+        "right": {**base, "view": "Right", "display_mode": display_mode or "Technical"},
+        "left": {**base, "view": "Left", "display_mode": display_mode or "Technical"},
+        "back": {**base, "view": "Back", "display_mode": display_mode or "Technical"},
+        "detail": {
+            **base, "box_min": box_min, "box_max": box_max,
+            "projection": "parallel", "display_mode": display_mode or "Shaded",
+        },
+    }
+
+    content: list[Any] = [{
+        "status": "ok",
+        "review_set": params.views,
+        "target": target,
+        "box_min": box_min,
+        "box_max": box_max,
+        "note": "Each following metadata block is immediately followed by its image content.",
+    }]
+    for requested in params.views:
+        name = requested.strip().lower()
+        payload = view_map.get(name)
+        if payload is None:
+            content.append({"status": "error", "capture_name": requested, "message": f"Unknown review view '{requested}'."})
+            continue
+        if name == "detail" and (not box_min or not box_max):
+            payload = {**base, "target": target, "direction": [1.0, -1.0, -0.55], "distance": distance, "projection": "perspective"}
+        command = "capture_viewport" if "view" in payload else "capture_inspection_view"
+        result = await _exec_simple(command, {k: v for k, v in payload.items() if v is not None})
+        content.extend(_named_image_content(name, result))
+    return content
+
+
+@mcp.tool(name="compare_before_after", annotations=WR)
+async def compare_before_after(params: BeforeAfterInput) -> Any:
+    """Capture before, run a batch, capture after, and return visual diff metrics.
+
+    This is the model's QA loop: see the starting state, perform edits atomically,
+    see the result, and get a coarse pixel-change score in one tool call.
+    """
+    capture_params = params.capture.model_dump(exclude_none=True)
+    capture_params["restore_state"] = True
+    before = await _exec_simple("capture_viewport", capture_params)
+    raw_commands = [c.model_dump() for c in params.commands]
+    batch_result = await _exec_batch(raw_commands, atomic=params.atomic, stop_on_error=params.stop_on_error)
+    after = await _exec_simple("capture_viewport", capture_params)
+    diff = _compare_base64_images(before.get("image_base64"), after.get("image_base64"))
+
+    meta = {
+        "status": "ok" if batch_result.get("status") == "ok" else "error",
+        "batch": batch_result,
+        "diff": {k: v for k, v in diff.items() if k != "diff_base64"},
+        "note": "Returned content order: metadata, before image, after image, optional diff heatmap.",
+    }
+    content: list[Any] = [meta]
+    content.extend(_named_image_content("before", before))
+    content.extend(_named_image_content("after", after))
+    if params.include_diff_image and diff.get("status") == "ok" and diff.get("diff_base64"):
+        content.extend(_named_image_content("diff_heatmap", diff, key="diff_base64", default_format="png"))
+    return content
+
+
 @mcp.tool(name="set_view", annotations=WI)
 async def set_view(params: ViewInput) -> dict:
     """Switch viewport to a named projection: Top, Front, Right, Left, Back, Perspective."""
@@ -1206,6 +1481,69 @@ async def execute_script(params: ScriptInput) -> dict:
 async def run_python(params: ScriptInput) -> dict:
     """McNeel-compatible alias for execute_script. Prefer structured tools when possible."""
     return await execute_script(params)
+
+
+@mcp.tool(name="execute_python3", annotations=WR)
+async def execute_python3(params: Python3Input) -> dict:
+    """Run CPython 3 in Rhino 8 via RhinoCode's official `rhinocode` CLI.
+
+    This supplements `execute_script`, which uses Rhino's legacy IronPython engine.
+    Requirements:
+    - Rhino 8.11+ with RhinoCode installed
+    - RhinoCode script server running (`StartScriptServer`; this tool starts it)
+    - AIBridge in Developer mode
+    """
+    blocked = await _developer_mode_required()
+    if blocked:
+        return blocked
+
+    rhinocode = _find_rhinocode()
+    if not rhinocode:
+        return {
+            "status": "error",
+            "error_code": "RHINOCODE_NOT_FOUND",
+            "message": "Could not find Rhino 8's rhinocode CLI.",
+            "retry_hint": r"Install/update Rhino 8.11+, or add C:\Program Files\Rhino 8\System to PATH.",
+        }
+
+    start = await _exec_simple("start_script_server", {})
+    if start.get("status") != "ok":
+        return {
+            "status": "error",
+            "error_code": "SCRIPT_SERVER_FAILED",
+            "message": "Could not start RhinoCode script server.",
+            "start_result": start,
+        }
+
+    with tempfile.NamedTemporaryFile("w", suffix=".py", prefix="rab_py3_", delete=False, encoding="utf-8") as f:
+        script_path = f.name
+        f.write(params.code)
+        if not params.code.endswith("\n"):
+            f.write("\n")
+
+    args = [rhinocode]
+    if params.rhino_id:
+        args.extend(["--rhino", params.rhino_id])
+    args.extend(["script", script_path])
+    proc = await _run_process(args, params.timeout_seconds)
+
+    if not params.keep_script:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+    ok = proc["returncode"] == 0
+    return {
+        "status": "ok" if ok else "error",
+        "engine": "RhinoCode CPython 3",
+        "rhinocode": rhinocode,
+        "returncode": proc["returncode"],
+        "stdout": proc["stdout"] or "(no stdout)",
+        "stderr": proc["stderr"] or "",
+        "script_path": script_path if params.keep_script else None,
+        "message": None if ok else "rhinocode script returned a non-zero exit code.",
+    }
 
 
 @mcp.tool(name="undo", annotations=WI)
