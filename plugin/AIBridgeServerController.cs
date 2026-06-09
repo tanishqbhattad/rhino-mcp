@@ -27,5 +27,10 @@ namespace RhinoAIBridge
         {
             _server.ForceRelease();
         }
+
+        public static void StopForRhinoShutdown()
+        {
+            _server.StopForRhinoShutdown();
+        }
     }
 }

@@ -7,6 +7,15 @@ detected AI clients.
 
 ## Highlights
 
+- Stability patch: MCP `ping` now checks optional dependencies without importing
+  heavy modules like `cv2`/`numpy`, has hard ping timeouts, and exits stale MCP
+  helpers when Rhino is unavailable instead of leaving post-restart processes
+  behind.
+- Adds a faster Rhino shutdown path for AIBridge sockets to reduce Windows
+  "Server Busy" popups when closing Rhino.
+- Adds `FIX-RHINO-MCP.bat`, a non-technical repair launcher for clearing stale
+  helpers, handling hidden Rhino processes, reinstalling the plugin, and
+  refreshing server dependencies.
 - Adds Safe, Standard, and Developer access modes. Run `AIBridge` in Rhino to
   choose or change the active mode.
 - Adds direct MCP image returns for viewport capture, thumbnails, and PDF

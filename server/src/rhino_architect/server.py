@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import json
 import logging
 import os
@@ -74,18 +75,24 @@ def _check_safe_mode(tool_name: str) -> dict | None:
     return None
 # Phase 7: Heartbeat watchdog - auto-exit when Rhino closes.
 # Runs in a daemon thread (not asyncio) so it works regardless of the MCP event loop.
-# Checks every 15s whether the Rhino TCP port is still accepting connections.
-# After 3 consecutive failures (~45s), exits the process so the MCP client knows
+# Checks every 10s whether the Rhino TCP port is still accepting connections.
+# After 2 consecutive failures (~20s), exits the process so the MCP client knows
 # the server is gone and can restart it when Rhino reopens.
-_HEARTBEAT_INTERVAL = 15   # seconds between checks
-_HEARTBEAT_MAX_FAILS = 3   # consecutive failures before exit
+_HEARTBEAT_INTERVAL = 10   # seconds between checks
+_HEARTBEAT_MAX_FAILS = 2   # consecutive failures before exit
+_HEARTBEAT_STARTUP_MAX_WAIT = int(os.environ.get("RHINO_HEARTBEAT_STARTUP_MAX_WAIT", "120"))
 
 def _rhino_heartbeat_loop():
     """Background thread: poll Rhino TCP port, exit if unreachable.
     
     Two-phase design:
-      Phase 1: Wait INDEFINITELY for Rhino to appear (user might start Rhino after the MCP server).
-      Phase 2: Once connected, monitor. After 3 consecutive failures (~45s), exit.
+      Phase 1: Wait briefly for Rhino to appear (Claude may start MCP before Rhino).
+      Phase 2: Once connected, monitor. After two consecutive failures, exit.
+
+    Older builds waited forever in phase 1. After a PC restart or Rhino close that left
+    the port absent, Claude/Codex/Antigravity could accumulate stale MCP helper
+    processes. Those stale helpers make later pings look busy even when the raw
+    AIBridge socket is healthy.
     """
     import time
     host = os.environ.get("RHINO_HOST", "127.0.0.1")
@@ -93,7 +100,8 @@ def _rhino_heartbeat_loop():
     
     # Phase 1: Wait for Rhino to become reachable (no timeout — wait forever)
     logger.info("Heartbeat: waiting for Rhino on %s:%d ...", host, port)
-    while True:
+    startup_deadline = time.monotonic() + max(15, _HEARTBEAT_STARTUP_MAX_WAIT)
+    while time.monotonic() < startup_deadline:
         try:
             with socket.create_connection((host, port), timeout=3):
                 pass
@@ -101,6 +109,12 @@ def _rhino_heartbeat_loop():
             break  # Rhino is up — move to phase 2
         except OSError:
             time.sleep(5)  # check every 5s while waiting
+    else:
+        logger.error(
+            "Rhino did not become reachable within %ds; shutting down MCP server.",
+            _HEARTBEAT_STARTUP_MAX_WAIT,
+        )
+        os._exit(0)
     
     # Phase 2: Monitor — exit if Rhino goes away
     consecutive_fails = 0
@@ -967,20 +981,20 @@ async def ping(params: Empty) -> dict:
     Cheap (sub-ms). Call at conversation start and to check if scene has changed (etag)."""
     import sys as _sys
     try:
-        conn = await get_connection()
-        data = await conn.ping()
+        async def _probe() -> dict:
+            conn = await get_connection()
+            return await conn.ping()
+
+        data = await asyncio.wait_for(_probe(), timeout=10.0)
         data["capabilities_resource"] = "rhino://capabilities"
         data["safe_mode"] = _SAFE_MODE
         data["mcp_python"] = _sys.executable
         data["mcp_version"] = "4.7.6"
-        # Check optional dependencies
+        # Check optional dependencies without importing them. Importing cv2/numpy during
+        # a health check can be surprisingly slow on Windows and made MCP ping appear hung.
         dep_status = {}
-        for pkg in ["pymupdf", "cv2", "numpy"]:
-            try:
-                __import__(pkg if pkg != "cv2" else "cv2")
-                dep_status[pkg] = "installed"
-            except ImportError:
-                dep_status[pkg] = "missing"
+        for pkg, module_name in {"pymupdf": "fitz", "cv2": "cv2", "numpy": "numpy"}.items():
+            dep_status[pkg] = "installed" if importlib.util.find_spec(module_name) else "missing"
         data["optional_dependencies"] = dep_status
         # Protocol 4.x releases remain wire-compatible.
         plugin_ver = data.get("protocol_version", "")
@@ -989,6 +1003,12 @@ async def ping(params: Empty) -> dict:
             data["version_warning"] = (f"MCP server expects protocol 4.x; plugin reports {plugin_ver}. "
                                        "Update the .rhp plugin for full compatibility.")
         return data
+    except asyncio.TimeoutError:
+        return {"status": "error",
+                "error_code": "RHINO_PING_TIMEOUT",
+                "message": "Timed out waiting for Rhino AIBridge to answer ping.",
+                "recoverable": True,
+                "hint": "Run AIBridgeStop then AIBridge in Rhino. If Rhino is closing or hidden, close it in Task Manager and reopen."}
     except Exception as e:
         return {"status": "error", "message": str(e),
                 "hint": "Is Rhino running with the AIBridge plugin loaded? Check 127.0.0.1:9544."}

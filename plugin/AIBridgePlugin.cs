@@ -39,15 +39,11 @@ namespace RhinoAIBridge
             try
             {
                 // Signal stop — cancels the accept loop and kills the listener
-                AIBridgeServerController.StopServer();
+                AIBridgeServerController.StopForRhinoShutdown();
 
                 // Give TCP handler threads up to 2s to wind down
                 // They may be blocked on UiDispatcher.Invoke which will now fail
                 // because the CancellationToken is cancelled
-                Thread.Sleep(500);
-
-                // Force-release any lingering connections
-                AIBridgeServerController.ForceKill();
             }
             catch { }
             finally

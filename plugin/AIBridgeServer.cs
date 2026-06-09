@@ -138,7 +138,7 @@ namespace RhinoAIBridge
                 RhinoApp.WriteLine("  Phase 2: scene snapshot cache + scene_version etag");
                 RhinoApp.WriteLine("  Phase 3: atomic batches + reference resolution ($1.object_ids[0])");
                 RhinoApp.WriteLine("  Phase 5: architect intelligence (massing, floors, core, facade, schedules)");
-                RhinoApp.WriteLine("  Phase 6: consolidated 90-tool MCP surface");
+                RhinoApp.WriteLine("  Phase 6: consolidated 112-tool MCP surface");
                 RhinoApp.WriteLine("  Logs: %APPDATA%\\AIBridge\\logs\\");
                 RhinoApp.WriteLine("==================================================");
                 AIBridgeLogger.Log(LogLevel.INFO, "Server", $"Started on 127.0.0.1:{PORT} build:{BuildHash}");
@@ -309,6 +309,32 @@ namespace RhinoAIBridge
             }
             _activeClients.Clear();
             AIBridgeLogger.Log(LogLevel.INFO, "Server", "ForceRelease: all connections closed");
+        }
+
+        /// <summary>
+        /// Fast, non-blocking shutdown path for Rhino's Closing event.
+        /// Avoids UI/log waits while Rhino is tearing down, which is when Windows can show
+        /// the "Server Busy" dialog if background client threads are still marshaling calls.
+        /// </summary>
+        public void StopForRhinoShutdown()
+        {
+            lock (_lifecycleLock)
+            {
+                _running = false;
+                try { _cts?.Cancel(); } catch { }
+                try { _listener?.Stop(); } catch { }
+                _listener = null;
+            }
+
+            foreach (var kv in _activeClients)
+            {
+                try { kv.Value?.Close(); } catch { }
+                try { kv.Value?.Dispose(); } catch { }
+            }
+            _activeClients.Clear();
+
+            try { SceneSnapshotRegistry.Shutdown(); } catch { }
+            try { AIBridgeLogger.Log(LogLevel.INFO, "Server", "StopForRhinoShutdown: listener and clients closed"); } catch { }
         }
 
         private async Task AcceptLoop(CancellationToken ct)

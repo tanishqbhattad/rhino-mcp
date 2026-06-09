@@ -58,6 +58,7 @@ DEFAULT_PORT = 9544
 CONNECT_TIMEOUT = 5.0
 READ_TIMEOUT = 190.0      # Phase 7: must exceed the longest C# per-command timeout (180s for batch/scripts)
 PING_TIMEOUT = 1.0
+PING_TOTAL_TIMEOUT = 8.0
 MAX_RETRIES = 2
 HEADER_SIZE = 4
 MAX_FRAME = 50 * 1024 * 1024   # 50MB cap, matches server
@@ -290,12 +291,14 @@ class RhinoProtocol:
 
     async def ping(self) -> dict[str, Any]:
         """Liveness + capability probe. Sub-millisecond on the server side (no UI thread hop)."""
-        try:
+        async def _ping_once() -> dict[str, Any]:
             await self._ensure_connected()
             async with self._lock:
                 await self._send({"type": "ping"})
-                raw = await asyncio.wait_for(self._recv(), timeout=PING_TIMEOUT)
-            return raw
+                return await asyncio.wait_for(self._recv(), timeout=PING_TIMEOUT)
+
+        try:
+            return await asyncio.wait_for(_ping_once(), timeout=PING_TOTAL_TIMEOUT)
         except Exception as exc:
             await self.disconnect()
             raise RhinoConnectionError(f"Ping failed: {exc}") from exc
