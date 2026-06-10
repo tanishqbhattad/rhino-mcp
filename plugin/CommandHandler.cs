@@ -700,13 +700,16 @@ namespace RhinoAIBridge
             var added = new List<string>();
             EventHandler<Rhino.DocObjects.RhinoObjectEventArgs> handler = (s, e) =>
             {
-                try { if (e.TheObject == null || ReferenceEquals(e.TheObject.Document, Doc)) added.Add(e.ObjectId.ToString()); }
+                try { if (e.TheObject != null && ReferenceEquals(e.TheObject.Document, Doc)) added.Add(e.ObjectId.ToString()); }
                 catch { }
             };
             RhinoDoc.AddRhinoObject += handler;
             try { action(); }
             finally { RhinoDoc.AddRhinoObject -= handler; }
-            return added;
+            return added
+                .Where(id => Guid.TryParse(id, out var gid) && Doc.Objects.FindId(gid) != null)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
         }
 
         static string SanitizeFileName(string raw)
@@ -3142,6 +3145,17 @@ namespace RhinoAIBridge
                     "    return result\n";
                 bool ok = false;
                 var newIds = CaptureAddedIds(() => ok = py.ExecuteScript(preamble + code));
+                bool rollbackOnError = p["rollback_on_error"]?.ToObject<bool>() ?? false;
+                var rolledBackIds = new List<string>();
+                if (!ok && rollbackOnError && newIds.Count > 0)
+                {
+                    foreach (var nid in newIds.ToList())
+                    {
+                        if (Guid.TryParse(nid, out var gid) && Doc.Objects.Delete(gid, true))
+                            rolledBackIds.Add(nid);
+                    }
+                    newIds = new List<string>();
+                }
 
                 RedrawScope.Mark();   // outer scope flushes; no double redraw
 
@@ -3173,6 +3187,11 @@ namespace RhinoAIBridge
                     ["objects_created"] = newIds.Count,
                     ["new_object_ids"] = new JArray(newIds.Take(20))
                 };
+                if (rolledBackIds.Count > 0)
+                {
+                    r["rolled_back"] = true;
+                    r["rolled_back_object_ids"] = new JArray(rolledBackIds.Take(20));
+                }
                 // Phase 7: Detect boolean failures from the _rab_check_bool tracker
                 int boolFails = 0;
                 foreach (var line in output)

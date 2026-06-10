@@ -16,6 +16,11 @@ detected AI clients.
 - Adds `FIX-RHINO-MCP.bat`, a non-technical repair launcher for clearing stale
   helpers, handling hidden Rhino processes, reinstalling the plugin, and
   refreshing server dependencies.
+- Field-test fixes: `ping` accepts empty calls, `execute_python3` now hard-fails
+  on Rhino versions below 8.11, camera override objects passed to
+  `capture_viewport.view` route to inspection capture, script-created object IDs
+  are de-duplicated/live-filtered, and `execute_script` supports
+  `rollback_on_error`.
 - Adds Safe, Standard, and Developer access modes. Run `AIBridge` in Rhino to
   choose or change the active mode.
 - Adds direct MCP image returns for viewport capture, thumbnails, and PDF

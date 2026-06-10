@@ -335,6 +335,17 @@ async def _developer_mode_required() -> dict | None:
     return None
 
 
+def _parse_rhino_version(raw: Any) -> tuple[int, int] | None:
+    """Parse Rhino version strings like '8.9.24194.18121' into (8, 9)."""
+    try:
+        parts = str(raw or "").split(".")
+        if len(parts) < 2:
+            return None
+        return int(parts[0]), int(parts[1])
+    except (TypeError, ValueError):
+        return None
+
+
 async def _exec_batch(
     commands: list[dict[str, Any]],
     atomic: bool = True,
@@ -606,7 +617,15 @@ class CaptureInput(BaseModel):
     format: str = "auto"   # "auto" | "png" | "jpeg"
     quality: int = Field(default=80, ge=1, le=100)
     restore_state: bool = Field(default=True, description="Restore viewport camera and display mode after capture. Default True - the AI can inspect the model from any angle without disrupting the user's current view.")
-    view: Optional[str] = Field(default=None, description="Temporarily switch to this named view before capturing (Top, Front, Right, Perspective, etc.). Restored if restore_state=True.")
+    view: Optional[Any] = Field(
+        default=None,
+        description=(
+            "Temporarily switch to this named view before capturing "
+            "(Top, Front, Right, Perspective, etc.). For camera overrides, pass "
+            "{location:[x,y,z], target:[x,y,z], projection:'parallel|perspective'} "
+            "or use capture_inspection_view."
+        ),
+    )
     display_mode: Optional[str] = Field(default=None, description="Temporarily switch to this display mode before capturing (Wireframe, Shaded, Rendered, Arctic, etc.). Restored if restore_state=True.")
     annotate: bool = Field(default=False, description="Include structured capture annotations: selected labels, bounding boxes, and layer colors.")
     annotation_scope: str = Field(default="selected", description="'selected' or 'visible'. Visible is capped by max_annotations.")
@@ -783,6 +802,10 @@ class ScriptInput(BaseModel):
     code: str = Field(..., description="Python code to run inside Rhino. Alias: script.")
     undo_name: Optional[str] = None
     default_layer: Optional[str] = None
+    rollback_on_error: bool = Field(
+        default=False,
+        description="If True, delete live objects created by a script that returns failure.",
+    )
 
 
 class Python3Input(BaseModel):
@@ -972,7 +995,7 @@ async def arch_defaults_resource() -> dict:
 # Tools --------------------------------------------------
 
 @mcp.tool(name="ping", annotations=RO)
-async def ping(params: Empty) -> dict:
+async def ping(params: Optional[Empty] = None) -> dict:
     """Health check — verify Rhino bridge is reachable on 127.0.0.1:9544.
 
     Returns: bridge status, Rhino version, document name, model units, scene_version (etag),
@@ -1202,21 +1225,40 @@ async def capture_viewport(params: CaptureInput) -> Any:
     Phase 1 - no disk round-trip. format='auto' picks based on display mode.
     restore_state=True (default) saves and restores the viewport camera + display mode after
     capture, so inspecting the model from any angle never disrupts the user's current view.
-    Pass view= and/or display_mode= to temporarily switch before capturing."""
-    result = await _exec_simple("capture_viewport", params.model_dump())
+    Pass view='Top' and/or display_mode= to temporarily switch before capturing.
+    For explicit camera overrides, either use capture_inspection_view or pass
+    view={location:[x,y,z], target:[x,y,z], projection:'parallel|perspective'}."""
+    payload = params.model_dump(exclude_none=True)
+    if isinstance(payload.get("view"), dict):
+        view_payload = payload.pop("view")
+        payload.update(view_payload)
+        result = await _exec_simple("capture_inspection_view", payload)
+    else:
+        result = await _exec_simple("capture_viewport", payload)
     return _as_mcp_image(result)
 
 
 @mcp.tool(name="capture_viewport_json", annotations=RO)
 async def capture_viewport_json(params: CaptureInput) -> dict:
     """Capture the viewport and return the full JSON payload with base64 + metadata."""
-    return await _exec_simple("capture_viewport", params.model_dump())
+    payload = params.model_dump(exclude_none=True)
+    if isinstance(payload.get("view"), dict):
+        view_payload = payload.pop("view")
+        payload.update(view_payload)
+        return await _exec_simple("capture_inspection_view", payload)
+    return await _exec_simple("capture_viewport", payload)
 
 
 @mcp.tool(name="get_viewport_image", annotations=RO)
 async def get_viewport_image(params: CaptureInput) -> Any:
     """McNeel-compatible viewport capture: returns metadata text plus an image content block."""
-    result = await _exec_simple("capture_viewport", params.model_dump())
+    payload = params.model_dump(exclude_none=True)
+    if isinstance(payload.get("view"), dict):
+        view_payload = payload.pop("view")
+        payload.update(view_payload)
+        result = await _exec_simple("capture_inspection_view", payload)
+    else:
+        result = await _exec_simple("capture_viewport", payload)
     return _image_with_metadata(result)
 
 
@@ -1517,6 +1559,17 @@ async def execute_python3(params: Python3Input) -> dict:
     if blocked:
         return blocked
 
+    health = await _exec_simple("ping", {})
+    version = _parse_rhino_version(health.get("rhino_version"))
+    if version is None or version < (8, 11):
+        return {
+            "status": "error",
+            "error_code": "RHINOCODE_UNSUPPORTED_RHINO_VERSION",
+            "message": "execute_python3 requires Rhino 8.11+ with RhinoCode script server support.",
+            "rhino_version": health.get("rhino_version", "unknown"),
+            "retry_hint": "Use execute_script on Rhino 8.9, or update Rhino to 8.11+ for CPython 3.",
+        }
+
     rhinocode = _find_rhinocode()
     if not rhinocode:
         return {
@@ -1527,11 +1580,11 @@ async def execute_python3(params: Python3Input) -> dict:
         }
 
     start = await _exec_simple("start_script_server", {})
-    if start.get("status") != "ok":
+    if start.get("status") != "ok" or start.get("started") is not True:
         return {
             "status": "error",
             "error_code": "SCRIPT_SERVER_FAILED",
-            "message": "Could not start RhinoCode script server.",
+            "message": "Could not start RhinoCode script server. Rhino 8.11+ is required.",
             "start_result": start,
         }
 
