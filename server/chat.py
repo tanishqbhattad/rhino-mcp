@@ -1,11 +1,13 @@
-﻿# RhinoAIBridge â€” Multi-Provider Chat Client
-# by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
+﻿#!/usr/bin/env python3
+# RhinoAIBridge - Multi-Provider Chat Client
+# by tanishqb | https://github.com/tanishqbhattad/rhino-mcp
 
-#!/usr/bin/env python3
-"""RhinoAIBridge â€” multi-provider chat client.
+"""RhinoAIBridge - multi-provider chat client.
 
 Bypasses the MCP layer and talks directly to the Rhino plugin over TCP.
 Works with any OpenAI-compatible API: OpenAI, Ollama, LM Studio, etc.
+This is a legacy/demo client with a smaller direct-TCP tool surface than the MCP
+server. Use `rhino-architect` for the full 112-tool MCP surface.
 
 Usage:
   uv run python chat.py                                  # Ollama + qwen2.5-coder:7b
@@ -16,15 +18,15 @@ Usage:
   uv run python chat.py --base-url http://localhost:1234/v1 --model lmstudio-model
 
 Ollama models with reliable tool-calling:
-  qwen2.5-coder:7b  (recommended â€” best function-calling accuracy)
+  qwen2.5-coder:7b  (recommended - best function-calling accuracy)
   qwen2.5:14b       (larger, more capable)
   llama3.1:8b       (good general-purpose)
   mistral:7b        (solid tool use)
 
 Environment variables:
-  OPENAI_API_KEY   â€” required when using --provider openai
-  RHINO_HOST       â€” plugin host (default: 127.0.0.1)
-  RHINO_PORT       â€” plugin port (default: 9544)
+  OPENAI_API_KEY   - required when using --provider openai
+  RHINO_HOST       - plugin host (default: 127.0.0.1)
+  RHINO_PORT       - plugin port (default: 9544)
 """
 
 from __future__ import annotations
@@ -38,22 +40,22 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# â”€â”€ Dependency check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Dependency check ----------------------------------------------------------
 
 try:
     from openai import OpenAI
     import orjson
 except ImportError as _e:
-    print(f"ERROR: missing package â€” {_e}")
+    print(f"ERROR: missing package - {_e}")
     print("Run:  uv add openai   (orjson is already in the venv)")
     sys.exit(1)
 
-# â”€â”€ Sync TCP connection to the Rhino plugin â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Sync TCP connection to the Rhino plugin -----------------------------------
 
 class RhinoBridge:
     """Blocking TCP socket to the plugin. Same wire format as protocol.py (4-byte BE length + JSON)."""
 
-    MAX_FRAME = 50 * 1024 * 1024  # 50 MB cap â€” matches plugin
+    MAX_FRAME = 50 * 1024 * 1024  # 50 MB cap - matches plugin
 
     def __init__(self, host: str = "127.0.0.1", port: int = 9544):
         import socket
@@ -70,9 +72,9 @@ class RhinoBridge:
 
     def _send_recv(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = orjson.dumps(payload)
-        # Client â†’ server: old 4-byte format (requests are always small)
+        # Client -> server: old 4-byte format (requests are always small)
         self._sock.sendall(struct.pack(">I", len(body)) + body)
-        # Server â†’ client: Tier 1 protocol [1-byte flag][4-byte length][payload]
+        # Server -> client: Tier 1 protocol [1-byte flag][4-byte length][payload]
         flag = self._recv_exact(1)[0]
         (length,) = struct.unpack(">I", self._recv_exact(4))
         if length <= 0 or length > self.MAX_FRAME:
@@ -111,7 +113,7 @@ class RhinoBridge:
             pass
 
 
-# â”€â”€ Tool dispatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Tool dispatch -------------------------------------------------------------
 
 # Max characters of a tool result returned to the model. Large scene dumps get truncated
 # so they don't eat the context window; the model can re-query with a tighter filter.
@@ -131,13 +133,13 @@ def dispatch(bridge: RhinoBridge, tool_name: str, args: dict[str, Any]) -> str:
 
         text = json.dumps(result, indent=2)
         if len(text) > _MAX_RESULT_CHARS:
-            text = text[:_MAX_RESULT_CHARS] + "\n... (truncated â€” use a tighter filter to see more)"
+            text = text[:_MAX_RESULT_CHARS] + "\n... (truncated - use a tighter filter to see more)"
         return text
     except Exception as exc:
         return json.dumps({"status": "error", "message": str(exc)})
 
 
-# â”€â”€ Tool schemas (OpenAI function-calling format) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Tool schemas (OpenAI function-calling format) -----------------------------
 
 def _fn(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
     return {
@@ -162,7 +164,7 @@ TOOLS: list[dict] = [
     _fn("query_scene",
         "Query the scene. scope='summary' for scene overview, 'layers' for layer list, "
         "'objects' (default) to list objects. Filtered by layer/type/name_pattern. "
-        "Returns scene_version etag â€” skip re-querying if version unchanged.",
+        "Returns scene_version etag - skip re-querying if version unchanged.",
         {
             "scope":  {"type": "string", "enum": ["objects", "layers", "summary", "scene"],
                        "default": "objects"},
@@ -265,7 +267,7 @@ TOOLS: list[dict] = [
         },
         required=["commands"]),
 
-    # â”€â”€ Architect intelligence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Architect intelligence ------------------------------------------------
 
     _fn("derive_floors_from_mass",
         "Section a massing solid at floor heights and extrude each into a slab. "
@@ -328,7 +330,7 @@ TOOLS: list[dict] = [
             "level_height": {"type": "number", "default": 3000},
         }),
 
-    # â”€â”€ Layers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Layers ----------------------------------------------------------------
 
     _fn("create_layer",
         "Create or update a layer.",
@@ -356,7 +358,7 @@ TOOLS: list[dict] = [
             "isolate": {"type": "string", "description": "Layer name to isolate (hides all others)"},
         }),
 
-    # â”€â”€ Analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Analysis --------------------------------------------------------------
 
     _fn("measure_object",
         "Return area, volume, length, and bounding box for one object.",
@@ -387,7 +389,7 @@ TOOLS: list[dict] = [
             "object_ids": {"type": "array", "items": {"type": "string"}, "default": []},
         }),
 
-    # â”€â”€ Viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Viewport --------------------------------------------------------------
 
     _fn("capture_viewport",
         "Capture the active viewport as JPEG or PNG. Returns base64 image data. "
@@ -429,7 +431,7 @@ TOOLS: list[dict] = [
     _fn("set_camera",
         "Precisely position the viewport camera. Two modes: "
         "(1) Explicit: location + target + optional lens_length/projection. "
-        "(2) Bbox framing: box_min + box_max â€” auto-computes camera distance to frame the volume.",
+        "(2) Bbox framing: box_min + box_max - auto-computes camera distance to frame the volume.",
         {
             "location":    {"type": "array", "items": {"type": "number"}, "description": "Camera position [x,y,z]."},
             "target":      {"type": "array", "items": {"type": "number"}, "description": "Camera target [x,y,z]."},
@@ -461,17 +463,17 @@ TOOLS: list[dict] = [
 
     _fn("run_command",
         "Execute any Rhino command string via RhinoApp.RunScript. "
-        "Escape hatch â€” prefer structured tools when available. Tracks newly created objects.",
+        "Escape hatch - prefer structured tools when available. Tracks newly created objects.",
         {
             "command": {"type": "string", "description": "Command exactly as typed in Rhino command line"},
             "echo":    {"type": "boolean", "default": False},
         },
         required=["command"]),
 
-    # â”€â”€ Geometry ops â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Geometry ops ----------------------------------------------------------
 
     _fn("get_cross_section",
-        "Cut a solid at a Z height and return section curves â€” useful for plan views.",
+        "Cut a solid at a Z height and return section curves - useful for plan views.",
         {
             "object_id": {"type": "string"},
             "z_height":  {"type": "number"},
@@ -497,10 +499,10 @@ TOOLS: list[dict] = [
         },
         required=["object_ids"]),
 
-    # â”€â”€ Escape hatches â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Escape hatches --------------------------------------------------------
 
     _fn("execute_script",
-        "Run arbitrary Python inside Rhino. Powerful escape hatch â€” prefer structured tools. "
+        "Run arbitrary Python inside Rhino. Powerful escape hatch - prefer structured tools. "
         "Preamble auto-imports: rhinoscriptsyntax, scriptcontext, Rhino, System.",
         {
             "code":          {"type": "string"},
@@ -524,7 +526,7 @@ TOOLS: list[dict] = [
 ]
 
 
-# â”€â”€ System prompt â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- System prompt -------------------------------------------------------------
 
 SYSTEM_PROMPT = """\
 You are an AI assistant controlling Rhino 3D through RhinoAIBridge.
@@ -541,7 +543,7 @@ Key rules:
 """
 
 
-# â”€â”€ Agentic chat loop â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Agentic chat loop ---------------------------------------------------------
 
 def _tool_call_summary(tool_name: str, args: dict) -> str:
     """One-line summary of a tool call for the terminal display."""
@@ -560,11 +562,11 @@ def _tool_call_summary(tool_name: str, args: dict) -> str:
 def run_chat(client: OpenAI, model: str, bridge: RhinoBridge) -> None:
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    print(f"\n  RhinoAIBridge â€” {model}")
+    print(f"\n  RhinoAIBridge - {model}")
     print("  Type your request. 'exit' to quit.\n")
 
     while True:
-        # â”€â”€ Get user input â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Get user input ----------------------------------------------------
         try:
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -579,7 +581,7 @@ def run_chat(client: OpenAI, model: str, bridge: RhinoBridge) -> None:
 
         messages.append({"role": "user", "content": user_input})
 
-        # â”€â”€ Agentic loop â€” keep going until the model stops calling tools â”€â”€â”€â”€â”€
+        # -- Agentic loop - keep going until the model stops calling tools -----
         while True:
             try:
                 response = client.chat.completions.create(
@@ -612,12 +614,12 @@ def run_chat(client: OpenAI, model: str, bridge: RhinoBridge) -> None:
                 ]
             messages.append(msg_dict)
 
-            # â”€â”€ No tool calls â€” model is done, print reply â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # -- No tool calls - model is done, print reply --------------------
             if not msg.tool_calls:
                 print(f"\nAssistant: {msg.content or '(no reply)'}\n")
                 break
 
-            # â”€â”€ Execute each tool call and feed results back â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # -- Execute each tool call and feed results back ------------------
             for tc in msg.tool_calls:
                 fn_name = tc.function.name
                 try:
@@ -625,13 +627,13 @@ def run_chat(client: OpenAI, model: str, bridge: RhinoBridge) -> None:
                 except json.JSONDecodeError:
                     fn_args = {}
 
-                print(f"  âš™  {_tool_call_summary(fn_name, fn_args)}")
+                print(f"  *  {_tool_call_summary(fn_name, fn_args)}")
                 result_text = dispatch(bridge, fn_name, fn_args)
 
                 # Parse first line of result for a quick status hint
                 try:
                     status = json.loads(result_text).get("status", "")
-                    hint = f"  â†’ {status}" if status and status != "ok" else ""
+                    hint = f"  -> {status}" if status and status != "ok" else ""
                 except Exception:
                     hint = ""
                 if hint:
@@ -646,11 +648,11 @@ def run_chat(client: OpenAI, model: str, bridge: RhinoBridge) -> None:
         print()   # blank line between exchanges
 
 
-# â”€â”€ Entry point â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# -- Entry point ---------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="RhinoAIBridge chat â€” connect Rhino to any OpenAI-compatible model",
+        description="RhinoAIBridge chat - connect Rhino to any OpenAI-compatible model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -668,7 +670,7 @@ def main() -> None:
                         help="Rhino plugin port (default: 9544)")
     args = parser.parse_args()
 
-    # â”€â”€ Resolve provider settings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Resolve provider settings ---------------------------------------------
     provider = args.provider or ("openai" if args.base_url and "openai" in (args.base_url or "") else "ollama")
 
     if args.base_url:
@@ -694,7 +696,7 @@ def main() -> None:
         api_key = "ollama"
         model = args.model or "qwen2.5-coder:7b"
 
-    # â”€â”€ Connect to Rhino â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Connect to Rhino ------------------------------------------------------
     print(f"Connecting to Rhino at {args.host}:{args.port} ...", end=" ", flush=True)
     try:
         bridge = RhinoBridge(args.host, args.port)
@@ -709,10 +711,10 @@ def main() -> None:
         print("In Rhino's command line, type:  AIBridge", file=sys.stderr)
         sys.exit(1)
 
-    # â”€â”€ Create OpenAI client â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Create OpenAI client --------------------------------------------------
     client = OpenAI(base_url=base_url, api_key=api_key)
 
-    # â”€â”€ Run â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # -- Run -------------------------------------------------------------------
     try:
         run_chat(client, model, bridge)
     finally:

@@ -2267,9 +2267,33 @@ namespace RhinoAIBridge
         }
         JObject SetDisplayMode(JObject p)
         {
-            var m = Rhino.Display.DisplayModeDescription.FindByName(p["mode"].ToString());
-            if (m != null) { Doc.Views.ActiveView.ActiveViewport.DisplayMode = m; RedrawScope.Mark(); }
-            return Ok(("mode", p["mode"].ToString()));
+            string requested = p["mode"]?.ToString();
+            if (string.IsNullOrWhiteSpace(requested)) return Err("mode required", "INVALID_INPUT");
+
+            var m = Rhino.Display.DisplayModeDescription.FindByName(requested);
+            if (m == null)
+            {
+                var modes = Rhino.Display.DisplayModeDescription.GetDisplayModes()
+                    .Select(dm => dm.EnglishName ?? dm.LocalName ?? dm.Id.ToString())
+                    .Where(n => !string.IsNullOrWhiteSpace(n))
+                    .OrderBy(n => n)
+                    .ToList();
+                var close = modes
+                    .Where(n => n.IndexOf(requested, StringComparison.OrdinalIgnoreCase) >= 0
+                             || requested.IndexOf(n, StringComparison.OrdinalIgnoreCase) >= 0)
+                    .Take(8)
+                    .ToArray();
+                var detail = new JObject { ["available_modes"] = new JArray(modes.Take(40)) };
+                if (close.Length > 0) detail["suggestions"] = new JArray(close);
+                return Err($"Display mode not found: {requested}", "DISPLAY_MODE_NOT_FOUND", detail);
+            }
+
+            var view = Doc.Views.ActiveView;
+            if (view == null) return Err("No active viewport", "VIEWPORT_EMPTY");
+            view.ActiveViewport.DisplayMode = m;
+            view.Redraw();
+            RedrawScope.Mark();
+            return Ok(("mode", m.EnglishName ?? m.LocalName ?? requested));
         }
 
         JArray CaptureAnnotations(JObject p)
@@ -2335,6 +2359,7 @@ namespace RhinoAIBridge
             var savedUp       = vp.CameraUp;
             var savedMode     = vp.DisplayMode;
             bool savedParallel = vp.IsParallelProjection;
+            double savedLens = vp.Camera35mmLensLength;
 
             try
             {
@@ -2356,21 +2381,19 @@ namespace RhinoAIBridge
                 if (!string.IsNullOrEmpty(modeOverride))
                 {
                     var dm = Rhino.Display.DisplayModeDescription.FindByName(modeOverride);
-                    if (dm != null) vp.DisplayMode = dm;
+                    if (dm == null)
+                        return Err($"Display mode not found: {modeOverride}", "DISPLAY_MODE_NOT_FOUND");
+                    vp.DisplayMode = dm;
                 }
 
                 // -- Capture --------------------------------------------------
-                // Phase 7: Disable viewport redraw during capture to prevent
-                // Rhino from re-rendering the scene mid-capture on complex models.
-                // This is the #1 cause of set_camera / capture_viewport hangs.
                 Bitmap source;
                 try
                 {
-                    Doc.Views.RedrawEnabled = false;
+                    Doc.Views.ActiveView.Redraw();
                     source = Doc.Views.ActiveView.CaptureToBitmap(new Size(w, h));
                 }
                 catch (Exception e) { return Err($"Capture failed: {e.Message}"); }
-                finally { Doc.Views.RedrawEnabled = true; }
                 if (source == null) return Err("Capture returned null");
 
                 // Pick format: explicit > display-mode-derived
@@ -2446,7 +2469,7 @@ namespace RhinoAIBridge
                     try
                     {
                         if (savedParallel) vp.ChangeToParallelProjection(true);
-                        else              vp.ChangeToPerspectiveProjection(true, 50);
+                        else              vp.ChangeToPerspectiveProjection(true, savedLens);
                         vp.SetCameraLocations(savedTarget, savedLocation);
                         vp.CameraUp = savedUp;
                         vp.DisplayMode = savedMode;
@@ -2742,7 +2765,12 @@ namespace RhinoAIBridge
 
             var r = Ok(("command", cmd), ("success", ok));
             if (newIds.Count > 0) r["new_object_ids"] = new JArray(newIds.Take(20).ToArray<object>());
-            if (!ok) r["message"] = "Command returned false. Use execute_script for Python scripts with print() output.";
+            if (!ok)
+            {
+                r["status"] = "error";
+                r["error_code"] = "COMMAND_FAILED";
+                r["message"] = "Command returned false. Use execute_script for Python scripts with print() output.";
+            }
             return r;
         }
 
@@ -2933,7 +2961,7 @@ namespace RhinoAIBridge
         }
         JObject UngroupObjects(JObject p)
         {
-            int i = p["name"] != null ? Doc.Groups.Find(p["name"].ToString(), true) : p["group_index"]?.ToObject<int>() ?? -1;
+            int i = p["name"] != null ? Doc.Groups.Find(p["name"].ToString()) : p["group_index"]?.ToObject<int>() ?? -1;
             if (i < 0) return Err("Not found");
             Doc.Groups.Delete(i);
             return Ok(("deleted_group", i));
@@ -3229,9 +3257,10 @@ namespace RhinoAIBridge
         JObject DoRedo(JObject p)
         {
             int c = p["count"]?.ToObject<int>() ?? 1;
-            for (int i = 0; i < c; i++) Doc.Redo();
+            int done = 0;
+            for (int i = 0; i < c; i++) { if (!Doc.Redo()) break; done++; }
             RedrawScope.Mark();
-            return Ok(("redone", c));
+            return Ok(("redone", done), ("requested", c));
         }
 
 
@@ -3523,9 +3552,8 @@ namespace RhinoAIBridge
                     if (wf != null) vp.DisplayMode = wf;
                 }
 
-                Doc.Views.RedrawEnabled = false;
+                view.Redraw();
                 using var bmp = view.CaptureToBitmap(new Size(w, h));
-                Doc.Views.RedrawEnabled = true;
 
                 if (bmp == null) return Err("Capture returned null");
 
@@ -3565,7 +3593,6 @@ namespace RhinoAIBridge
             catch (Exception e) { return Err($"Thumbnail failed: {e.Message}"); }
             finally
             {
-                Doc.Views.RedrawEnabled = true;
                 if (forceWireframe) vp.DisplayMode = savedMode;
             }
         }

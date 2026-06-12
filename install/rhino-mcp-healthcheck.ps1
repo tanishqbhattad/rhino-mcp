@@ -183,6 +183,7 @@ if ($script:failures -eq 0) {
     Write-Host "`n  $($script:failures) check(s) failed - see [X] items above." -ForegroundColor Red
     Write-Host "  Quick fixes:" -ForegroundColor Yellow
     Write-Host "    - Open Rhino 8, type 'AIBridge' to start the server" -ForegroundColor Yellow
-    Write-Host "    - Re-run: install\install-rhino-mcp.ps1 to repair config" -ForegroundColor Yellow
+    Write-Host "    - Re-run INSTALL.bat from the repo root to repair config" -ForegroundColor Yellow
+    Write-Host "    - Or run FIX-RHINO-MCP.bat for the quick repair flow" -ForegroundColor Yellow
 }
 Write-Host ""

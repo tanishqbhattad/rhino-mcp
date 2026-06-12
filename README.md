@@ -1,6 +1,6 @@
-# RhinoAIBridge v4.7.6 — AI Control of Rhino 8 via MCP
+﻿# RhinoAIBridge v4.7.6 - AI Control of Rhino 8 via MCP
 
-> **The most powerful Rhino MCP server.** 112 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 — create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
+> **The most powerful Rhino MCP server.** 112 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 - create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rhino 8](https://img.shields.io/badge/Rhino-8.x-blue)](https://www.rhino3d.com/)
@@ -14,32 +14,34 @@
 
 ## What is this?
 
-**RhinoAIBridge** is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that bridges any MCP-compatible AI — Claude Desktop, ChatGPT, Codex, or local Ollama models — directly into Rhino 3D (version 8). The AI can read your scene, create and modify geometry, manage layers, run scripts, capture viewport images, generate architectural drawings, manage materials, trace PDFs, and execute any Rhino command — all from a natural language conversation.
+**RhinoAIBridge** is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that bridges any MCP-compatible AI - Claude Desktop, ChatGPT, Codex, or local Ollama models - directly into Rhino 3D (version 8). The AI can read your scene, create and modify geometry, manage layers, run scripts, capture viewport images, generate architectural drawings, manage materials, trace PDFs, and execute any Rhino command - all from a natural language conversation.
 
 This is the **fastest, most feature-complete Rhino AI integration available**:
 
 - **Sub-millisecond ping** with in-process scene cache (no full scene walks)
-- **Local authenticated TCP bridge** — per-user token handshake on `127.0.0.1`
-- **Auto-thumbnails** — every mutation returns a viewport JPEG so the AI sees what it built
-- **Atomic batches** — multi-step operations roll back as one unit on failure
-- **No .NET SDK required** on target machines — plugin is pre-built
+- **Local authenticated TCP bridge** - per-user token handshake on `127.0.0.1`
+- **Auto-thumbnails** - every mutation returns a viewport JPEG so the AI sees what it built
+- **Atomic batches** - multi-step operations roll back as one unit on failure
+- **No .NET SDK required** on target machines - plugin is pre-built
 - **112 MCP tools** across 12 categories
 
 ---
 
 ## Quick Install (2 minutes)
 
-**Requirements:** Rhino 8 · Python (auto-installed via uv) · Claude Desktop / ChatGPT API key / Codex / Ollama
+**Requirements for release ZIP users:** Rhino 8, Python managed by `uv` (auto-installed if missing), and Claude Desktop / Codex / Gemini Antigravity / another MCP client.
+
+**Build-from-source requirement:** .NET 8 SDK. Release ZIP users do not need the .NET SDK.
 
 ### Windows
 
 1. **Download** the latest release zip and unzip anywhere
-2. **Close Rhino**, then **double-click `INSTALL.bat`** — copies the pre-built plugin, installs dependencies, and patches Claude Desktop, Codex, and Gemini Antigravity automatically
-3. **Open Rhino 8** → type `PluginManager` → Install → browse to:
+2. **Close Rhino**, then **double-click `INSTALL.bat`** - copies the pre-built plugin, installs dependencies, and patches Claude Desktop, Codex, and Gemini Antigravity automatically
+3. **Open Rhino 8** -> type `PluginManager` -> Install -> browse to:
    `%APPDATA%\McNeel\Rhinoceros\8.0\Plug-ins\RhinoAIBridge\RhinoAIBridge.rhp`
-   *(First time only — auto-loads on future starts)*
+   *(First time only - auto-loads on future starts)*
 4. **In Rhino command line**, type: `AIBridge`, then choose Safe, Standard, or Developer mode
-5. **Restart Claude Desktop** → ask: *"ping Rhino"*
+5. **Restart Claude Desktop** -> ask: *"ping Rhino"*
 
 That is it. No Visual Studio. No .NET SDK. No manual config editing.
 
@@ -52,7 +54,7 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 ### Scene & Context
 | Tool | What it does |
 |------|-------------|
-| `ping` | Liveness check — returns doc name, unit system, object count, protocol version |
+| `ping` | Liveness check - returns doc name, unit system, object count, protocol version |
 | `query_scene` | Smart scene query: filter by type, layer, name, bbox, visibility |
 | `get_rhino_commands` | Discover all available Rhino commands with substring filter |
 | `get_state` | Read persistent key-value state |
@@ -197,13 +199,13 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 ### Claude Desktop (recommended)
 The installer patches `claude_desktop_config.json` automatically. Just restart Claude Desktop after install.
 
-Manual config — `%APPDATA%\Claude\claude_desktop_config.json`:
+Manual config - `%APPDATA%\Claude\claude_desktop_config.json`:
 ```json
 {
   "mcpServers": {
     "rhino-architect": {
       "command": "uv",
-      "args": ["--directory", "C:\\path\\to\\rhino-mcp\\server", "run", "rhino-architect"]
+      "args": ["--directory", "C:\\path\\to\\rhino-mcp\\server", "run", "--frozen", "rhino-architect"]
     }
   }
 }
@@ -212,7 +214,7 @@ Manual config — `%APPDATA%\Claude\claude_desktop_config.json`:
 ### OpenAI Codex
 INSTALL.bat option [4] writes `%USERPROFILE%\.codex\config.toml` automatically.
 
-Manual config — `~/.codex/config.toml`:
+Manual config - `~/.codex/config.toml`:
 ```toml
 [mcp_servers.rhino_architect]
 command = "uv"
@@ -241,6 +243,8 @@ Then in Rhino run `AIBridge`, and ask Codex: *"ping Rhino"*
 Restart Antigravity after installation, run `AIBridge` in Rhino, choose an access mode, and ask: *"ping Rhino"*
 
 ### ChatGPT
+`chat.py` is a legacy direct-TCP demo client. For the full 112-tool surface, use the MCP server with Claude, Codex, Gemini Antigravity, or another MCP-capable client.
+
 ```
 cd server
 set OPENAI_API_KEY=sk-...
@@ -248,6 +252,8 @@ uv run python chat.py --provider openai --model gpt-4o
 ```
 
 ### Ollama (fully local, free)
+`chat.py` is useful for quick local experiments, but it intentionally exposes a smaller legacy direct-TCP tool surface than the MCP server.
+
 ```
 ollama pull qwen2.5-coder:7b
 cd server
@@ -282,7 +288,7 @@ Claude Desktop / ChatGPT / Codex / Ollama
 
 **Wire protocol:** The local bridge requires a per-user auth token before it accepts commands. Responses use raw JSON framing to avoid Rhino plugin-loader runtime dependency failures. The scene snapshot cache means repeated `query_scene` calls are O(1) regardless of object count.
 
-**Atomic batches:** Send `batch(commands=[...], atomic=true)` and the entire sequence runs inside one Rhino undo record. Any failure triggers `Doc.Undo()` — the scene is left exactly as it was.
+**Atomic batches:** Send `batch(commands=[...], atomic=true)` and the entire sequence runs inside one Rhino undo record. Any failure triggers `Doc.Undo()` - the scene is left exactly as it was.
 
 **Auto-thumbnails:** Every mutating tool captures a 240x180 JPEG after the viewport redraws and embeds it in the response. Claude sees the result immediately without a separate `capture_viewport` call.
 
@@ -305,42 +311,42 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp`, DLLs, JSON runtime files, and
 
 ## Troubleshooting
 
-**"Cannot connect to Rhino"** — Make sure Rhino is open and you have run the `AIBridge` command in Rhino's command line.
+**"Cannot connect to Rhino"** - Make sure Rhino is open and you have run the `AIBridge` command in Rhino's command line.
 
-**Plugin does not appear in Claude** — Restart Claude Desktop after install. Check `%APPDATA%\Claude\claude_desktop_config.json` contains the `rhino-architect` server entry.
+**Plugin does not appear in Claude** - Restart Claude Desktop after install. Check `%APPDATA%\Claude\claude_desktop_config.json` contains the `rhino-architect` server entry.
 
-**Protocol version mismatch** — Run `INSTALL.bat` again to copy the latest plugin binary. The v4.7.6 plugin reports protocol 4.7.
+**Protocol version mismatch** - Run `INSTALL.bat` again to copy the latest plugin binary. The v4.7.6 plugin reports protocol 4.7.
 
-**uv not found** — Open a new terminal after install (PATH change does not apply to the current session).
+**uv not found** - Open a new terminal after install (PATH change does not apply to the current session).
 
-**Ollama connection refused** — Run `ollama serve` in a separate terminal before starting `chat.py`.
+**Ollama connection refused** - Run `ollama serve` in a separate terminal before starting `chat.py`.
 
-**Large scenes slow** — Use `query_scene` with filters rather than fetching everything at once. The cache handles 5000+ objects at interactive speed.
+**Large scenes slow** - Use `query_scene` with filters rather than fetching everything at once. The cache handles 5000+ objects at interactive speed.
 
-**Run health check** — `cd server && uv run python ../scripts/doctor.py` checks plugin, port, Claude Desktop, and Codex config in one pass.
+**Run health check** - `cd server && uv run python ../scripts/doctor.py` checks plugin, port, Claude Desktop, and Codex config in one pass.
 
-**Codex TOML parse error** — Re-run `INSTALL.bat`. v4.7.6 uses inline array format that all TOML parsers accept.
+**Codex TOML parse error** - Re-run `INSTALL.bat`. v4.7.6 uses inline array format that all TOML parsers accept.
 
-**Codex not seeing the server** — Run `codex mcp list` and confirm `rhino_architect` is listed and `enabled = true`. Re-run INSTALL.bat option [4] if missing.
+**Codex not seeing the server** - Run `codex mcp list` and confirm `rhino_architect` is listed and `enabled = true`. Re-run INSTALL.bat option [4] if missing.
 
 ---
 
 ## Changelog
 
 ### v4.7.6 (current)
-- **Rhino 8 runtime compatibility** — removes plugin-loader dependencies on `System.Threading.Channels` and response compression assemblies
-- **Authenticated localhost bridge** — per-user token handshake, client cap, idle timeout, and connection cleanup
-- **Startup access modes** — run `AIBridge` and choose Safe, Standard, or Developer mode
-- **112 MCP tools** — direct MCP images, review captures, before/after diffs, CPython 3 execution, McNeel-compatible aliases, surface primitives, SVG section/silhouette feedback, and JSON fallbacks
-- **Geometry correctness fixes** — live transform GUIDs, planar offsets, vertical wall validation, layer full paths, and closed polyline reporting
-- **Clean SDK-free installer** — deploys the complete pre-built .NET 8 payload and configures Claude Desktop, Codex, and Gemini Antigravity
+- **Rhino 8 runtime compatibility** - removes plugin-loader dependencies on `System.Threading.Channels` and response compression assemblies
+- **Authenticated localhost bridge** - per-user token handshake, client cap, idle timeout, and connection cleanup
+- **Startup access modes** - run `AIBridge` and choose Safe, Standard, or Developer mode
+- **112 MCP tools** - direct MCP images, review captures, before/after diffs, CPython 3 execution, McNeel-compatible aliases, surface primitives, SVG section/silhouette feedback, and JSON fallbacks
+- **Geometry correctness fixes** - live transform GUIDs, planar offsets, vertical wall validation, layer full paths, and closed polyline reporting
+- **Clean SDK-free installer** - deploys the complete pre-built .NET 8 payload and configures Claude Desktop, Codex, and Gemini Antigravity
 
 ### v4.7.5
-- **90 tools** — up from 32 in v4.5
-- **15 missing dispatch entries fixed** — `set_design_brief`, `get_design_brief`, `tag_object`, `get_provenance`, `search_memory`, `get_related_objects`, `name_group`, `get_group`, `get_all_groups`, `add_design_rule`, `log_session`, `get_scene_diff`, `get_change_log`, `get_tracker_version`, and `get_design_rules` now properly registered in the C# plugin
-- **Double-serialization fix** — 35+ tools were wrapping JSON in `json.dumps()` causing clients to receive escaped strings. All tools now return native dicts
-- **MCP tool annotations** — every tool tagged with read-only, write, write-idempotent, or destructive hints for AI clients
-- **Codex TOML fix** — inline args array format prevents parse errors on all platforms
+- **90 tools** - up from 32 in v4.5
+- **15 missing dispatch entries fixed** - `set_design_brief`, `get_design_brief`, `tag_object`, `get_provenance`, `search_memory`, `get_related_objects`, `name_group`, `get_group`, `get_all_groups`, `add_design_rule`, `log_session`, `get_scene_diff`, `get_change_log`, `get_tracker_version`, and `get_design_rules` now properly registered in the C# plugin
+- **Double-serialization fix** - 35+ tools were wrapping JSON in `json.dumps()` causing clients to receive escaped strings. All tools now return native dicts
+- **MCP tool annotations** - every tool tagged with read-only, write, write-idempotent, or destructive hints for AI clients
+- **Codex TOML fix** - inline args array format prevents parse errors on all platforms
 - **Protocol v4.7** baked into the pre-built plugin binary
 
 ### v4.7.4
@@ -356,21 +362,21 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp`, DLLs, JSON runtime files, and
 - **PDF Tracing**: `trace_pdf` (PyMuPDF pipeline, vector text at 1.0 confidence)
 - **File Import**: `import_dwg`, `calibrate_scale`
 - **Codex support**: `scripts/patch_codex_config.py` + INSTALL.bat option [4]
-- **Doctor script**: `scripts/doctor.py` — full health-check
+- **Doctor script**: `scripts/doctor.py` - full health-check
 
 ### v4.6
 - Auth token + 3-tier trust modes
 - Dry-run support on delete/boolean/batch
 - Viewport metadata + scene query modes
-- 42-test pytest suite
+- 45-test pytest suite
 
 ### v4.5
-- Pre-built plugin — no .NET SDK required on target machines
+- Pre-built plugin - no .NET SDK required on target machines
 - `set_camera`, `get_rhino_commands`, `set_layer_material`, `run_command`
 - Auto-thumbnails, gzip compression, atomic batch rollback
 
 ### v4.0
-- Scene snapshot cache — O(1) reads
+- Scene snapshot cache - O(1) reads
 - Deferred redraw and atomic batches
 - Architect intelligence: massing, floors, core, facade, schedules
 
@@ -378,8 +384,8 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp`, DLLs, JSON runtime files, and
 
 ## License
 
-MIT — see LICENSE. Free for personal and commercial use.
+MIT - see LICENSE. Free for personal and commercial use.
 
 ---
 
-*Built by Tanishq Bhattad — https://github.com/tanishqbhattad*
+*Built by Tanishq Bhattad - https://github.com/tanishqbhattad*

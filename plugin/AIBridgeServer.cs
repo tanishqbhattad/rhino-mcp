@@ -1,4 +1,4 @@
-// RhinoAIBridge v4.7.5 â€” AIBridgeServer.cs
+﻿// RhinoAIBridge v4.7.5 - AIBridgeServer.cs
 // by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
 
 using System;
@@ -20,7 +20,7 @@ namespace RhinoAIBridge
 {
     /// <summary>
     /// TCP server. Length-prefixed JSON frames. One persistent UI-thread dispatcher
-    /// instead of one ManualResetEvent per call. Async accept loop â€” no Sleep(100) tax.
+    /// instead of one ManualResetEvent per call. Async accept loop - no Sleep(100) tax.
     /// </summary>
     public class AIBridgeServer
     {
@@ -46,7 +46,7 @@ namespace RhinoAIBridge
         private string _authToken;
         private bool _requireAuth;
 
-        // Build hash captured once at startup â€” useful when 5 versions of the .rhp are on disk.
+        // Build hash captured once at startup - useful when 5 versions of the .rhp are on disk.
         public static string BuildHash { get; private set; } = ComputeBuildHash();
 
         public bool IsRunning => _running;
@@ -299,6 +299,7 @@ namespace RhinoAIBridge
         /// </summary>
         public void ForceRelease()
         {
+            UiDispatcher.BeginShutdown();
             try { _cts?.Cancel(); } catch { }
             try { _listener?.Stop(); } catch { }
             // Force-close every tracked client socket
@@ -308,6 +309,7 @@ namespace RhinoAIBridge
                 try { kv.Value?.Dispose(); } catch { }
             }
             _activeClients.Clear();
+            UiDispatcher.WaitForIdle(TimeSpan.FromSeconds(2));
             AIBridgeLogger.Log(LogLevel.INFO, "Server", "ForceRelease: all connections closed");
         }
 
@@ -318,6 +320,7 @@ namespace RhinoAIBridge
         /// </summary>
         public void StopForRhinoShutdown()
         {
+            UiDispatcher.BeginShutdown();
             lock (_lifecycleLock)
             {
                 _running = false;
@@ -332,6 +335,7 @@ namespace RhinoAIBridge
                 try { kv.Value?.Dispose(); } catch { }
             }
             _activeClients.Clear();
+            UiDispatcher.WaitForIdle(TimeSpan.FromSeconds(2));
 
             try { SceneSnapshotRegistry.Shutdown(); } catch { }
             try { AIBridgeLogger.Log(LogLevel.INFO, "Server", "StopForRhinoShutdown: listener and clients closed"); } catch { }
@@ -417,7 +421,7 @@ namespace RhinoAIBridge
 
                         try
                         {
-                            // Fast path â€” ping is in-band, no UI thread hop.
+                            // Fast path - ping is in-band, no UI thread hop.
                             if (cmdType == "ping")
                             {
                                 result = HandlePing(cmd["params"] as JObject);
@@ -474,6 +478,17 @@ namespace RhinoAIBridge
                                 result?["status"]?.ToString() ?? "?",
                                 result?["message"]?.ToString());
                         }
+                        catch (TimeoutException e)
+                        {
+                            result = new JObject
+                            {
+                                ["status"] = "error",
+                                ["error_code"] = "COMMAND_TIMEOUT",
+                                ["message"] = e.Message,
+                                ["may_still_be_running"] = true
+                            };
+                            AIBridgeLogger.LogCommand(cmdType, "{}", timer, "timeout", e.ToString());
+                        }
                         catch (Exception e)
                         {
                             result = new JObject { ["status"] = "error", ["message"] = e.Message };
@@ -519,7 +534,7 @@ namespace RhinoAIBridge
         {
             // No UI thread hop; this MUST stay sub-millisecond.
             // The MCP server uses ping to verify the connection is alive and the doc is what it expects.
-            // scene_version is the etag â€” Claude can short-circuit re-querying if it hasn't changed.
+            // scene_version is the etag - Claude can short-circuit re-querying if it hasn't changed.
             var doc = RhinoDoc.ActiveDoc;
             var snap = doc != null ? SceneSnapshotRegistry.Get(doc) : null;
             return new JObject

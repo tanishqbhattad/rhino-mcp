@@ -249,6 +249,7 @@ namespace RhinoAIBridge
                     return new JObject { ["status"] = "error", ["message"] = "label parameter is required." };
 
                 bool capture = p["capture"] == null || (bool)p["capture"];
+                bool restoreView = p["restore_view"]?.ToObject<bool>() ?? capture;
 
                 string layerName = $"Section-{label}";
                 int layerIdx = doc.Layers.FindByFullPath(layerName, RhinoMath.UnsetIntIndex);
@@ -323,6 +324,7 @@ namespace RhinoAIBridge
                 if (activeView == null) return new JObject { ["status"] = "error", ["message"] = "No active viewport." };
                 var viewport = activeView.ActiveViewport;
                 Guid viewportId = viewport.Id;
+                var savedView = restoreView ? SaveViewState(viewport) : null;
                 Guid cpId = doc.Objects.AddClippingPlane(sectionPlane, magnitude, magnitude, new Guid[] { viewportId });
 
                 if (cpId == Guid.Empty)
@@ -330,36 +332,44 @@ namespace RhinoAIBridge
 
                 doc.Strings.SetString(cpKey, cpId.ToString());
 
-                // Align view
-                var alignParams = new JObject
+                try
                 {
-                    ["label"] = label
-                };
-                AlignViewToSection(alignParams, doc);
-
-                doc.Views.Redraw();
-
-                var result = new JObject
-                {
-                    ["status"] = "ok",
-                    ["label"] = label,
-                    ["clipping_plane_id"] = cpId.ToString(),
-                    ["section_plane"] = new JObject
+                    // Align view
+                    var alignParams = new JObject
                     {
-                        ["origin"] = PointToJObject(planeOrigin),
-                        ["normal"] = VectorToJObject(viewDir)
-                    },
-                    ["view_direction"] = VectorToJObject(viewDir)
-                };
+                        ["label"] = label
+                    };
+                    AlignViewToSection(alignParams, doc);
 
-                if (capture)
-                {
-                    string b64 = CaptureViewport(doc, 1600, 1200);
-                    if (b64 != null)
-                        result["image_base64"] = b64;
+                    doc.Views.Redraw();
+
+                    var result = new JObject
+                    {
+                        ["status"] = "ok",
+                        ["label"] = label,
+                        ["clipping_plane_id"] = cpId.ToString(),
+                        ["view_restored"] = restoreView,
+                        ["section_plane"] = new JObject
+                        {
+                            ["origin"] = PointToJObject(planeOrigin),
+                            ["normal"] = VectorToJObject(viewDir)
+                        },
+                        ["view_direction"] = VectorToJObject(viewDir)
+                    };
+
+                    if (capture)
+                    {
+                        string b64 = CaptureViewport(doc, 1600, 1200);
+                        if (b64 != null)
+                            result["image_base64"] = b64;
+                    }
+
+                    return result;
                 }
-
-                return result;
+                finally
+                {
+                    if (savedView != null) RestoreViewState(doc, savedView);
+                }
             }
             catch (Exception ex)
             {
@@ -456,6 +466,7 @@ namespace RhinoAIBridge
             try
             {
                 bool capture = p["capture"] == null || (bool)p["capture"];
+                bool restoreView = p["restore_view"]?.ToObject<bool>() ?? capture;
 
                 // Get level data from SemanticClassifier
                 JObject levelSummary = null;
@@ -520,6 +531,7 @@ namespace RhinoAIBridge
                 if (planActiveView == null) return new JObject { ["status"] = "error", ["message"] = "No active viewport." };
                 var viewport = planActiveView.ActiveViewport;
                 Guid viewportId = viewport.Id;
+                var savedView = restoreView ? SaveViewState(viewport) : null;
                 Guid cpId = doc.Objects.AddClippingPlane(planePlane, magnitude, magnitude, new Guid[] { viewportId });
 
                 if (cpId == Guid.Empty)
@@ -528,35 +540,43 @@ namespace RhinoAIBridge
                 doc.Strings.SetString(cpKey, cpId.ToString());
                 doc.Strings.SetString($"ai:plan:floor_{floorIndex:D2}:layer", layerName);
 
-                // Set Top view
-                viewport.SetProjection(DefinedViewportProjection.Top, null, true);
-
-                // Frame to floor footprint XY bbox at that level
-                BoundingBox planeBbox = new BoundingBox(
-                    new Point3d(bbox.Min.X, bbox.Min.Y, floorZ),
-                    new Point3d(bbox.Max.X, bbox.Max.Y, cutZ));
-                viewport.ZoomBoundingBox(planeBbox);
-
-                doc.Views.Redraw();
-
-                var result = new JObject
+                try
                 {
-                    ["status"] = "ok",
-                    ["floor_index"] = floorIndex,
-                    ["floor_elevation"] = floorZ,
-                    ["cut_elevation"] = cutZ,
-                    ["layer"] = layerName,
-                    ["clipping_plane_id"] = cpId.ToString()
-                };
+                    // Set Top view
+                    viewport.SetProjection(DefinedViewportProjection.Top, null, true);
 
-                if (capture)
-                {
-                    string b64 = CaptureViewport(doc, 1600, 1200);
-                    if (b64 != null)
-                        result["image_base64"] = b64;
+                    // Frame to floor footprint XY bbox at that level
+                    BoundingBox planeBbox = new BoundingBox(
+                        new Point3d(bbox.Min.X, bbox.Min.Y, floorZ),
+                        new Point3d(bbox.Max.X, bbox.Max.Y, cutZ));
+                    viewport.ZoomBoundingBox(planeBbox);
+
+                    doc.Views.Redraw();
+
+                    var result = new JObject
+                    {
+                        ["status"] = "ok",
+                        ["floor_index"] = floorIndex,
+                        ["floor_elevation"] = floorZ,
+                        ["cut_elevation"] = cutZ,
+                        ["layer"] = layerName,
+                        ["clipping_plane_id"] = cpId.ToString(),
+                        ["view_restored"] = restoreView
+                    };
+
+                    if (capture)
+                    {
+                        string b64 = CaptureViewport(doc, 1600, 1200);
+                        if (b64 != null)
+                            result["image_base64"] = b64;
+                    }
+
+                    return result;
                 }
-
-                return result;
+                finally
+                {
+                    if (savedView != null) RestoreViewState(doc, savedView);
+                }
             }
             catch (Exception ex)
             {
@@ -1100,6 +1120,50 @@ namespace RhinoAIBridge
                 }
             }
             return best;
+        }
+
+        private sealed class ViewState
+        {
+            public RhinoViewport Viewport { get; init; }
+            public Point3d Target { get; init; }
+            public Point3d Location { get; init; }
+            public Vector3d Up { get; init; }
+            public DisplayModeDescription DisplayMode { get; init; }
+            public bool IsParallel { get; init; }
+            public double LensLength { get; init; }
+        }
+
+        private static ViewState SaveViewState(RhinoViewport viewport)
+        {
+            if (viewport == null) return null;
+            return new ViewState
+            {
+                Viewport = viewport,
+                Target = viewport.CameraTarget,
+                Location = viewport.CameraLocation,
+                Up = viewport.CameraUp,
+                DisplayMode = viewport.DisplayMode,
+                IsParallel = viewport.IsParallelProjection,
+                LensLength = viewport.Camera35mmLensLength
+            };
+        }
+
+        private static void RestoreViewState(RhinoDoc doc, ViewState state)
+        {
+            if (state?.Viewport == null) return;
+            try
+            {
+                if (state.IsParallel) state.Viewport.ChangeToParallelProjection(true);
+                else state.Viewport.ChangeToPerspectiveProjection(true, state.LensLength);
+                state.Viewport.SetCameraLocations(state.Target, state.Location);
+                state.Viewport.CameraUp = state.Up;
+                state.Viewport.DisplayMode = state.DisplayMode;
+                doc.Views.ActiveView?.Redraw();
+            }
+            catch
+            {
+                // Best effort: section captures should never fail solely because view restore failed.
+            }
         }
 
         /// <summary>

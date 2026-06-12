@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  plugin:
+    name: Rhino plugin build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Build plugin
+        run: dotnet build plugin/RhinoAIBridge.csproj -c Release
+
+  python:
+    name: Python MCP checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install locked dependencies
+        run: uv --directory server sync --group dev --frozen
+      - name: Syntax check
+        run: >
+          uv --directory server run --frozen python -m py_compile
+          src/rhino_architect/server.py
+          src/rhino_architect/protocol.py
+          src/rhino_architect/pdf_tracer.py
+          src/rhino_architect/material_downloader.py
+          src/rhino_architect/doctor.py
+          src/rhino_architect/validation.py
+          chat.py
+      - name: Tests
+        run: uv --directory server run --frozen python -m pytest -q

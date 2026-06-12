@@ -352,6 +352,13 @@ async def _exec_batch(
     stop_on_error: Optional[bool] = None,
 ) -> dict:
     """Phase 3 - execute a batch with optional atomic semantics."""
+    for i, command in enumerate(commands):
+        tool_name = command.get("type", "") if isinstance(command, dict) else ""
+        blocked = _check_safe_mode(tool_name)
+        if blocked:
+            blocked["batch_index"] = i
+            blocked["op_index"] = i + 1
+            return blocked
     try:
         conn = await get_connection()
         resp = await conn.send_batch(commands, atomic=atomic, stop_on_error=stop_on_error)
@@ -510,7 +517,7 @@ class BatchCommandInput(BaseModel):
 class DeriveFloorsFromMassInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     mass_id: str
-    level_heights: list[float] = []
+    level_heights: list[float] = Field(default_factory=list)
     levels: Optional[int] = None
     level_height: float = Field(default=3000, gt=0)
     slab_thickness: float = Field(default=250, gt=0)
@@ -524,9 +531,9 @@ class CreateCoreInput(BaseModel):
     height: float = Field(default=3000, gt=0)
     z_level: Optional[float] = None
     wall_thickness: float = Field(default=200, gt=0)
-    walls: list[dict[str, Any]] = []
-    modules: list[dict[str, Any]] = []
-    punch_through: list[str] = []
+    walls: list[dict[str, Any]] = Field(default_factory=list)
+    modules: list[dict[str, Any]] = Field(default_factory=list)
+    punch_through: list[str] = Field(default_factory=list)
     wall_layer: Optional[str] = "Core::Walls"
     shaft_layer: Optional[str] = "Core::Shafts"
 
@@ -572,8 +579,8 @@ class SetupLayersInput(BaseModel):
 
 class BatchLayerVisInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    show: list[str] = []
-    hide: list[str] = []
+    show: list[str] = Field(default_factory=list)
+    hide: list[str] = Field(default_factory=list)
     isolate: Optional[str] = None
 
 
@@ -601,12 +608,23 @@ class CheckIntInput(BaseModel):
 
 class ValidateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    object_ids: list[str] = []
+    object_ids: list[str] = Field(default_factory=list)
 
 
 class DeleteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     object_ids: list[str] = Field(..., description="GUIDs to delete, or selectors: 'all', 'by_layer:Layer', 'by_name:Pattern', 'selected'.")
+
+
+class CameraViewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    location: Optional[list[float]] = Field(None, description="Temporary camera position [x, y, z].")
+    target: Optional[list[float]] = Field(None, description="Temporary camera target [x, y, z].")
+    direction: Optional[list[float]] = Field(None, description="Camera look direction. Use with target + distance.")
+    distance: Optional[float] = Field(None, description="Distance from target when direction is supplied.")
+    projection: Optional[str] = Field(None, description="'perspective' | 'parallel'. Defaults to current.")
+    box_min: Optional[list[float]] = Field(None, description="Bounding box min [x,y,z] to frame.")
+    box_max: Optional[list[float]] = Field(None, description="Bounding box max [x,y,z] to frame.")
 
 
 class CaptureInput(BaseModel):
@@ -617,7 +635,7 @@ class CaptureInput(BaseModel):
     format: str = "auto"   # "auto" | "png" | "jpeg"
     quality: int = Field(default=80, ge=1, le=100)
     restore_state: bool = Field(default=True, description="Restore viewport camera and display mode after capture. Default True - the AI can inspect the model from any angle without disrupting the user's current view.")
-    view: Optional[Any] = Field(
+    view: Optional[str | CameraViewInput] = Field(
         default=None,
         description=(
             "Temporarily switch to this named view before capturing "
@@ -802,6 +820,10 @@ class ScriptInput(BaseModel):
     code: str = Field(..., description="Python code to run inside Rhino. Alias: script.")
     undo_name: Optional[str] = None
     default_layer: Optional[str] = None
+    auto_checkpoint: bool = Field(
+        default=True,
+        description="If True, save a checkpoint before executing the script. Set False for tiny safe scripts.",
+    )
     rollback_on_error: bool = Field(
         default=False,
         description="If True, delete live objects created by a script that returns failure.",
@@ -1366,11 +1388,20 @@ async def compare_before_after(params: BeforeAfterInput) -> Any:
     batch_result = await _exec_batch(raw_commands, atomic=params.atomic, stop_on_error=params.stop_on_error)
     after = await _exec_simple("capture_viewport", capture_params)
     diff = _compare_base64_images(before.get("image_base64"), after.get("image_base64"))
+    batch_ok = batch_result.get("status") == "ok"
+    rolled_back = bool(batch_result.get("rolled_back"))
 
     meta = {
-        "status": "ok" if batch_result.get("status") == "ok" else "error",
+        "status": "ok" if batch_ok else "error",
         "batch": batch_result,
+        "batch_applied": batch_ok and not rolled_back,
+        "rolled_back": rolled_back,
         "diff": {k: v for k, v in diff.items() if k != "diff_base64"},
+        "diff_interpretation": (
+            "Diff reflects the committed edit."
+            if batch_ok and not rolled_back
+            else "Diff is diagnostic only; the batch failed or rolled back."
+        ),
         "note": "Returned content order: metadata, before image, after image, optional diff heatmap.",
     }
     content: list[Any] = [meta]
@@ -1695,9 +1726,9 @@ async def create_elevation(label: str = "", direction: str = "north", offset: fl
 
 
 @mcp.tool(name="cut_section", annotations=WR)
-async def cut_section(label: str, capture: bool = True) -> dict:
-    """Cut the named section — creates clipping plane, aligns view, captures result. Call after user has confirmed section line position."""
-    return await _exec_simple("cut_section", {"label": label, "capture": capture})
+async def cut_section(label: str, capture: bool = True, restore_view: bool = True) -> dict:
+    """Cut the named section, optionally capture it, and restore the user's viewport by default."""
+    return await _exec_simple("cut_section", {"label": label, "capture": capture, "restore_view": restore_view})
 
 
 @mcp.tool(name="align_view_to_section", annotations=WI)
@@ -1707,9 +1738,9 @@ async def align_view_to_section(label: str) -> dict:
 
 
 @mcp.tool(name="create_plan", annotations=WR)
-async def create_plan(floor: str, cut_height_mm: float = 1200.0, capture: bool = True) -> dict:
-    """Generate a floor plan for the specified floor (e.g. '1', '8', 'ground', 'G', 'B1'). Automatically places a horizontal clipping plane at cut_height_mm above the floor level and captures a top-down orthographic view."""
-    return await _exec_simple("create_plan", {"floor": floor, "cut_height_mm": cut_height_mm, "capture": capture})
+async def create_plan(floor: str, cut_height_mm: float = 1200.0, capture: bool = True, restore_view: bool = True) -> dict:
+    """Generate a floor plan, optionally capture it, and restore the user's viewport by default."""
+    return await _exec_simple("create_plan", {"floor": floor, "cut_height_mm": cut_height_mm, "capture": capture, "restore_view": restore_view})
 
 
 @mcp.tool(name="create_all_plans", annotations=WR)

@@ -1,6 +1,6 @@
 using System;
-using System.Collections.Concurrent;
 using System.Threading;
+using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
 using Rhino;
 
@@ -14,35 +14,44 @@ namespace RhinoAIBridge
     ///     RhinoApp.InvokeOnUiThread(() => { ...; wait.Set(); });
     ///     wait.Wait(...);
     /// 
-    /// v4 keeps RhinoApp.InvokeOnUiThread (still the only safe primitive Rhino exposes for cross-thread doc access),
-    /// but pools the wait handles via ThreadLocal. Each TCP client thread reuses the same handle for every command.
-    /// 
-    /// This isn't the biggest win in Phase 1, but it eliminates per-call allocations on the hot path
-    /// and sets us up cleanly for Phase 4 (request multiplexing) where we'll want a persistent worker queue.
+    /// v4 keeps RhinoApp.InvokeOnUiThread (still the only safe primitive Rhino exposes for cross-thread doc access).
+    /// Each invocation owns its completion source so a timed-out queued action cannot later write into
+    /// a reused slot from a newer request.
     /// </summary>
     public static class UiDispatcher
     {
-        // One reusable wait handle per calling thread. Cheap, cleared between calls.
-        private static readonly ThreadLocal<WorkSlot> _slot = new ThreadLocal<WorkSlot>(() => new WorkSlot(), trackAllValues: false);
+        private static volatile bool _shuttingDown;
+        private static int _activeInvokes;
 
         private sealed class WorkSlot
         {
-            public readonly ManualResetEventSlim Wait = new ManualResetEventSlim(false);
-            public JObject Result;
-            public Exception Error;
-
-            public void Reset()
-            {
-                Wait.Reset();
-                Result = null;
-                Error = null;
-            }
+            public readonly TaskCompletionSource<JObject> Completion =
+                new TaskCompletionSource<JObject>(TaskCreationOptions.RunContinuationsAsynchronously);
+            public volatile bool Cancelled;
         }
 
-        public static void Start() { /* nothing to start; the UI thread is Rhino's */ }
+        public static void Start()
+        {
+            _shuttingDown = false;
+        }
+
+        public static void BeginShutdown()
+        {
+            _shuttingDown = true;
+        }
+
         public static void Stop()
         {
-            // Dispose any tracked thread-local handles. ThreadLocal will clean up on plugin unload.
+            BeginShutdown();
+            WaitForIdle(TimeSpan.FromSeconds(2));
+        }
+
+        public static bool WaitForIdle(TimeSpan timeout)
+        {
+            var deadline = DateTime.UtcNow + timeout;
+            while (Volatile.Read(ref _activeInvokes) > 0 && DateTime.UtcNow < deadline)
+                Thread.Sleep(25);
+            return Volatile.Read(ref _activeInvokes) == 0;
         }
 
         /// <summary>
@@ -51,21 +60,54 @@ namespace RhinoAIBridge
         /// </summary>
         public static JObject Invoke(Func<JObject> func, TimeSpan timeout)
         {
-            var slot = _slot.Value;
-            slot.Reset();
-
-            RhinoApp.InvokeOnUiThread(new Action(() =>
+            if (_shuttingDown)
             {
-                try { slot.Result = func(); }
-                catch (Exception e) { slot.Error = e; }
-                finally { slot.Wait.Set(); }
-            }));
+                return new JObject
+                {
+                    ["status"] = "error",
+                    ["error_code"] = "AIBRIDGE_SHUTTING_DOWN",
+                    ["message"] = "AIBridge is shutting down; command was not started."
+                };
+            }
 
-            if (!slot.Wait.Wait(timeout))
-                throw new TimeoutException($"Command timed out ({timeout.TotalSeconds}s)");
+            var slot = new WorkSlot();
+            try
+            {
+                RhinoApp.InvokeOnUiThread(new Action(() =>
+                {
+                    if (slot.Cancelled || _shuttingDown)
+                    {
+                        slot.Completion.TrySetResult(new JObject
+                        {
+                            ["status"] = "error",
+                            ["error_code"] = slot.Cancelled ? "COMMAND_CANCELLED_BEFORE_START" : "AIBRIDGE_SHUTTING_DOWN",
+                            ["message"] = slot.Cancelled
+                                ? "Command timed out before Rhino's UI thread started it."
+                                : "AIBridge is shutting down; command was not started."
+                        });
+                        return;
+                    }
 
-            if (slot.Error != null) throw slot.Error;
-            return slot.Result ?? new JObject { ["status"] = "error", ["message"] = "No result" };
+                    Interlocked.Increment(ref _activeInvokes);
+                    try { slot.Completion.TrySetResult(func()); }
+                    catch (Exception e) { slot.Completion.TrySetException(e); }
+                    finally { Interlocked.Decrement(ref _activeInvokes); }
+                }));
+            }
+            catch (Exception e)
+            {
+                throw new InvalidOperationException($"Failed to queue command on Rhino UI thread: {e.Message}", e);
+            }
+
+            if (!slot.Completion.Task.Wait(timeout))
+            {
+                slot.Cancelled = true;
+                throw new TimeoutException(
+                    $"Command timed out after {timeout.TotalSeconds}s. If Rhino had already started the command, it may still be finishing on the UI thread.");
+            }
+
+            return slot.Completion.Task.GetAwaiter().GetResult()
+                ?? new JObject { ["status"] = "error", ["message"] = "No result" };
         }
     }
 }
