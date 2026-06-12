@@ -1,4 +1,6 @@
-# RhinoAIBridge v4.8.0 - AI Control of Rhino 8 via MCP
+# Rhino MCP - RhinoAIBridge v4.8.0
+
+**The Rhino MCP server: full AI control of Rhino 8 / Rhinoceros 3D through the Model Context Protocol.** Works with Claude Desktop, Claude Code, ChatGPT, Codex, Gemini and local Ollama models.
 
 > **The most powerful Rhino MCP server.** 115 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 - create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
@@ -11,6 +13,20 @@
 [![Works with Ollama](https://img.shields.io/badge/Works%20with-Ollama-purple)](https://ollama.com/)
 
 ---
+
+## Why this Rhino MCP?
+
+There are several Rhino MCP servers; this one is built for serious, long modeling sessions:
+
+| | RhinoAIBridge |
+|---|---|
+| Tools | **115** (modeling, architecture, layers, materials, viewport vision, sections/plans, PDF tracing, design memory) |
+| Protocol | **v5 multiplexed** - reads, ping and cancel answer instantly while long scripts run |
+| Reliability | **Idempotent retries** (no duplicate geometry on reconnect), atomic batches with rollback, write-ahead log crash recovery |
+| Vision loop | Auto-thumbnails after every edit, multi-angle review sets, before/after pixel diffs |
+| Install | Pre-built plugin - **no .NET SDK needed**, one-click INSTALL.bat |
+
+If Rhino MCP saves you modeling time, please **star the repo** - stars are how other Rhino users find it.
 
 ## What is this?
 
@@ -36,7 +52,7 @@ This is the **fastest, most feature-complete Rhino AI integration available**:
 
 ### Windows
 
-1. **Download** the latest release zip and unzip anywhere
+1. **Download** the latest release zip from [Releases](https://github.com/tanishqbhattad/rhino-mcp/releases/latest) and unzip anywhere
 2. **Close Rhino**, then **double-click `INSTALL.bat`** - copies the pre-built plugin, installs dependencies, and patches Claude Desktop, Codex, and Gemini Antigravity automatically
 3. **Open Rhino 8** -> type `PluginManager` -> Install -> browse to:
    `%APPDATA%\McNeel\Rhinoceros\8.0\Plug-ins\RhinoAIBridge\RhinoAIBridge.rhp`
@@ -50,7 +66,7 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 
 ---
 
-## 112 MCP Tools
+## 115 MCP Tools
 
 ### Scene & Context
 | Tool | What it does |
@@ -277,7 +293,7 @@ uv run python chat.py --provider anthropic --model claude-opus-4-6
 Claude Desktop / ChatGPT / Codex / Ollama
          |  MCP (stdio)
          v
-  server/src/rhino_architect/server.py   <- FastMCP Python server (112 tools)
+  server/src/rhino_architect/server.py   <- FastMCP Python server (115 tools)
          |  TCP 127.0.0.1:9544
          |  local auth token + [1-byte flag][4-byte len][JSON payload]
          v
