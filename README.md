@@ -28,6 +28,22 @@ There are several Rhino MCP servers; this one is built for serious, long modelin
 
 If Rhino MCP saves you modeling time, please **star the repo** - stars are how other Rhino users find it.
 
+## For Architects - No Coding Needed
+
+You do not need to be a programmer to use this. If you can describe a building, you can model it:
+
+> *"Create a 4-storey office massing on a 30x18m footprint, taller ground floor, derive the floor slabs, add a core with two lifts and a stair, then put windows on the north facade every 3 metres."*
+
+Claude does the modeling in Rhino while you watch - and shows you what it built after every step. You can ask for:
+
+- **Massing studies** - footprints, levels, setbacks, quick volume options side by side
+- **Floor plans and sections** - cut, captured and restored without touching your viewport
+- **Area schedules** - GFA/NFA by layer, level or name, ready to paste into a report
+- **Materials and views** - "make the facade glass, the core concrete, show me a hero shot"
+- **Drawing imports** - trace a PDF site plan or import a DWG and build on top of it
+
+Setup is one double-click (INSTALL.bat) plus loading the plugin in Rhino - the [Installation Guide](INSTALL_GUIDE.txt) walks through every step with no jargon. If you get stuck, ask Claude itself: *"help me set up Rhino MCP"*.
+
 ## What is this?
 
 **RhinoAIBridge** is a [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that bridges any MCP-compatible AI - Claude Desktop, ChatGPT, Codex, or local Ollama models - directly into Rhino 3D (version 8). The AI can read your scene, create and modify geometry, manage layers, run scripts, capture viewport images, generate architectural drawings, manage materials, trace PDFs, and execute any Rhino command - all from a natural language conversation.
