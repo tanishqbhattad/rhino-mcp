@@ -1,4 +1,4 @@
-﻿// RhinoAIBridge v4.5 -- ChangeTracker.cs
+// RhinoAIBridge v4.5 -- ChangeTracker.cs
 // Object-level change tracking. Thread-safe circular buffer (1000 events).
 
 using System;
@@ -76,11 +76,20 @@ namespace RhinoAIBridge
             finally { _lock.ExitWriteLock(); }
         }
 
-        public static (JArray added, JArray deleted, JArray modified, int toVersion) GetDiff(int fromVersion)
+        public static (JArray added, JArray deleted, JArray modified, int toVersion, bool truncated) GetDiff(int fromVersion)
         {
             _lock.EnterReadLock();
-            List<ChangeEvent> events; int toVer;
-            try { events = _log.Where(e => e.Version > fromVersion).ToList(); toVer = _version; }
+            List<ChangeEvent> events; int toVer; bool truncated;
+            try
+            {
+                events = _log.Where(e => e.Version > fromVersion).ToList();
+                toVer = _version;
+                // The circular buffer holds MAX_EVENTS. If events older than fromVersion
+                // were evicted, the diff is INCOMPLETE — callers must fall back to a full
+                // re-query instead of trusting a silently partial answer.
+                int oldestTracked = _log.Count > 0 ? _log[0].Version : _version + 1;
+                truncated = fromVersion + 1 < oldestTracked && fromVersion < _version;
+            }
             finally { _lock.ExitReadLock(); }
 
             var latest = events.GroupBy(e => e.ObjectId).Select(g => g.OrderByDescending(e => e.Version).First()).ToList();
@@ -100,7 +109,7 @@ namespace RhinoAIBridge
                         break;
                 }
             }
-            return (added, deleted, modified, toVer);
+            return (added, deleted, modified, toVer, truncated);
         }
 
         public static JArray GetLog(int limit = 50, int sinceVersion = 0)

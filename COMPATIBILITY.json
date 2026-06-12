@@ -1,6 +1,6 @@
 {
-  "plugin_version": "4.7.6",
-  "protocol_version": "4.7",
+  "plugin_version": "4.8.0",
+  "protocol_version": "5.0",
   "min_rhino_version": "8.0",
   "min_python_version": "3.10",
   "tested_on": ["Rhino 8.10", "Rhino 8.11", "Rhino 8.12"],
@@ -26,5 +26,5 @@
     }
   },
   "breaking_changes": [],
-  "notes": "All v4.5-v4.7.5 callers are forward-compatible. v4.7.6 adds live-tested Rhino 8 runtime compatibility, local auth, startup access modes, security hardening, and installer fixes."
+  "notes": "Protocol 5 (v4.8.0): multiplexed connection, idempotent retries via request_id replay, cooperative cancellation, binary image frames, WAL crash recovery. Fully backward compatible: protocol-4 clients get legacy single-flight semantics; the MCP server also works against 4.x plugins."
 }

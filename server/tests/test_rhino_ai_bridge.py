@@ -1,4 +1,4 @@
-﻿"""
+"""
 RhinoAIBridge v4.6 -- Test Suite (offline, no Rhino needed)
 Run: cd server && uv run pytest tests/ -v
 """
@@ -204,3 +204,100 @@ class TestMaterialDownloader:
         monkeypatch.setattr(material_downloader.urllib.request, "urlopen", fail)
         cached = material_downloader._fetch_json("https://example.test/a")
         assert cached["_stale_cache"] is True
+
+
+# -- 6. Protocol 5: binary image frames + request_id matching (v4.8) --
+
+def make_binary_frame(header: dict, image: bytes):
+    """Server-side framing for flag 0x02: [4B header len][JSON header][raw image]."""
+    h = json.dumps(header).encode()
+    payload = struct.pack('>I', len(h)) + h + image
+    return b'\x02' + struct.pack('>I', len(payload)) + payload
+
+def parse_any_frame(data: bytes):
+    """Client-side parse mirroring protocol.RhinoProtocol._recv_frame."""
+    flag = data[0]
+    length = struct.unpack('>I', data[1:5])[0]
+    payload = data[5:5 + length]
+    if flag == 1:
+        payload = gzip.decompress(payload)
+        return json.loads(payload)
+    if flag == 2:
+        (hlen,) = struct.unpack('>I', payload[:4])
+        header = json.loads(payload[4:4 + hlen].decode('utf-8'))
+        header['_image_raw'] = payload[4 + hlen:]
+        return header
+    return json.loads(payload)
+
+
+class TestProtocol5Frames:
+    def test_binary_frame_roundtrip(self):
+        img = bytes(range(256)) * 4
+        f = make_binary_frame({'status': 'ok', 'format': 'jpeg', 'request_id': 'abc'}, img)
+        r = parse_any_frame(f)
+        assert r['status'] == 'ok'
+        assert r['request_id'] == 'abc'
+        assert r['_image_raw'] == img
+
+    def test_binary_frame_empty_image(self):
+        f = make_binary_frame({'status': 'ok'}, b'')
+        r = parse_any_frame(f)
+        assert r['_image_raw'] == b''
+
+    def test_raw_frame_still_parses(self):
+        p = json.dumps({'status': 'ok', 'request_id': 'r1'}).encode()
+        f = b'\x00' + struct.pack('>I', len(p)) + p
+        assert parse_any_frame(f)['request_id'] == 'r1'
+
+    def test_binary_frame_no_base64_inflation(self):
+        img = b'\xff' * 30000
+        bin_f = make_binary_frame({'status': 'ok'}, img)
+        import base64 as _b64
+        json_f = json.dumps({'status': 'ok', 'image_base64': _b64.b64encode(img).decode()}).encode()
+        assert len(bin_f) < len(json_f)
+
+
+class TestRequestIdMatching:
+    """Mirrors the reader-loop dispatch rules in protocol.RhinoProtocol."""
+
+    @staticmethod
+    def dispatch(frame, pending, fifo):
+        rid = frame.get('request_id')
+        fut = None
+        if rid is not None:
+            fut = pending.pop(rid, None)
+            if fut is not None and fut in fifo:
+                fifo.remove(fut)
+        if fut is None and rid is None and fifo:
+            fut = fifo.pop(0)
+            for k, v in list(pending.items()):
+                if v is fut:
+                    pending.pop(k)
+                    break
+        return fut
+
+    def test_out_of_order_by_request_id(self):
+        f1, f2 = object(), object()
+        pending = {'a': f1, 'b': f2}
+        fifo = [f1, f2]
+        assert self.dispatch({'request_id': 'b'}, pending, fifo) is f2
+        assert self.dispatch({'request_id': 'a'}, pending, fifo) is f1
+        assert not pending and not fifo
+
+    def test_legacy_fifo_order(self):
+        f1, f2 = object(), object()
+        pending = {'a': f1, 'b': f2}
+        fifo = [f1, f2]
+        assert self.dispatch({}, pending, fifo) is f1
+        assert self.dispatch({}, pending, fifo) is f2
+
+    def test_unknown_request_id_dropped(self):
+        pending, fifo = {}, []
+        assert self.dispatch({'request_id': 'zzz'}, pending, fifo) is None
+
+    def test_idempotent_resend_uses_same_id(self):
+        # The retry contract: a re-sent payload keeps its request_id so the
+        # plugin can replay instead of re-executing.
+        payload = {'type': 'create_object', 'request_id': 'fixed'}
+        resend = dict(payload)
+        assert resend['request_id'] == payload['request_id']

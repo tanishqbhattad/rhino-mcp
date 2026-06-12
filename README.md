@@ -1,6 +1,6 @@
-﻿# RhinoAIBridge v4.7.6 - AI Control of Rhino 8 via MCP
+# RhinoAIBridge v4.8.0 - AI Control of Rhino 8 via MCP
 
-> **The most powerful Rhino MCP server.** 112 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 - create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
+> **The most powerful Rhino MCP server.** 115 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 - create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rhino 8](https://img.shields.io/badge/Rhino-8.x-blue)](https://www.rhino3d.com/)
@@ -23,7 +23,8 @@ This is the **fastest, most feature-complete Rhino AI integration available**:
 - **Auto-thumbnails** - every mutation returns a viewport JPEG so the AI sees what it built
 - **Atomic batches** - multi-step operations roll back as one unit on failure
 - **No .NET SDK required** on target machines - plugin is pre-built
-- **112 MCP tools** across 12 categories
+- **115 MCP tools** across 12 categories
+- **Protocol 5**: multiplexed connection (reads & ping answer while long commands run), idempotent retries (no duplicate geometry on reconnect), cooperative cancellation, binary image frames, and a write-ahead log for crash recovery
 
 ---
 

@@ -4,9 +4,9 @@
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <TargetExt>.rhp</TargetExt>
     <NoWarn>NU1701</NoWarn>
-    <Version>4.7.6</Version>
+    <Version>4.8.0</Version>
     <Title>RhinoAIBridge</Title>
-    <Description>AI Bridge for Rhino 8 - v4.7.6 (112 tools, review captures, CPython 3, surface tools, PDF tracing)</Description>
+    <Description>AI Bridge for Rhino 8 - v4.8.0 (protocol 5: multiplexed, idempotent retries, cancellation, binary image frames, WAL crash recovery; 115 tools)</Description>
     <AssemblyName>RhinoAIBridge</AssemblyName>
     <RootNamespace>RhinoAIBridge</RootNamespace>
     <LangVersion>latest</LangVersion>

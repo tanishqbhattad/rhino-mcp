@@ -1,7 +1,7 @@
 [project]
 name = "rhino-architect"
-version = "4.7.6"
-description = "AI Bridge MCP server for Rhino 8 - v4.7.6 (review captures, CPython 3, surface tools, PDF tracing, 112 tools)"
+version = "4.8.0"
+description = "AI Bridge MCP server for Rhino 8 - v4.8.0 (protocol 5: multiplexed, idempotent retries, cancel, binary frames; 115 tools)"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

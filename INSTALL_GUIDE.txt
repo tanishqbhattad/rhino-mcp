@@ -1,5 +1,5 @@
 ================================================================
-  RhinoAIBridge v4.7.6 — Installation Guide
+  RhinoAIBridge v4.8.0 — Installation Guide
   by tanishqb | https://github.com/tanishqbhattad/rhino-mcp
 ================================================================
 
@@ -20,7 +20,7 @@ You do NOT need:
   STEP 1 — Extract the zip
 ================================================================
 
-Unzip RhinoAIBridge-v4.7.6.zip to any folder.
+Unzip RhinoAIBridge-v4.8.0.zip to any folder.
 Example: C:\RhinoAIBridge\
 
 

@@ -1,4 +1,4 @@
-# RhinoAIBridge v4.7.6 MCP Server
+# RhinoAIBridge v4.8.0 MCP Server
 # by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
 
 """Rhino AI Bridge v4.7.6 MCP Server.
@@ -98,7 +98,7 @@ def _rhino_heartbeat_loop():
     host = os.environ.get("RHINO_HOST", "127.0.0.1")
     port = int(os.environ.get("RHINO_PORT", "9544"))
     
-    # Phase 1: Wait for Rhino to become reachable (no timeout — wait forever)
+    # Phase 1: Wait for Rhino to become reachable (bounded by RHINO_HEARTBEAT_STARTUP_MAX_WAIT)
     logger.info("Heartbeat: waiting for Rhino on %s:%d ...", host, port)
     startup_deadline = time.monotonic() + max(15, _HEARTBEAT_STARTUP_MAX_WAIT)
     while time.monotonic() < startup_deadline:
@@ -168,6 +168,14 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
         if not resp.ok:
             return {"status": "error", "message": resp.message, **(resp.result or {})}
         result = dict(resp.result) if resp.result else {}
+        # Protocol 5 binary image frame: raw bytes arrived out-of-band (no base64
+        # on the wire, no giant-string JSON parse). Re-attach base64 here so every
+        # downstream consumer keeps the same shape.
+        raw_img = result.pop("_image_raw", None)
+        if raw_img is not None and "image_base64" not in result:
+            result["image_base64"] = base64.b64encode(raw_img).decode("ascii")
+            result.pop("image_binary", None)
+            result.pop("image_bytes_length", None)
         result.setdefault("status", "ok")
         if resp.scene_version is not None and "scene_version" not in result:
             result["scene_version"] = resp.scene_version
@@ -315,14 +323,18 @@ async def _run_process(args: list[str], timeout_seconds: int) -> dict[str, Any]:
         }
 
 
-async def _developer_mode_required() -> dict | None:
-    """Block code execution unless the Rhino plugin is currently in Developer mode."""
+async def _developer_mode_required() -> tuple[dict | None, dict]:
+    """Block code execution unless the Rhino plugin is currently in Developer mode.
+
+    Returns (error_or_None, ping_data) so callers can reuse the health probe
+    instead of paying for a second ping round-trip.
+    """
     blocked = _check_safe_mode("execute_python3")
     if blocked:
-        return blocked
+        return blocked, {}
     ping = await _exec_simple("ping", {})
     if ping.get("status") != "ok":
-        return ping
+        return ping, ping
     mode = str(ping.get("mode") or "").lower()
     if mode != "developer":
         return {
@@ -331,8 +343,8 @@ async def _developer_mode_required() -> dict | None:
             "message": "execute_python3 requires Developer mode in Rhino because it can run arbitrary code.",
             "current_mode": mode or "unknown",
             "retry_hint": "Run AIBridge in Rhino and choose Developer mode, then retry.",
-        }
-    return None
+        }, ping
+    return None, ping
 
 
 def _parse_rhino_version(raw: Any) -> tuple[int, int] | None:
@@ -393,6 +405,10 @@ class QuerySceneInput(BaseModel):
     filter: dict[str, Any] = Field(default_factory=dict)
     detail: str = "summary"  # ids | summary | full
     limit: int = Field(default=80, ge=1, le=500)
+    format: str = Field(
+        default="rows",
+        description="'rows' (objects as dicts) or 'columnar' (parallel arrays: ids/names/layers/types/bboxes - 40-60% fewer tokens on large listings).",
+    )
 
 
 class CreateObjectInput(BaseModel):
@@ -883,12 +899,16 @@ class RunCommandInput(BaseModel):
 # Capabilities Resource --------------------------------------------------
 # Long-tail commands (still callable inside `batch`) and discoverable workflows.
 CAPABILITIES: dict[str, Any] = {
-    "version": "4.7.6",
-    "phase": "1+2+3+5+6",
-    "tool_count": 112,
-    "deferred_phases": {
-        "phase_4": "multiplexed protocol - deferred (UI-thread serialization makes the gain marginal)",
-        "phase_7": "System.Text.Json source generators - deferred (low ROI vs. wider risk)",
+    "version": "4.8.0",
+    "phase": "1+2+3+4+5+6+7",
+    "tool_count": 115,
+    "protocol_5": {
+        "multiplex": "request_id-matched responses; reads/ping/cancel answer while long commands run",
+        "idempotent_retry": "re-sent request_ids replay cached results instead of re-executing",
+        "cancel": "cancel_operation stops the running command at its next checkpoint",
+        "binary_image": "viewport captures travel as raw bytes (flag 0x02), not base64",
+        "columnar_query": "query_scene(format='columnar') returns parallel arrays (40-60% fewer tokens)",
+        "wal": "write-ahead log of mutating commands; get_recovery_log after a crash",
     },
     "tool_surface": "consolidated",
     "preferred_tools": [
@@ -1034,19 +1054,27 @@ async def ping(params: Optional[Empty] = None) -> dict:
         data["capabilities_resource"] = "rhino://capabilities"
         data["safe_mode"] = _SAFE_MODE
         data["mcp_python"] = _sys.executable
-        data["mcp_version"] = "4.7.6"
+        data["mcp_version"] = "4.8.0"
         # Check optional dependencies without importing them. Importing cv2/numpy during
         # a health check can be surprisingly slow on Windows and made MCP ping appear hung.
         dep_status = {}
         for pkg, module_name in {"pymupdf": "fitz", "cv2": "cv2", "numpy": "numpy"}.items():
             dep_status[pkg] = "installed" if importlib.util.find_spec(module_name) else "missing"
         data["optional_dependencies"] = dep_status
-        # Protocol 4.x releases remain wire-compatible.
+        # Protocol 4.x (legacy single-flight) and 5.x (multiplexed) are both supported.
         plugin_ver = data.get("protocol_version", "")
         plugin_major = plugin_ver.split(".", 1)[0] if plugin_ver else ""
-        if plugin_ver and plugin_major != "4":
-            data["version_warning"] = (f"MCP server expects protocol 4.x; plugin reports {plugin_ver}. "
+        if plugin_ver and plugin_major not in ("4", "5"):
+            data["version_warning"] = (f"MCP server expects protocol 4.x/5.x; plugin reports {plugin_ver}. "
                                        "Update the .rhp plugin for full compatibility.")
+        elif plugin_major == "4":
+            data["version_note"] = ("Plugin is protocol 4 (legacy single-flight). Update the .rhp to v4.8 "
+                                    "for multiplexing, idempotent retries, cancellation and binary frames.")
+        try:
+            conn = await get_connection()
+            data["client_mode"] = "multiplexed" if conn._server_multiplex else "legacy"
+        except Exception:
+            pass
         return data
     except asyncio.TimeoutError:
         return {"status": "error",
@@ -1586,11 +1614,10 @@ async def execute_python3(params: Python3Input) -> dict:
     - RhinoCode script server running (`StartScriptServer`; this tool starts it)
     - AIBridge in Developer mode
     """
-    blocked = await _developer_mode_required()
+    blocked, health = await _developer_mode_required()
     if blocked:
         return blocked
 
-    health = await _exec_simple("ping", {})
     version = _parse_rhino_version(health.get("rhino_version"))
     if version is None or version < (8, 11):
         return {
@@ -2545,7 +2572,7 @@ async def thumbnail_json(
 # v4.7.4: TIER 2 — WORKFLOW FEATURES
 # =============================================================================
 
-@mcp.tool(name="export_objects", annotations=RO)
+@mcp.tool(name="export_objects", annotations=WI)
 async def export_objects(
     format: str = "stl",
     path: str = "",
@@ -2594,6 +2621,59 @@ async def restore_checkpoint(name: str) -> dict:
 async def list_checkpoints() -> dict:
     """List all saved design checkpoints with size and timestamp."""
     return await _exec_simple("list_checkpoints", {})
+
+
+# =============================================================================
+# ENTRY POINT
+
+
+# =============================================================================
+# v4.8: PROTOCOL 5 TOOLS - cancellation, checkpoint hygiene, crash recovery
+# =============================================================================
+
+@mcp.tool(name="cancel_operation", annotations=WI)
+async def cancel_operation() -> dict:
+    """Cancel the most recent long-running mutating operation in Rhino.
+
+    Works while the operation is still executing (protocol 5 multiplexing lets
+    this tool run concurrently). The plugin stops at its next checkpoint -
+    batches stop at the next op boundary (atomic batches roll back), and
+    facade/floor generators return partial results flagged cancelled: true.
+    """
+    try:
+        conn = await get_connection()
+    except RhinoConnectionError as e:
+        return {"status": "error", "error_code": "RHINO_NOT_CONNECTED", "message": str(e)}
+    rid = conn.last_mutating_request_id
+    if not rid:
+        return {"status": "error", "message": "No mutating operation has been issued on this connection yet."}
+    result = await conn.cancel(rid)
+    result.setdefault("status", "ok")
+    result["request_id"] = rid
+    return result
+
+
+@mcp.tool(name="delete_checkpoint", annotations=DE)
+async def delete_checkpoint(name: str) -> dict:
+    """Delete a saved design checkpoint (registry entry + .3dm file).
+
+    Checkpoints persist across Rhino sessions (registry.json sidecar); auto-
+    checkpoints are capped at the 10 newest, but named ones live until deleted.
+    """
+    return await _exec_simple("delete_checkpoint", {"name": name})
+
+
+@mcp.tool(name="get_recovery_log", annotations=RO)
+async def get_recovery_log(limit: int = 50) -> dict:
+    """Read the write-ahead log of mutating commands (crash recovery).
+
+    Every mutating command is journaled BEFORE execution ('begin') and after
+    ('end' + status). After a Rhino crash or unexpected restart, read the tail
+    to see exactly what was in flight, then diff against query_scene to decide
+    what to re-issue. Falls back to the most recent session log if Rhino was
+    restarted since the last write.
+    """
+    return await _exec_simple("get_recovery_log", {"limit": limit})
 
 
 # =============================================================================
