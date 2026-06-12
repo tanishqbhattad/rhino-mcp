@@ -8,7 +8,7 @@
       1. Rhino 8 process is running
       2. Port 9544 is open (TCP)
       3. TCP ping (protocol-level handshake) returns ok
-      4. Protocol version matches server expectation (4.x)
+      4. Protocol version matches server expectation (4.x or 5.x)
       5. Python MCP server process is running
       6. Python venv is intact (uv run --frozen can resolve entry point)
 
@@ -128,10 +128,10 @@ if ($resp) {
     try {
         $json = $resp | ConvertFrom-Json
         $ver  = $json.protocol_version
-        if ($ver -match "^4\.") {
+        if ($ver -match "^[45]\.") {
             OK "Protocol v$ver (compatible)"
         } elseif ($ver) {
-            WARN "Protocol v$ver - expected 4.x. You may need to rebuild the plugin."
+            WARN "Protocol v$ver - expected 4.x or 5.x. You may need to rebuild the plugin."
         } else {
             WARN "Protocol version not reported"
         }

@@ -1,7 +1,7 @@
 @echo off
 echo.
 echo   ====================================
-echo    Building Rhino AI Bridge v4.7.6
+echo    Building Rhino AI Bridge v4.8.0
 echo   ====================================
 echo.
 where dotnet >nul 2>&1

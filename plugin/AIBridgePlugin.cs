@@ -1,4 +1,4 @@
-// RhinoAIBridge v4.7.6 - AIBridgePlugin.cs
+// RhinoAIBridge v4.8.0 - AIBridgePlugin.cs
 // by tanishqb | https://github.com/tanishqbhattad/rhino-mcp
 
 using System;

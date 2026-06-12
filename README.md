@@ -366,7 +366,13 @@ Output: `plugin/bin/Release/net8.0/`. Copy `.rhp`, DLLs, JSON runtime files, and
 
 ## Changelog
 
-### v4.7.6 (current)
+### v4.8.0 (current)
+- **Protocol 5**: multiplexed connection, idempotent retries (no duplicate geometry on reconnect), cooperative cancellation, binary image frames
+- 115 tools (new: cancel_operation, delete_checkpoint, get_recovery_log)
+- Offscreen ViewCapture rendering, FileIO 3dm export, crash-safe checkpoint restore, write-ahead log crash recovery
+- Oriented openings (diagonal walls), unit-aware defaults, whole-scene validation, columnar queries (40-60% fewer tokens)
+
+### v4.7.6
 - **Rhino 8 runtime compatibility** - removes plugin-loader dependencies on `System.Threading.Channels` and response compression assemblies
 - **Authenticated localhost bridge** - per-user token handshake, client cap, idle timeout, and connection cleanup
 - **Startup access modes** - run `AIBridge` and choose Safe, Standard, or Developer mode

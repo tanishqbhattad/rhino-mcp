@@ -38,7 +38,7 @@ def _fetch_json(url: str) -> dict:
     """Fetch parsed JSON, falling back to the last known good response."""
     cache_file = _SCHEMA_CACHE_DIR / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}.json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "RhinoAIBridge/4.7.6"})
+        req = urllib.request.Request(url, headers={"User-Agent": "RhinoAIBridge/4.8.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         try:
@@ -309,7 +309,7 @@ def download_material(asset_id: str, resolution: str = "2K") -> dict:
         tmp_path = Path(tmp.name)
 
     try:
-        req = urllib.request.Request(download_url, headers={"User-Agent": "RhinoAIBridge/4.7.6"})
+        req = urllib.request.Request(download_url, headers={"User-Agent": "RhinoAIBridge/4.8.0"})
         with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as out:
             shutil.copyfileobj(resp, out)
 

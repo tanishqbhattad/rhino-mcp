@@ -6,7 +6,7 @@ title Rhino MCP Quick Repair
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "PLUGIN_DIR=%APPDATA%\McNeel\Rhinoceros\8.0\Plug-ins\RhinoAIBridge"
-set "DIST_DIR=%ROOT%\dist\plugin"
+set "DIST_DIR=%ROOT%\..\dist\plugin"
 
 echo.
 echo  ============================================================

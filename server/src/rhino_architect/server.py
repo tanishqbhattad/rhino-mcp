@@ -1,7 +1,7 @@
 # RhinoAIBridge v4.8.0 MCP Server
 # by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
 
-"""Rhino AI Bridge v4.7.6 MCP Server.
+"""Rhino AI Bridge v4.8.0 MCP Server.
 
 This release combines:
   Phase 1 - lean responses (dicts -> FastMCP -> orjson on wire)
