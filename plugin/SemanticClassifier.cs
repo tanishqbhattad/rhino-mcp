@@ -18,6 +18,8 @@ namespace RhinoAIBridge
         public int LevelIndex = -1;
         public BoundingBox BBox;
         public string Layer;
+        public Vector3d Facing = Vector3d.Unset;
+        public string Orientation = null;
     }
 
     public static class SemanticClassifier
@@ -40,9 +42,14 @@ namespace RhinoAIBridge
                     var bb = obj.Geometry?.GetBoundingBox(accurate: false) ?? BoundingBox.Unset;
                     if (!bb.IsValid) continue;
                     var layer = doc.Layers[obj.Attributes.LayerIndex]?.FullPath ?? "";
-                    result.Add(new ClassifiedObject { Id = obj.Id.ToString(), BBox = bb, Layer = layer, Type = ClassifyObject(bb, layer) });
+                    var atype = ClassifyObject(bb, layer);
+                    var co = new ClassifiedObject { Id = obj.Id.ToString(), BBox = bb, Layer = layer, Type = atype };
+                    if (atype == ArchType.Opening || atype == ArchType.FacadePanel || atype == ArchType.Wall)
+                        co.Facing = DominantHorizontalNormal(obj.Geometry, bb);
+                    result.Add(co);
                 }
                 AssignLevels(result);
+                AssignOrientation(doc, result);
                 _cachedResult = result;
                 _cachedSceneVersion = sv;
                 return result;
@@ -95,6 +102,119 @@ namespace RhinoAIBridge
             }
         }
 
+        // v4.9: facing/orientation -- the missing piece for semantic selection
+        // like "south-facing windows on level 3". +Y is treated as North, +X East.
+        private static void AssignOrientation(RhinoDoc doc, List<ClassifiedObject> objects)
+        {
+            // volume-weighted centroid: structural bulk anchors 'outward'; stray/thin
+            // objects barely move it, so opposite facades resolve to opposite compass dirs.
+            double cx = 0, cy = 0, cz = 0, wsum = 0;
+            foreach (var o in objects)
+            {
+                var s = o.BBox.Max - o.BBox.Min;
+                double w = Math.Max(Math.Abs(s.X) * Math.Abs(s.Y) * Math.Abs(s.Z), 1.0);
+                var c = o.BBox.Center;
+                cx += c.X * w; cy += c.Y * w; cz += c.Z * w; wsum += w;
+            }
+            var bc = wsum > 0 ? new Point3d(cx / wsum, cy / wsum, cz / wsum) : Point3d.Origin;
+            foreach (var co in objects)
+            {
+                if (co.Facing == Vector3d.Unset) continue;
+                var outward = co.BBox.Center - bc; outward.Z = 0;
+                if (co.Facing * outward < 0) co.Facing = -co.Facing;
+                co.Orientation = BearingToCompass(co.Facing);
+            }
+        }
+
+        // Largest near-vertical face normal (the glazing/wall plane), falling back to the
+        // thinnest horizontal bbox axis for crude or boxy geometry.
+        private static Vector3d DominantHorizontalNormal(GeometryBase geo, BoundingBox bb)
+        {
+            Vector3d best = Vector3d.Unset; double bestArea = 0;
+            Brep brep = geo as Brep ?? (geo as Extrusion)?.ToBrep();
+            if (brep != null)
+            {
+                foreach (var face in brep.Faces)
+                {
+                    var nrm = face.NormalAt(face.Domain(0).Mid, face.Domain(1).Mid);
+                    var horiz = new Vector3d(nrm.X, nrm.Y, 0);
+                    if (horiz.Length < 0.5) continue;
+                    var d = face.GetBoundingBox(false).Diagonal;
+                    double[] dims = { Math.Abs(d.X), Math.Abs(d.Y), Math.Abs(d.Z) };
+                    Array.Sort(dims);
+                    double area = dims[1] * dims[2];
+                    if (area > bestArea) { bestArea = area; best = horiz; }
+                }
+            }
+            if (best == Vector3d.Unset)
+            {
+                double dx = bb.Max.X - bb.Min.X, dy = bb.Max.Y - bb.Min.Y;
+                best = dx <= dy ? new Vector3d(1, 0, 0) : new Vector3d(0, 1, 0);
+            }
+            best.Z = 0;
+            if (best.Length < 1e-9) return Vector3d.Unset;
+            best.Unitize();
+            return best;
+        }
+
+        private static readonly string[] _compass = { "N", "NE", "E", "SE", "S", "SW", "W", "NW" };
+        private static string BearingToCompass(Vector3d n)
+        {
+            double deg = Math.Atan2(n.X, n.Y) * 180.0 / Math.PI;
+            if (deg < 0) deg += 360;
+            return _compass[(int)Math.Round(deg / 45.0) % 8];
+        }
+
+        public static ArchType ParseType(string name)
+        {
+            var s = (name ?? "").ToLowerInvariant();
+            if (s.Contains("wall")) return ArchType.Wall;
+            if (s.Contains("slab") || s.Contains("floor") || s.Contains("ceiling")) return ArchType.Slab;
+            if (s.Contains("column") || s.Contains("pillar")) return ArchType.Column;
+            if (s.Contains("core")) return ArchType.Core;
+            if (s.Contains("facade") || s.Contains("panel") || s.Contains("clad")) return ArchType.FacadePanel;
+            if (s.Contains("window") || s.Contains("door") || s.Contains("opening") || s.Contains("glaz")) return ArchType.Opening;
+            if (s.Contains("stair") || s.Contains("ramp")) return ArchType.Stair;
+            if (s.Contains("mass") || s.Contains("envelope")) return ArchType.Massing;
+            return ArchType.Generic;
+        }
+
+        private static string NormalizeOrientation(string o)
+        {
+            var s = (o ?? "").Trim().ToLowerInvariant().Replace("-facing", "").Replace(" facing", "").Trim();
+            switch (s)
+            {
+                case "n": case "north": return "N";
+                case "ne": case "northeast": case "north-east": return "NE";
+                case "e": case "east": return "E";
+                case "se": case "southeast": case "south-east": return "SE";
+                case "s": case "south": return "S";
+                case "sw": case "southwest": case "south-west": return "SW";
+                case "w": case "west": return "W";
+                case "nw": case "northwest": case "north-west": return "NW";
+                default: return null;
+            }
+        }
+
+        // Semantic query: filter classified objects by type + level + facing orientation.
+        public static List<ClassifiedObject> Query(RhinoDoc doc, string type, int? level, string orientation)
+        {
+            var cl = Classify(doc);
+            IEnumerable<ClassifiedObject> q = cl;
+            if (!string.IsNullOrWhiteSpace(type) && type.ToLowerInvariant() != "all")
+            {
+                var t = ParseType(type);
+                q = q.Where(c => c.Type == t);
+            }
+            if (level.HasValue) q = q.Where(c => c.LevelIndex == level.Value);
+            if (!string.IsNullOrWhiteSpace(orientation))
+            {
+                var want = NormalizeOrientation(orientation);
+                if (want != null) q = q.Where(c => c.Orientation == want);
+            }
+            return q.ToList();
+        }
+
         public static JObject AnalyzeArchitecture(RhinoDoc doc)
         {
             var cl = Classify(doc);
@@ -124,7 +244,7 @@ namespace RhinoAIBridge
                 var grp = cl.Where(c => c.Type == t).ToList();
                 if (grp.Count == 0 && !all) continue;
                 systems[t.ToString().ToLower()] = new JArray(grp.Select(c => new JObject {
-                    ["id"] = c.Id, ["level"] = c.LevelIndex, ["layer"] = c.Layer,
+                    ["id"] = c.Id, ["level"] = c.LevelIndex, ["layer"] = c.Layer, ["orientation"] = c.Orientation,
                     ["size"] = new JArray { Math.Round(c.BBox.Max.X-c.BBox.Min.X,0), Math.Round(c.BBox.Max.Y-c.BBox.Min.Y,0), Math.Round(c.BBox.Max.Z-c.BBox.Min.Z,0) }
                 }));
             }

@@ -96,6 +96,8 @@ namespace RhinoAIBridge
             }
             catch (Exception e)
             {
+                if (_shuttingDown)
+                    return new JObject { ["status"] = "error", ["error_code"] = "AIBRIDGE_SHUTTING_DOWN", ["message"] = "AIBridge is shutting down; command was not started." };
                 throw new InvalidOperationException($"Failed to queue command on Rhino UI thread: {e.Message}", e);
             }
 

@@ -145,6 +145,8 @@ class RhinoProtocol:
         "get_trace_layers", "get_section_profile", "get_silhouette",
         "capture_viewport", "capture_inspection_view", "thumbnail", "batch_preview",
         "get_recovery_log",
+        "detect_clashes",
+        "list_commands",
     })
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
@@ -373,9 +375,17 @@ class RhinoProtocol:
                 await self._send(payload, sent_flag)
             return await asyncio.wait_for(fut, timeout)
         finally:
-            # Drop the rid mapping; the FIFO entry stays until the reader consumes
-            # the matching frame (keeps legacy alignment even after a timeout).
+            # Drop the rid mapping. For multiplexed servers the FIFO is not used
+            # for matching (responses route by request_id), so also evict this
+            # future to prevent a slow leak of cancelled/timed-out futures. For
+            # legacy servers the FIFO entry must stay until the reader consumes the
+            # matching frame (keeps strict in-order alignment after a timeout).
             self._pending.pop(rid, None)
+            if self._server_multiplex:
+                try:
+                    self._fifo.remove(fut)
+                except ValueError:
+                    pass
 
     # ── Public API ───────────────────────────────────────────────────
 

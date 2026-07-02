@@ -313,8 +313,13 @@ def download_material(asset_id: str, resolution: str = "2K") -> dict:
         with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as out:
             shutil.copyfileobj(resp, out)
 
-        # Extract zip
+        # Extract zip safely (guard against Zip Slip path traversal).
         with zipfile.ZipFile(tmp_path, "r") as zf:
+            dest_root = cache_dir.resolve()
+            for _member in zf.namelist():
+                _target = (dest_root / _member).resolve()
+                if _target != dest_root and dest_root not in _target.parents:
+                    raise ValueError("Refusing to extract unsafe zip path: {}".format(_member))
             zf.extractall(cache_dir)
 
     finally:

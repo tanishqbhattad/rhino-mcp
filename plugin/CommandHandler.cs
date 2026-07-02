@@ -75,6 +75,7 @@ namespace RhinoAIBridge
             "validate_architecture", "get_recovery_log", "get_building_systems",
             "get_level_summary", "detect_design_patterns", "find_unassigned_geometry",
             "analyze_architecture", "capture_illustration",
+            "detect_clashes",
         };
 
         public CommandHandler()
@@ -83,6 +84,7 @@ namespace RhinoAIBridge
             {
                 // Context & Scene
                 ["get_context"] = W(GetContext), ["get_selection"] = W(GetSelection),
+                ["list_commands"] = W(ListCommands),
                 ["get_scene_summary"] = W(GetSceneSummary), ["get_objects"] = W(GetObjects), ["list_objects"] = W(GetObjects),
                 ["get_object_details"] = W(GetObjectDetails), ["get_object_info"] = W(GetObjectDetails),
                 // Architecture
@@ -129,11 +131,13 @@ namespace RhinoAIBridge
                 // Analysis
                 ["measure_object"] = W(MeasureObject), ["measure_distance"] = W(MeasureDistance),
                 ["check_intersection"] = W(CheckIntersection), ["validate_objects"] = W(ValidateObjects),
+                ["detect_clashes"] = W(DetectClashes),
                 // Viewport
                 ["set_view"] = W(SetView), ["set_display_mode"] = W(SetDisplayMode),
                 ["capture_viewport"] = W(CaptureViewport), ["get_viewport_image"] = W(CaptureViewport),
                 ["capture_inspection_view"] = W(CaptureInspectionView),
                 ["select_objects"] = W(SelectObjects), ["set_selection"] = W(SelectObjects),
+                ["select_by_semantic"] = W(SelectBySemanticCmd),
                 ["set_camera"] = W(SetCamera), ["get_rhino_commands"] = W(GetRhinoCommands),
                 // Materials & Commands
                 ["set_layer_material"] = W(SetLayerMaterial),
@@ -517,6 +521,22 @@ namespace RhinoAIBridge
                 return ErrFromException(e);
             }
         };
+
+        // Machine-readable dispatch table: lets the MCP server generate its
+        // capabilities resource from the live registry instead of a hand-
+        // maintained list that drifts (v4.10).
+        JObject ListCommands(JObject p)
+        {
+            var names = _commands.Keys.Concat(new[] { "batch" }).OrderBy(k => k);
+            return new JObject
+            {
+                ["status"] = "ok",
+                ["commands"] = new JArray(names),
+                ["count"] = _commands.Count + 1,
+                ["protocol_version"] = AIBridgeServer.PROTOCOL_VERSION,
+                ["note"] = "Every command is callable directly over TCP or as a batch sub-op ({type, params})."
+            };
+        }
 
         // --- Helpers --------------------------------------------------
         static RhinoDoc Doc => RhinoDoc.ActiveDoc;
@@ -2367,6 +2387,129 @@ namespace RhinoAIBridge
                 a.Max.Y >= b.Min.Y && b.Max.Y >= a.Min.Y &&
                 a.Max.Z >= b.Min.Z && b.Max.Z >= a.Min.Z));
         }
+        // v4.9: real clash detection. Broad phase = RTree over bounding boxes;
+        // narrow phase = true Brep-Brep intersection with tolerance (not bbox-only).
+        JObject DetectClashes(JObject p)
+        {
+            double tol = p["tolerance"]?.ToObject<double>() ?? Tol;
+            if (tol <= 0) tol = Tol;
+            int maxChecks = Math.Clamp(p["max_checks"]?.ToObject<int>() ?? 1500, 1, 20000);
+            bool includeTouch = p["include_touching"]?.ToObject<bool>() ?? true;
+            bool solidOverlap = p["solid_overlap"]?.ToObject<bool>() ?? true;
+
+            List<RhinoObject> objs;
+            var idsTok = p["object_ids"];
+            if (idsTok is JArray ja && ja.Count > 0)
+                objs = ResIds(idsTok).Select(s => Doc.Objects.FindId(Guid.TryParse(s, out var g) ? g : Guid.Empty))
+                                     .Where(o => o != null).ToList();
+            else
+                objs = AllObjs();
+            string layer = p["layer"]?.ToString();
+            if (!string.IsNullOrEmpty(layer))
+            {
+                int li = Doc.Layers.FindByFullPath(layer, -1);
+                if (li >= 0) objs = objs.Where(o => o.Attributes.LayerIndex == li).ToList();
+            }
+            var items = objs.Where(o => o.Geometry is Brep || o.Geometry is Extrusion).ToList();
+            int n = items.Count;
+            if (n < 2)
+                return Ok(("clash_count", 0), ("clashes", new JArray()), ("checked_objects", n),
+                          ("message", "Need at least 2 solid objects (Brep/Extrusion) in scope."));
+
+            var bboxes = new BoundingBox[n];
+            for (int i = 0; i < n; i++) bboxes[i] = items[i].Geometry.GetBoundingBox(false);
+
+            var tree = new RTree();
+            for (int i = 0; i < n; i++) tree.Insert(bboxes[i], i);
+            var pairs = new HashSet<long>();
+            for (int i = 0; i < n; i++)
+            {
+                int ic = i;
+                var sb = bboxes[i]; sb.Inflate(tol);
+                tree.Search(sb, (s, e) => { if (e.Id > ic) pairs.Add((long)ic * n + e.Id); });
+            }
+
+            var clashes = new JArray();
+            int checks = 0, boolChecks = 0, hard = 0; bool truncated = false;
+            foreach (var key in pairs)
+            {
+                if (checks >= maxChecks) { truncated = true; break; }
+                int i = (int)(key / n), j = (int)(key % n);
+                var ba = GetBrep(items[i]); var bb2 = GetBrep(items[j]);
+                if (ba == null || bb2 == null) continue;
+                checks++;
+                if (!Intersection.BrepBrep(ba, bb2, tol, out var crvs, out var pts)) continue;
+                bool has = (crvs != null && crvs.Length > 0) || (pts != null && pts.Length > 0);
+                if (!has) continue;
+                double len = crvs != null ? crvs.Sum(c => c.GetLength()) : 0;
+                Point3d rep = (crvs != null && crvs.Length > 0) ? crvs[0].PointAtNormalizedLength(0.5)
+                             : (pts != null && pts.Length > 0) ? pts[0] : Point3d.Origin;
+                string kind = "touch";
+                if (solidOverlap && boolChecks < 300 && ba.IsSolid && bb2.IsSolid)
+                {
+                    boolChecks++;
+                    var inter = Brep.CreateBooleanIntersection(new[] { ba }, new[] { bb2 }, tol);
+                    if (inter != null && inter.Length > 0)
+                    {
+                        double vol = 0;
+                        foreach (var bi in inter) { var vm = VolumeMassProperties.Compute(bi); if (vm != null) vol += Math.Abs(vm.Volume); }
+                        if (vol > tol * tol * tol) { kind = "overlap"; hard++; }
+                    }
+                }
+                else if (solidOverlap) kind = "intersect";
+                if (kind == "touch" && !includeTouch) continue;
+                clashes.Add(new JObject
+                {
+                    ["a"] = items[i].Id.ToString(),
+                    ["b"] = items[j].Id.ToString(),
+                    ["kind"] = kind,
+                    ["point"] = new JArray { Math.Round(rep.X, 1), Math.Round(rep.Y, 1), Math.Round(rep.Z, 1) },
+                    ["intersection_length"] = Math.Round(len, 1),
+                    ["a_layer"] = Doc.Layers[items[i].Attributes.LayerIndex]?.Name,
+                    ["b_layer"] = Doc.Layers[items[j].Attributes.LayerIndex]?.Name
+                });
+            }
+            var res = Ok(("clash_count", clashes.Count), ("hard_overlaps", hard),
+                         ("checked_objects", n), ("candidate_pairs", pairs.Count),
+                         ("narrow_checks", checks), ("tolerance", tol), ("clashes", clashes));
+            if (truncated)
+            {
+                res["truncated"] = true;
+                res["hint"] = "Hit max_checks; narrow the scope (object_ids/layer) or raise max_checks.";
+            }
+            return res;
+        }
+
+        // v4.9: semantic selection -- type + level + facing orientation.
+        JObject SelectBySemanticCmd(JObject p)
+        {
+            string type = p["type"]?.ToString();
+            int? level = (p["level"] != null && p["level"].Type == JTokenType.Integer) ? (int?)p["level"].ToObject<int>() : null;
+            string orient = p["orientation"]?.ToString();
+            bool select = p["select"]?.ToObject<bool>() ?? true;
+            bool clear = p["clear_selection"]?.ToObject<bool>() ?? true;
+            var matches = SemanticClassifier.Query(Doc, type, level, orient);
+            int selected = 0;
+            if (select)
+            {
+                if (clear) Doc.Objects.UnselectAll();
+                var guids = matches.Select(m => Guid.TryParse(m.Id, out var g) ? g : Guid.Empty).Where(g => g != Guid.Empty).ToList();
+                selected = Doc.Objects.Select(guids, true);
+                RedrawScope.Mark();
+            }
+            var arr = new JArray(matches.Select(m => new JObject
+            {
+                ["id"] = m.Id,
+                ["type"] = m.Type.ToString().ToLower(),
+                ["level"] = m.LevelIndex,
+                ["orientation"] = m.Orientation,
+                ["layer"] = m.Layer
+            }));
+            return Ok(("count", matches.Count), ("selected_count", selected),
+                      ("filter", new JObject { ["type"] = type, ["level"] = level, ["orientation"] = orient }),
+                      ("objects", arr));
+        }
+
         JObject ValidateObjects(JObject p)
         {
             var ids = p["object_ids"]?.ToObject<List<string>>();

@@ -2,7 +2,7 @@
 
 **The Rhino MCP server: full AI control of Rhino 8 / Rhinoceros 3D through the Model Context Protocol.** Works with Claude Desktop, Claude Code, ChatGPT, Codex, Gemini and local Ollama models.
 
-> **The most powerful Rhino MCP server.** 115 tools give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 - create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
+> **The most powerful Rhino MCP server.** 117 tools (curated into lean/standard/full profiles via `RHINO_TOOLS`) give Claude, ChatGPT, Codex, or Ollama full control of Rhino 8 - create geometry, manipulate layers, capture viewports, manage materials, generate architectural drawings, trace PDFs, and more. No .NET SDK required on the target machine.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rhino 8](https://img.shields.io/badge/Rhino-8.x-blue)](https://www.rhino3d.com/)
@@ -20,7 +20,7 @@ There are several Rhino MCP servers; this one is built for serious, long modelin
 
 | | RhinoAIBridge |
 |---|---|
-| Tools | **115** (modeling, architecture, layers, materials, viewport vision, sections/plans, PDF tracing, design memory) |
+| Tools | **117** total, exposed via profiles: `RHINO_TOOLS=lean` (~21, for small/local models), `standard` (~65, default), `full` (everything). Pruned tools stay callable via `batch`. |
 | Protocol | **v5 multiplexed** - reads, ping and cancel answer instantly while long scripts run |
 | Reliability | **Idempotent retries** (no duplicate geometry on reconnect), atomic batches with rollback, write-ahead log crash recovery |
 | Vision loop | Auto-thumbnails after every edit, multi-angle review sets, before/after pixel diffs |
@@ -55,7 +55,7 @@ This is the **fastest, most feature-complete Rhino AI integration available**:
 - **Auto-thumbnails** - every mutation returns a viewport JPEG so the AI sees what it built
 - **Atomic batches** - multi-step operations roll back as one unit on failure
 - **No .NET SDK required** on target machines - plugin is pre-built
-- **115 MCP tools** across 12 categories
+- **117 MCP tools** across 12 categories, curated into context-friendly profiles (`RHINO_TOOLS=lean|standard|full`; default `standard` ≈65 tools)
 - **Protocol 5**: multiplexed connection (reads & ping answer while long commands run), idempotent retries (no duplicate geometry on reconnect), cooperative cancellation, binary image frames, and a write-ahead log for crash recovery
 
 ---
@@ -82,7 +82,9 @@ For a detailed walkthrough see **INSTALL_GUIDE.txt**.
 
 ---
 
-## 115 MCP Tools
+## 117 MCP Tools (profiles: lean / standard / full)
+
+Set `RHINO_TOOLS=lean|standard|full` in the MCP server env to control how many tools are advertised to the client (default `standard`, ≈65). Anything not exposed in the active profile remains callable as a `batch` sub-op, and the live command list is available from the `rhino://capabilities` resource.
 
 ### Scene & Context
 | Tool | What it does |
@@ -276,7 +278,7 @@ Then in Rhino run `AIBridge`, and ask Codex: *"ping Rhino"*
 Restart Antigravity after installation, run `AIBridge` in Rhino, choose an access mode, and ask: *"ping Rhino"*
 
 ### ChatGPT
-`chat.py` is a legacy direct-TCP demo client. For the full 112-tool surface, use the MCP server with Claude, Codex, Gemini Antigravity, or another MCP-capable client.
+`chat.py` is a legacy direct-TCP demo client. For the full MCP tool surface, use the MCP server with Claude, Codex, Gemini Antigravity, or another MCP-capable client.
 
 ```
 cd server
@@ -309,7 +311,7 @@ uv run python chat.py --provider anthropic --model claude-opus-4-6
 Claude Desktop / ChatGPT / Codex / Ollama
          |  MCP (stdio)
          v
-  server/src/rhino_architect/server.py   <- FastMCP Python server (115 tools)
+  server/src/rhino_architect/server.py   <- FastMCP Python server (117 tools, profile-gated)
          |  TCP 127.0.0.1:9544
          |  local auth token + [1-byte flag][4-byte len][JSON payload]
          v

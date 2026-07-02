@@ -1,27 +1,28 @@
-# RhinoAIBridge v4.8.0 MCP Server
-# by tanishqb | https://github.com/tanishqb/rhino-ai-bridge
+# RhinoAIBridge MCP Server
+# by tanishqbhattad | https://github.com/tanishqbhattad/rhino-mcp
 
-"""Rhino AI Bridge v4.8.0 MCP Server.
+"""Rhino AI Bridge MCP Server.
 
-This release combines:
-  Phase 1 - lean responses (dicts -> FastMCP -> orjson on wire)
-  Phase 2 - scene_version etag surfaced on every response (cache key for the model)
-  Phase 3 - atomic batches + reference resolution ($1.object_ids[0] chaining)
-  Phase 5 - architect intelligence layer (massing, floors, core, facade, schedules)
-  Phase 6 - consolidated 112-tool MCP surface
-
-Phase 4 (multiplexed protocol) and Phase 7 (System.Text.Json) intentionally deferred -
-both buy less than the cache + tool-surface work, and both have correctness pitfalls
-we'd rather defer than ship hastily.
+Key properties:
+  - Lean responses (dicts -> FastMCP -> orjson on wire)
+  - scene_version etag surfaced on every response (cache key for the model)
+  - Atomic batches + reference resolution ($1.object_ids[0] chaining)
+  - Architect intelligence layer (massing, floors, core, facade, schedules)
+  - Protocol 5 transport (multiplexed, idempotent retries, cancel, binary frames)
+  - Tool profiles: RHINO_TOOLS=lean|standard|full controls how many tools are
+    exposed to the MCP client. Pruned tools remain callable via `batch`.
 
 The plugin still understands the full v3/v4 command vocabulary so older flows and
 direct-batch sub-ops keep working. The MCP-exposed surface here is the curated subset
 that maps cleanly to how architects work.
+
+The single source of truth for the version is pyproject.toml (package metadata).
 """
 from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.metadata
 import importlib.util
 import json
 import logging
@@ -47,6 +48,12 @@ from rhino_architect.protocol import (
 
 logging.basicConfig(level=logging.INFO, stream=sys.stderr)
 logger = logging.getLogger("rhino_ai_bridge")
+
+# Single-sourced version: pyproject.toml -> installed package metadata.
+try:
+    _VERSION = importlib.metadata.version("rhino-architect")
+except importlib.metadata.PackageNotFoundError:  # running from a raw checkout
+    _VERSION = "0.0.0-dev"
 
 
 # Safe mode --------------------------------------------------
@@ -83,59 +90,33 @@ _HEARTBEAT_MAX_FAILS = 2   # consecutive failures before exit
 _HEARTBEAT_STARTUP_MAX_WAIT = int(os.environ.get("RHINO_HEARTBEAT_STARTUP_MAX_WAIT", "120"))
 
 def _rhino_heartbeat_loop():
-    """Background thread: poll Rhino TCP port, exit if unreachable.
-    
-    Two-phase design:
-      Phase 1: Wait briefly for Rhino to appear (Claude may start MCP before Rhino).
-      Phase 2: Once connected, monitor. After two consecutive failures, exit.
+    """Background thread: status-only monitor of the Rhino TCP port.
 
-    Older builds waited forever in phase 1. After a PC restart or Rhino close that left
-    the port absent, Claude/Codex/Antigravity could accumulate stale MCP helper
-    processes. Those stale helpers make later pings look busy even when the raw
-    AIBridge socket is healthy.
+    IMPORTANT: this never terminates the MCP server. Claude Desktop launches the
+    server at app startup (usually before Rhino is open) and marks the connector
+    as "failed" if the process exits. The protocol layer auto-reconnects when
+    Rhino reappears, so tool calls just return a connection error while Rhino is
+    down and start working once it is back. We only log reachability changes.
     """
     import time
     host = os.environ.get("RHINO_HOST", "127.0.0.1")
     port = int(os.environ.get("RHINO_PORT", "9544"))
-    
-    # Phase 1: Wait for Rhino to become reachable (bounded by RHINO_HEARTBEAT_STARTUP_MAX_WAIT)
-    logger.info("Heartbeat: waiting for Rhino on %s:%d ...", host, port)
-    startup_deadline = time.monotonic() + max(15, _HEARTBEAT_STARTUP_MAX_WAIT)
-    while time.monotonic() < startup_deadline:
-        try:
-            with socket.create_connection((host, port), timeout=3):
-                pass
-            logger.info("Heartbeat: Rhino is reachable — entering monitor phase.")
-            break  # Rhino is up — move to phase 2
-        except OSError:
-            time.sleep(5)  # check every 5s while waiting
-    else:
-        logger.error(
-            "Rhino did not become reachable within %ds; shutting down MCP server.",
-            _HEARTBEAT_STARTUP_MAX_WAIT,
-        )
-        os._exit(0)
-    
-    # Phase 2: Monitor — exit if Rhino goes away
-    consecutive_fails = 0
+    logger.info("Heartbeat: monitoring Rhino on %s:%d (status only, no auto-exit).", host, port)
+    was_reachable = None
     while True:
-        time.sleep(_HEARTBEAT_INTERVAL)
         try:
             with socket.create_connection((host, port), timeout=3):
                 pass
-            consecutive_fails = 0
+            reachable = True
         except OSError:
-            consecutive_fails += 1
-            logger.warning(
-                "Rhino heartbeat failed (%d/%d)",
-                consecutive_fails, _HEARTBEAT_MAX_FAILS,
+            reachable = False
+        if reachable != was_reachable:
+            logger.info(
+                "Heartbeat: Rhino %s.",
+                "reachable" if reachable else "not reachable (server staying alive)",
             )
-            if consecutive_fails >= _HEARTBEAT_MAX_FAILS:
-                logger.error(
-                    "Rhino unreachable for %ds — shutting down MCP server.",
-                    _HEARTBEAT_INTERVAL * _HEARTBEAT_MAX_FAILS,
-                )
-                os._exit(0)  # hard exit — clean shutdown not possible from a thread
+            was_reachable = reachable
+        time.sleep(_HEARTBEAT_INTERVAL)
 
 _heartbeat_thread = threading.Thread(target=_rhino_heartbeat_loop, daemon=True)
 _heartbeat_thread.start()
@@ -450,7 +431,7 @@ class TransformObjectsInput(BaseModel):
             "Example: [{type:'move', translation:[3000,0,0]}, {type:'array', count_x:4, spacing_x:8000}]."
         ),
     )
-    copy: bool = False
+    copy_objects: bool = Field(False, alias="copy")
     translation: Optional[list[float]] = None
     angle_degrees: Optional[float] = None
     center: Optional[list[float]] = None
@@ -542,7 +523,7 @@ class DeriveFloorsFromMassInput(BaseModel):
 
 
 class CreateCoreInput(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
     boundary: list[list[float]] = Field(..., min_length=3)
     height: float = Field(default=3000, gt=0)
     z_level: Optional[float] = None
@@ -627,6 +608,25 @@ class ValidateInput(BaseModel):
     object_ids: list[str] = Field(default_factory=list)
 
 
+class DetectClashesInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    object_ids: list[str] = Field(default_factory=list, description="Scope to these objects (GUIDs or selectors like 'by_layer:Name'); empty = every solid in the scene.")
+    layer: Optional[str] = Field(default=None, description="Restrict the scope to objects on this layer.")
+    tolerance: Optional[float] = Field(default=None, description="Intersection tolerance in model units; defaults to the document absolute tolerance.")
+    max_checks: int = Field(default=1500, ge=1, le=20000, description="Cap on Brep-Brep narrow-phase tests after the RTree broad phase.")
+    include_touching: bool = Field(default=True, description="Include surface-touching contacts, not just hard solid interpenetrations.")
+    solid_overlap: bool = Field(default=True, description="Classify hard interpenetration vs touch via boolean-intersection volume (a bit slower).")
+
+
+class SemanticSelectInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    type: Optional[str] = Field(default=None, description="Element type: wall, slab, column, core, facade, opening (windows/doors), stair, massing, or 'all'.")
+    level: Optional[int] = Field(default=None, description="Level index to filter to (from analyze_architecture / get_level_summary).")
+    orientation: Optional[str] = Field(default=None, description="Facing direction: N, NE, E, SE, S, SW, W, NW (or words like 'south'). +Y is treated as North.")
+    select: bool = Field(default=True, description="Also select the matching objects in Rhino.")
+    clear_selection: bool = Field(default=True, description="Clear the current selection first (when select=True).")
+
+
 class DeleteInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     object_ids: list[str] = Field(..., description="GUIDs to delete, or selectors: 'all', 'by_layer:Layer', 'by_name:Pattern', 'selected'.")
@@ -664,6 +664,7 @@ class CaptureInput(BaseModel):
     annotate: bool = Field(default=False, description="Include structured capture annotations: selected labels, bounding boxes, and layer colors.")
     annotation_scope: str = Field(default="selected", description="'selected' or 'visible'. Visible is capped by max_annotations.")
     max_annotations: int = Field(default=20, ge=0, le=200)
+    as_json: bool = Field(default=False, description="Return the full JSON payload (base64 + metadata) instead of MCP image content. For clients that cannot render image blocks.")
 
 
 class InspectionCaptureInput(CaptureInput):
@@ -899,9 +900,8 @@ class RunCommandInput(BaseModel):
 # Capabilities Resource --------------------------------------------------
 # Long-tail commands (still callable inside `batch`) and discoverable workflows.
 CAPABILITIES: dict[str, Any] = {
-    "version": "4.8.0",
-    "phase": "1+2+3+4+5+6+7",
-    "tool_count": 115,
+    # "version", "tool_count", "tool_profile" and "plugin_commands" are filled in
+    # dynamically by the capabilities() resource - never hand-edit counts here.
     "protocol_5": {
         "multiplex": "request_id-matched responses; reads/ping/cancel answer while long commands run",
         "idempotent_retry": "re-sent request_ids replay cached results instead of re-executing",
@@ -1008,14 +1008,27 @@ CAPABILITIES: dict[str, Any] = {
 
 # Resource --------------------------------------------------
 @mcp.resource("rhino://capabilities")
-def capabilities() -> str:
+async def capabilities() -> str:
     """Long-tail capabilities, examples, legacy command names, preferred workflows.
 
     Resources are returned as serialized text; this one ships as JSON for easy parsing.
+    Version, tool count and profile are computed - never hand-maintained. When Rhino
+    is reachable, plugin_commands is fetched live from the plugin dispatch table
+    (list_commands) so it can never drift from the actual C# registry.
     """
     caps = dict(CAPABILITIES)
+    caps["version"] = _VERSION
+    caps["tool_profile"] = _TOOL_PROFILE
+    caps["tool_count"] = _exposed_tool_count()
     caps["safe_mode"] = _SAFE_MODE
     caps["safe_mode_blocked_tools"] = sorted(_SAFE_MODE_BLOCKED)
+    try:
+        live = await _exec_simple("list_commands", {})
+        if live.get("status") == "ok" and live.get("commands"):
+            caps["plugin_commands"] = live["commands"]
+            caps["plugin_commands_source"] = "live (plugin dispatch table)"
+    except Exception:
+        pass  # Rhino not running - the static legacy list below still applies.
     return orjson.dumps(caps).decode("utf-8")
 
 
@@ -1054,7 +1067,8 @@ async def ping(params: Optional[Empty] = None) -> dict:
         data["capabilities_resource"] = "rhino://capabilities"
         data["safe_mode"] = _SAFE_MODE
         data["mcp_python"] = _sys.executable
-        data["mcp_version"] = "4.8.0"
+        data["mcp_version"] = _VERSION
+        data["tool_profile"] = _TOOL_PROFILE
         # Check optional dependencies without importing them. Importing cv2/numpy during
         # a health check can be surprisingly slow on Windows and made MCP ping appear hung.
         dep_status = {}
@@ -1135,7 +1149,7 @@ async def transform_objects(params: TransformObjectsInput) -> dict:
     each op's output object_ids feed the next, so you can move-then-array in a single call.
 
     Selectors: 'selected', 'all', 'last_created', 'by_layer:Wall', 'by_name:Floor*', or GUIDs."""
-    return await _exec_simple("transform_objects", params.model_dump(exclude_none=True))
+    return await _exec_simple("transform_objects", params.model_dump(exclude_none=True, by_alias=True))
 
 
 @mcp.tool(name="modify_object", annotations=WR)
@@ -1266,6 +1280,25 @@ async def validate_objects(params: ValidateInput) -> dict:
     return await _exec_simple("validate_objects", params.model_dump())
 
 
+@mcp.tool(name="detect_clashes", annotations=RO)
+async def detect_clashes(params: DetectClashesInput) -> dict:
+    """Real clash / coordination check. Broad phase: an RTree over bounding boxes finds candidate
+    pairs; narrow phase: a true Brep-Brep intersection (not just bbox overlap) with tolerance
+    confirms real contact. Returns each clashing pair with a contact point, intersection length,
+    and kind ('overlap' = hard interpenetration, 'touch'/'intersect' = surfaces meet). Scope with
+    object_ids/layer; empty scope checks every solid in the scene."""
+    return await _exec_simple("detect_clashes", params.model_dump(exclude_none=True))
+
+
+@mcp.tool(name="select_by_semantic", annotations=RO)
+async def select_by_semantic(params: SemanticSelectInput) -> dict:
+    """Semantic selection by type + level + facing orientation -- e.g. 'all south-facing windows on
+    level 3' is type='opening', level=3, orientation='S'. Orientation is derived from each element's
+    geometry (largest near-vertical face normal); +Y is treated as North. Optionally selects the
+    matches in Rhino and always returns their ids with type/level/orientation."""
+    return await _exec_simple("select_by_semantic", params.model_dump(exclude_none=True))
+
+
 # Viewport --------------------------------------------------
 
 @mcp.tool(name="capture_viewport", annotations=RO)
@@ -1277,21 +1310,26 @@ async def capture_viewport(params: CaptureInput) -> Any:
     capture, so inspecting the model from any angle never disrupts the user's current view.
     Pass view='Top' and/or display_mode= to temporarily switch before capturing.
     For explicit camera overrides, either use capture_inspection_view or pass
-    view={location:[x,y,z], target:[x,y,z], projection:'parallel|perspective'}."""
+    view={location:[x,y,z], target:[x,y,z], projection:'parallel|perspective'}.
+    Pass as_json=true to get the base64 JSON payload instead of MCP image content."""
     payload = params.model_dump(exclude_none=True)
+    as_json = payload.pop("as_json", False)
     if isinstance(payload.get("view"), dict):
         view_payload = payload.pop("view")
         payload.update(view_payload)
         result = await _exec_simple("capture_inspection_view", payload)
     else:
         result = await _exec_simple("capture_viewport", payload)
-    return _as_mcp_image(result)
+    return result if as_json else _as_mcp_image(result)
 
 
 @mcp.tool(name="capture_viewport_json", annotations=RO)
 async def capture_viewport_json(params: CaptureInput) -> dict:
-    """Capture the viewport and return the full JSON payload with base64 + metadata."""
+    """Capture the viewport and return the full JSON payload with base64 + metadata.
+
+    Alias for capture_viewport(as_json=true) - kept for backward compatibility (full profile only)."""
     payload = params.model_dump(exclude_none=True)
+    payload.pop("as_json", None)
     if isinstance(payload.get("view"), dict):
         view_payload = payload.pop("view")
         payload.update(view_payload)
@@ -1303,6 +1341,7 @@ async def capture_viewport_json(params: CaptureInput) -> dict:
 async def get_viewport_image(params: CaptureInput) -> Any:
     """McNeel-compatible viewport capture: returns metadata text plus an image content block."""
     payload = params.model_dump(exclude_none=True)
+    payload.pop("as_json", None)
     if isinstance(payload.get("view"), dict):
         view_payload = payload.pop("view")
         payload.update(view_payload)
@@ -1314,15 +1353,23 @@ async def get_viewport_image(params: CaptureInput) -> Any:
 
 @mcp.tool(name="capture_inspection_view", annotations=RO)
 async def capture_inspection_view(params: InspectionCaptureInput) -> Any:
-    """Temporarily inspect from a requested camera, return an image, then restore the viewport."""
-    result = await _exec_simple("capture_inspection_view", params.model_dump(exclude_none=True))
-    return _as_mcp_image(result)
+    """Temporarily inspect from a requested camera, return an image, then restore the viewport.
+
+    Pass as_json=true to get the base64 JSON payload instead of MCP image content."""
+    payload = params.model_dump(exclude_none=True)
+    as_json = payload.pop("as_json", False)
+    result = await _exec_simple("capture_inspection_view", payload)
+    return result if as_json else _as_mcp_image(result)
 
 
 @mcp.tool(name="capture_inspection_view_json", annotations=RO)
 async def capture_inspection_view_json(params: InspectionCaptureInput) -> dict:
-    """Inspection capture with full JSON metadata instead of image-only content."""
-    return await _exec_simple("capture_inspection_view", params.model_dump(exclude_none=True))
+    """Inspection capture with full JSON metadata instead of image-only content.
+
+    Alias for capture_inspection_view(as_json=true) - kept for backward compatibility (full profile only)."""
+    payload = params.model_dump(exclude_none=True)
+    payload.pop("as_json", None)
+    return await _exec_simple("capture_inspection_view", payload)
 
 
 @mcp.tool(name="capture_review_set", annotations=RO)
@@ -1410,12 +1457,17 @@ async def compare_before_after(params: BeforeAfterInput) -> Any:
     see the result, and get a coarse pixel-change score in one tool call.
     """
     capture_params = params.capture.model_dump(exclude_none=True)
+    capture_params.pop("as_json", None)
     capture_params["restore_state"] = True
     before = await _exec_simple("capture_viewport", capture_params)
     raw_commands = [c.model_dump() for c in params.commands]
     batch_result = await _exec_batch(raw_commands, atomic=params.atomic, stop_on_error=params.stop_on_error)
     after = await _exec_simple("capture_viewport", capture_params)
-    diff = _compare_base64_images(before.get("image_base64"), after.get("image_base64"))
+    # cv2 decode/diff is CPU-bound - run off the event loop so concurrent
+    # protocol-5 calls (ping, reads) stay responsive.
+    diff = await asyncio.to_thread(
+        _compare_base64_images, before.get("image_base64"), after.get("image_base64")
+    )
     batch_ok = batch_result.get("status") == "ok"
     rolled_back = bool(batch_result.get("rolled_back"))
 
@@ -1734,7 +1786,7 @@ async def run_command(params: RunCommandInput) -> dict:
 # =============================================================================
 
 @mcp.tool(name="create_section", annotations=WR)
-async def create_section(label: str = "", start_x: float = None, start_y: float = None, start_z: float = None, end_x: float = None, end_y: float = None, end_z: float = None, view_side: str = "left") -> dict:
+async def create_section(label: str = "", start_x: Optional[float] = None, start_y: Optional[float] = None, start_z: Optional[float] = None, end_x: Optional[float] = None, end_y: Optional[float] = None, end_z: Optional[float] = None, view_side: str = "left") -> dict:
     """Create an architectural section line with arrowheads on a dedicated layer. The model will place a default section line at the model center — reposition it and call cut_section when satisfied."""
     params = {"view_side": view_side}
     if label: params["label"] = label
@@ -1744,7 +1796,7 @@ async def create_section(label: str = "", start_x: float = None, start_y: float 
 
 
 @mcp.tool(name="create_elevation", annotations=WR)
-async def create_elevation(label: str = "", direction: str = "north", offset: float = None) -> dict:
+async def create_elevation(label: str = "", direction: str = "north", offset: Optional[float] = None) -> dict:
     """Create an elevation marker for the specified direction (north/south/east/west)."""
     params = {"direction": direction}
     if label: params["label"] = label
@@ -1783,7 +1835,7 @@ async def list_sections() -> dict:
 
 
 @mcp.tool(name="update_section", annotations=WR)
-async def update_section(label: str, start_x: float = None, start_y: float = None, start_z: float = None, end_x: float = None, end_y: float = None, end_z: float = None) -> dict:
+async def update_section(label: str, start_x: Optional[float] = None, start_y: Optional[float] = None, start_z: Optional[float] = None, end_x: Optional[float] = None, end_y: Optional[float] = None, end_z: Optional[float] = None) -> dict:
     """Reposition an existing section line and re-cut."""
     params = {"label": label}
     if start_x is not None: params["start_point"] = {"x": start_x, "y": start_y or 0, "z": start_z or 0}
@@ -1802,15 +1854,15 @@ async def remove_section(label: str) -> dict:
 # =============================================================================
 
 @mcp.tool(name="create_display_mode", annotations=WR)
-async def create_display_mode(name: str, preset: str = "", base_mode: str = "", background_color: str = "", edge_color: str = "", edge_thickness: int = -1, silhouette_thickness: int = -1, show_edges: bool = None, show_silhouettes: bool = None, shading_enabled: bool = None) -> dict:
+async def create_display_mode(name: str, preset: str = "", base_mode: str = "", background_color: str = "", edge_color: str = "", edge_thickness: Optional[int] = None, silhouette_thickness: Optional[int] = None, show_edges: Optional[bool] = None, show_silhouettes: Optional[bool] = None, shading_enabled: Optional[bool] = None) -> dict:
     """Create a custom Rhino display mode for illustration. Presets: diagram, technical, blueprint, sketch, axonometric, atmospheric, monochrome, cutaway."""
     params = {"name": name}
     if preset: params["preset"] = preset
     if base_mode: params["base_mode"] = base_mode
     if background_color: params["background_color"] = background_color
     if edge_color: params["edge_color"] = edge_color
-    if edge_thickness >= 0: params["edge_thickness"] = edge_thickness
-    if silhouette_thickness >= 0: params["silhouette_thickness"] = silhouette_thickness
+    if edge_thickness is not None: params["edge_thickness"] = edge_thickness
+    if silhouette_thickness is not None: params["silhouette_thickness"] = silhouette_thickness
     if show_edges is not None: params["show_edges"] = show_edges
     if show_silhouettes is not None: params["show_silhouettes"] = show_silhouettes
     if shading_enabled is not None: params["shading_enabled"] = shading_enabled
@@ -1830,13 +1882,13 @@ async def list_display_modes() -> dict:
 
 
 @mcp.tool(name="adjust_display_mode", annotations=WR)
-async def adjust_display_mode(name: str, background_color: str = "", edge_color: str = "", edge_thickness: int = -1, silhouette_thickness: int = -1) -> dict:
+async def adjust_display_mode(name: str, background_color: str = "", edge_color: str = "", edge_thickness: Optional[int] = None, silhouette_thickness: Optional[int] = None) -> dict:
     """Adjust parameters of an existing custom AI display mode."""
     params = {"name": name}
     if background_color: params["background_color"] = background_color
     if edge_color: params["edge_color"] = edge_color
-    if edge_thickness >= 0: params["edge_thickness"] = edge_thickness
-    if silhouette_thickness >= 0: params["silhouette_thickness"] = silhouette_thickness
+    if edge_thickness is not None: params["edge_thickness"] = edge_thickness
+    if silhouette_thickness is not None: params["silhouette_thickness"] = silhouette_thickness
     return await _exec_simple("adjust_display_mode", params)
 
 
@@ -1925,17 +1977,17 @@ async def download_material(asset_id: str, layer_name: str, resolution: str = "2
 
 
 @mcp.tool(name="edit_material", annotations=WR)
-async def edit_material(layer_name: str = "", material_name: str = "", roughness: float = -1, metallic: float = -1, diffuse_color: str = "", transparency: float = -1, texture_scale: float = -1, texture_rotation: float = -361) -> dict:
+async def edit_material(layer_name: str = "", material_name: str = "", roughness: Optional[float] = None, metallic: Optional[float] = None, diffuse_color: str = "", transparency: Optional[float] = None, texture_scale: Optional[float] = None, texture_rotation: Optional[float] = None) -> dict:
     """Edit properties of an existing Rhino render material on a layer."""
     params = {}
     if layer_name: params["layer_name"] = layer_name
     if material_name: params["material_name"] = material_name
-    if roughness >= 0: params["roughness"] = roughness
-    if metallic >= 0: params["metallic"] = metallic
+    if roughness is not None: params["roughness"] = roughness
+    if metallic is not None: params["metallic"] = metallic
     if diffuse_color: params["diffuse_color"] = diffuse_color
-    if transparency >= 0: params["transparency"] = transparency
-    if texture_scale > 0: params["texture_scale"] = texture_scale
-    if texture_rotation > -361: params["texture_rotation"] = texture_rotation
+    if transparency is not None: params["transparency"] = transparency
+    if texture_scale is not None: params["texture_scale"] = texture_scale
+    if texture_rotation is not None: params["texture_rotation"] = texture_rotation
     return await _exec_simple("edit_material", params)
 
 
@@ -1946,11 +1998,11 @@ async def list_materials() -> dict:
 
 
 @mcp.tool(name="get_material", annotations=RO)
-async def get_material(layer_name: str = "", material_index: int = -1) -> dict:
+async def get_material(layer_name: str = "", material_index: Optional[int] = None) -> dict:
     """Get full properties of a render material by layer name or material index."""
     params = {}
     if layer_name: params["layer_name"] = layer_name
-    if material_index >= 0: params["material_index"] = material_index
+    if material_index is not None: params["material_index"] = material_index
     return await _exec_simple("get_material", params)
 
 
@@ -1991,7 +2043,7 @@ async def get_pdf_info(pdf_path: str) -> dict:
     """
     try:
         from rhino_architect.pdf_tracer import get_pdf_info as _info
-        return _info(pdf_path)
+        return await asyncio.to_thread(_info, pdf_path)
     except ImportError as e:
         return {"error": str(e)}
 
@@ -2006,7 +2058,7 @@ async def preview_pdf_page(pdf_path: str, page_number: int = 0) -> Any:
     """
     try:
         from rhino_architect.pdf_tracer import render_page_preview
-        b64 = render_page_preview(pdf_path, page_number)
+        b64 = await asyncio.to_thread(render_page_preview, pdf_path, page_number)
         if b64:
             return Image(data=base64.b64decode(b64), format="png")
         return {"error": "Could not render page"}
@@ -2019,7 +2071,7 @@ async def preview_pdf_page_json(pdf_path: str, page_number: int = 0) -> dict:
     """Render a PDF page and return base64 JSON metadata instead of MCP image content."""
     try:
         from rhino_architect.pdf_tracer import render_page_preview
-        b64 = render_page_preview(pdf_path, page_number)
+        b64 = await asyncio.to_thread(render_page_preview, pdf_path, page_number)
         if b64:
             return {"status": "ok", "page": page_number, "image_base64": b64, "format": "png",
                     "note": "Render the image to confirm the page looks correct before tracing."}
@@ -2074,8 +2126,11 @@ async def trace_pdf(
             "note": "This is NOT your system Python or Codex Python — it\'s the MCP bridge\'s own venv."
         }
 
-    # Step 1: Extract geometry in Python
-    trace_result = _trace(
+    # Step 1: Extract geometry in Python. The CV pipeline (PyMuPDF + OpenCV) is
+    # CPU-bound and can run for many seconds - run it off the event loop so the
+    # MCP server (ping, concurrent tool calls) stays responsive.
+    trace_result = await asyncio.to_thread(
+        _trace,
         pdf_path=pdf_path,
         page_number=page_number,
         dpi=dpi,
@@ -2375,7 +2430,7 @@ async def batch_preview(commands: list[dict]) -> dict:
 
     Checks each step:
       - Is it a known command?
-      - Are  paths (, .object_ids, .object_ids[0]) forward-reference-free?
+      - Are $N reference paths ($1, $1.object_ids, $1.object_ids[0]) forward-reference-free?
       - Are there destructive commands that need extra care?
       - Which steps involve viewport captures (consider capture_at_end)?
 
@@ -2504,9 +2559,9 @@ async def revolve_profile(params: RevolveProfileInput) -> dict:
 
 class LayerEntry(BaseModel):
     path: str = Field(description="Layer path using :: separator (e.g. 'Building::Walls::Exterior')")
-    color: list[int] = Field(default=None, description="RGB color [r,g,b] for the leaf layer")
-    visible: bool = Field(default=None, description="Layer visibility")
-    material: dict = Field(default=None, description="PBR material dict: {base_color, roughness, metallic, opacity}")
+    color: Optional[list[int]] = Field(default=None, description="RGB color [r,g,b] for the leaf layer")
+    visible: Optional[bool] = Field(default=None, description="Layer visibility")
+    material: Optional[dict] = Field(default=None, description="PBR material dict: {base_color, roughness, metallic, opacity}")
 
 
 @mcp.tool(name="create_layer_tree", annotations=WR)
@@ -2538,11 +2593,13 @@ async def thumbnail(
     height: int = 360,
     quality: int = 75,
     wireframe: bool = False,
+    as_json: bool = False,
 ) -> Any:
     """Capture a viewport thumbnail for design QA. Returns base64 JPEG.
 
     Default mode is Shaded (wireframe=False) at 480x360 for readable design checks.
     Set wireframe=True for fastest capture (<1s) at the cost of visual detail.
+    Set as_json=True to get the JSON/base64 payload instead of MCP image content.
 
     Returns image_base64, camera info, and visible object count.
     Call this after major modeling steps to verify geometry, materials, and layout.
@@ -2551,7 +2608,7 @@ async def thumbnail(
         "width": width, "height": height,
         "quality": quality, "wireframe": wireframe,
     })
-    return _as_mcp_image(result, key="image_base64", default_format="jpeg")
+    return result if as_json else _as_mcp_image(result, key="image_base64", default_format="jpeg")
 
 
 @mcp.tool(name="thumbnail_json", annotations=RO)
@@ -2576,7 +2633,7 @@ async def thumbnail_json(
 async def export_objects(
     format: str = "stl",
     path: str = "",
-    object_ids: list[str] = None,
+    object_ids: Optional[list[str]] = None,
 ) -> dict:
     """Export geometry to a file. Supports STL, OBJ, STEP, IGES, 3DM.
 
@@ -2674,6 +2731,97 @@ async def get_recovery_log(limit: int = 50) -> dict:
     restarted since the last write.
     """
     return await _exec_simple("get_recovery_log", {"limit": limit})
+
+
+# =============================================================================
+# TOOL PROFILES (RHINO_TOOLS=lean|standard|full)
+# =============================================================================
+# The plugin's full command vocabulary stays callable through `batch` regardless
+# of profile - profiles only control which tools are ADVERTISED to the MCP
+# client, which is what costs context and dilutes tool selection.
+#
+#   lean     ~21 tools - small/local models (Ollama), minimal context
+#   standard ~65 tools - daily-driver surface for Claude/GPT class models (default)
+#   full     everything, including *_json twins and McNeel-compat aliases
+
+_LEAN_TOOLS: frozenset[str] = frozenset({
+    "ping", "query_scene", "create_object", "transform_objects", "modify_object",
+    "delete_objects", "batch", "execute_script", "capture_viewport", "set_view",
+    "set_display_mode", "set_camera", "undo", "create_layer",
+    "batch_layer_visibility", "select_objects", "measure_object", "report_areas",
+    "save_checkpoint", "restore_checkpoint", "get_log",
+})
+
+_STANDARD_TOOLS: frozenset[str] = _LEAN_TOOLS | frozenset({
+    # Architect intelligence
+    "derive_floors_from_mass", "create_core", "place_openings_on_facade",
+    "setup_arch_layers", "create_layer_tree",
+    # Semantic analysis & QA
+    "analyze_architecture", "get_level_summary", "select_by_semantic",
+    "detect_clashes", "validate_objects",
+    # Vision loop
+    "capture_review_set", "capture_inspection_view", "compare_before_after",
+    "thumbnail",
+    # Geometry
+    "boolean_operation", "extrude_curve", "loft_surface", "revolve_profile",
+    # Sections & plans
+    "create_section", "cut_section", "create_plan", "create_all_plans",
+    "list_sections",
+    # Materials
+    "set_pbr_material", "list_materials", "search_materials", "download_material",
+    # Import & tracing
+    "import_dwg", "trace_pdf", "get_pdf_info",
+    # Design memory
+    "set_design_brief", "get_design_brief", "add_design_rule", "search_memory",
+    # Scene sync & state
+    "get_scene_diff", "set_state", "get_state",
+    # Safety & ops
+    "batch_preview", "list_checkpoints", "cancel_operation", "export_objects",
+    # Escape hatches
+    "execute_python3", "run_command", "get_rhino_commands",
+})
+
+
+def _exposed_tool_count() -> int:
+    try:
+        return len(mcp._tool_manager._tools)
+    except AttributeError:  # FastMCP internals moved - fall back to "unknown"
+        return -1
+
+
+def _apply_tool_profile() -> str:
+    """Prune the FastMCP tool registry down to the selected profile.
+
+    Anything pruned here is still executable through `batch` (the plugin dispatch
+    table is unaffected) and is documented in the rhino://capabilities resource.
+    """
+    profile = os.environ.get("RHINO_TOOLS", "standard").strip().lower()
+    if profile not in ("lean", "standard", "full"):
+        logger.warning("Unknown RHINO_TOOLS=%r - using 'standard'. Valid: lean|standard|full.", profile)
+        profile = "standard"
+    if profile == "full":
+        logger.info("Tool profile 'full': all %d tools exposed.", _exposed_tool_count())
+        return profile
+    allowed = _LEAN_TOOLS if profile == "lean" else _STANDARD_TOOLS
+    try:
+        tools = mcp._tool_manager._tools
+    except AttributeError:
+        logger.warning("FastMCP tool registry not found - exposing all tools (profile ignored).")
+        return "full"
+    unknown = allowed - set(tools)
+    if unknown:  # typo guard: profile names must match registered tools
+        logger.warning("Profile lists unregistered tool names (ignored): %s", sorted(unknown))
+    pruned = [name for name in list(tools) if name not in allowed]
+    for name in pruned:
+        del tools[name]
+    logger.info(
+        "Tool profile '%s': %d tools exposed, %d pruned (still callable via batch; set RHINO_TOOLS=full to restore).",
+        profile, len(tools), len(pruned),
+    )
+    return profile
+
+
+_TOOL_PROFILE = _apply_tool_profile()
 
 
 # =============================================================================
