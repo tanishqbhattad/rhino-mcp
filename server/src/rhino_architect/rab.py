@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 # rab - Rhino Architect Bridge helper library.
 # Auto-deployed to %LOCALAPPDATA%\AIBridge\rab.py by the MCP server and
 # auto-imported into every execute_script call. IronPython 2 compatible:
@@ -45,7 +46,7 @@ def _sid(guid):
     return str(guid)
 
 
-# ── Layers ───────────────────────────────────────────────────────────────
+# --- Layers ---------------------------------------------------------------
 
 def layer(path, color=None):
     """Ensure a layer exists (nested via ::). Returns the path."""
@@ -66,7 +67,7 @@ def _assign(guid, layer_path, name):
     return gid
 
 
-# ── Creation ─────────────────────────────────────────────────────────────
+# --- Creation -------------------------------------------------------------
 
 def box(origin, dx, dy, dz, layer_path=None, name=None):
     """Axis-aligned box from min corner. Returns guid str."""
@@ -132,7 +133,7 @@ def grid(origin, nx, ny, sx, sy):
     return out
 
 
-# ── Query & edit ─────────────────────────────────────────────────────────
+# --- Query & edit -----------------------------------------------------------
 
 def ids_on(layer_path):
     """Guid strings of all objects on a layer (empty list if no layer)."""

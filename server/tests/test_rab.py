@@ -28,6 +28,10 @@ def test_rab_source_is_ironpython2_safe():
                 assert arg.annotation is None, f"type hint on {node.name}({arg.arg})"
         assert not isinstance(node, ast.AnnAssign), "annotated assignment - IronPython 2 unsafe"
     assert "encoding=" not in src, "py3-only open(encoding=) kwarg - use io.open"
+    # IronPython 2 rejects non-ASCII source bytes (found live: box-drawing chars
+    # in comments broke the import). Keep the file pure ASCII.
+    bad = [(i + 1, ch) for i, l in enumerate(src.splitlines()) for ch in l if ord(ch) > 127]
+    assert not bad, f"non-ASCII characters (IronPython 2 unsafe): {bad[:5]}"
 
 
 def test_bootstrap_parses_and_is_idempotent_marker():

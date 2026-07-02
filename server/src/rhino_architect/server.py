@@ -165,8 +165,9 @@ _RAB_BOOTSTRAP = (
     "try:\n"
     "    import rab\n"
     "    rab = reload(rab)\n"
-    "except Exception:\n"
+    "except Exception as _raberr:\n"
     "    rab = None\n"
+    "    print('[rab] helper import failed: %s' % _raberr)\n"
 )
 
 mcp = FastMCP("RhinoAIBridge")
