@@ -2,7 +2,7 @@
 RhinoAIBridge v4.6 -- Test Suite (offline, no Rhino needed)
 Run: cd server && uv run pytest tests/ -v
 """
-import json, re, struct, gzip, pytest
+import json, re, struct, gzip
 from rhino_architect import material_downloader
 
 # -- Wire protocol helpers --

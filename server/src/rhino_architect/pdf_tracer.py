@@ -415,7 +415,6 @@ def _extract_vector_text(page, page_h_pt, img_h, dpi, model_unit):
         text_dict = page.get_text("dict")
     except Exception:
         return elements
-    factor = (25.4 / dpi) / _UNIT_TO_MM.get(model_unit, 1.0)
     scale = dpi / 72.0
     for block in text_dict.get("blocks", []):
         if block.get("type") != 0:

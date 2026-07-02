@@ -59,7 +59,7 @@ def check_deps():
     except ImportError:
         fail("mcp not installed -- run: uv sync")
     try:
-        import orjson
+        import orjson  # noqa: F401 - availability probe
         ok("orjson installed")
     except ImportError:
         fail("orjson not installed -- run: uv sync")
@@ -182,8 +182,8 @@ def main():
     check_claude_config()
 
     print(f"\n{BOLD}{'='*54}{RESET}")
-    print(f"  Run this after any install issue to get exact fix steps.")
-    print(f"  Docs: https://github.com/tanishqbhattad/rhino-mcp")
+    print("  Run this after any install issue to get exact fix steps.")
+    print("  Docs: https://github.com/tanishqbhattad/rhino-mcp")
     print(f"{BOLD}{'='*54}{RESET}\n")
 
 if __name__ == "__main__":

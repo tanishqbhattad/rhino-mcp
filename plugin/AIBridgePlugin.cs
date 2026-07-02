@@ -13,6 +13,12 @@ namespace RhinoAIBridge
         public AIBridgePlugin() { Instance = this; }
         public static AIBridgePlugin Instance { get; private set; }
 
+        // v4.10: load with Rhino instead of on first command use, so the bridge's
+        // auto-start (OnIdle below) makes the TCP server available the moment Rhino
+        // is open - no manual AIBridge command needed. Mode comes from
+        // RHINO_AIBRIDGE_MODE (safe|standard|developer), default Safe.
+        public override PlugInLoadTime LoadTime => PlugInLoadTime.AtStartup;
+
         protected override LoadReturnCode OnLoad(ref string errorMessage)
         {
             // Install the COM message filter on Rhino's main STA thread up front. The

@@ -39,5 +39,7 @@ jobs:
           src/rhino_architect/doctor.py
           src/rhino_architect/validation.py
           chat.py
+      - name: Lint (ruff - real-bug rules only)
+        run: uv --directory server run --frozen ruff check src tests ../evals
       - name: Tests
         run: uv --directory server run --frozen python -m pytest -q

@@ -24,7 +24,6 @@ import asyncio
 import base64
 import importlib.metadata
 import importlib.util
-import json
 import logging
 import os
 import orjson
@@ -34,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -121,6 +121,54 @@ def _rhino_heartbeat_loop():
 _heartbeat_thread = threading.Thread(target=_rhino_heartbeat_loop, daemon=True)
 _heartbeat_thread.start()
 
+
+# rab helper library --------------------------------------------------
+# A small IronPython-2-compatible helper module (rab.py) is deployed next to the
+# auth token and auto-imported into every execute_script call, so the model can
+# write `rab.wall(...)` instead of 50 lines of rhinoscriptsyntax boilerplate.
+# Disable with RHINO_RAB=0.
+_RAB_ENABLED = os.environ.get("RHINO_RAB", "1").strip().lower() not in ("0", "false", "no")
+
+
+def _aibridge_dir() -> Path:
+    """Same per-user directory the auth token lives in (mirrors protocol.py)."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    else:
+        base = str(Path.home() / ".config")
+    return Path(base) / "AIBridge"
+
+
+def _deploy_rab() -> None:
+    """Copy the packaged rab.py into the AIBridge dir so IronPython can import it."""
+    try:
+        src = Path(__file__).with_name("rab.py").read_text(encoding="utf-8")
+        dst = _aibridge_dir() / "rab.py"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists() or dst.read_text(encoding="utf-8") != src:
+            dst.write_text(src, encoding="utf-8")
+            logger.info("rab helper library deployed to %s", dst)
+    except Exception as e:
+        logger.warning("Could not deploy rab.py: %s", e)
+
+
+if _RAB_ENABLED:
+    _deploy_rab()
+
+# Prepended to every execute_script payload (after the plugin's own rs/sc preamble).
+# reload() keeps the in-Rhino copy fresh when the server ships a newer rab.py.
+_RAB_BOOTSTRAP = (
+    "import sys as _rabsys, os as _rabos\n"
+    "_rabdir = _rabos.path.join(_rabos.environ.get('LOCALAPPDATA') or _rabos.path.expanduser('~/.config'), 'AIBridge')\n"
+    "if _rabdir not in _rabsys.path:\n"
+    "    _rabsys.path.insert(0, _rabdir)\n"
+    "try:\n"
+    "    import rab\n"
+    "    rab = reload(rab)\n"
+    "except Exception:\n"
+    "    rab = None\n"
+)
+
 mcp = FastMCP("RhinoAIBridge")
 
 
@@ -133,6 +181,11 @@ async def _exec(command: str, params: dict[str, Any]) -> dict:
     return resp.result
 
 
+# Opt-in per-call timing: RHINO_TIMING=1 adds elapsed_ms to every response.
+# Off by default to keep responses token-lean.
+_TIMING = os.environ.get("RHINO_TIMING", "").strip().lower() in ("1", "true", "yes")
+
+
 async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
     """Execute a command and return the raw result dict.
 
@@ -143,6 +196,7 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
     blocked = _check_safe_mode(command)
     if blocked:
         return blocked
+    t0 = time.perf_counter() if _TIMING else 0.0
     try:
         conn = await get_connection()
         resp = await conn.send_command(command, params)
@@ -160,6 +214,8 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
         result.setdefault("status", "ok")
         if resp.scene_version is not None and "scene_version" not in result:
             result["scene_version"] = resp.scene_version
+        if _TIMING:
+            result["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         return result
     except RhinoConnectionError as e:
         return {
@@ -352,6 +408,14 @@ async def _exec_batch(
             blocked["batch_index"] = i
             blocked["op_index"] = i + 1
             return blocked
+        # Script sub-ops get the same rab bootstrap as the standalone tool.
+        if _RAB_ENABLED and tool_name in ("execute_script", "run_python"):
+            sub = command.get("params")
+            if isinstance(sub, dict):
+                code = sub.get("code") or sub.get("script")
+                if isinstance(code, str) and not code.startswith(_RAB_BOOTSTRAP):
+                    sub.pop("script", None)
+                    sub["code"] = _RAB_BOOTSTRAP + code
     try:
         conn = await get_connection()
         resp = await conn.send_batch(commands, atomic=atomic, stop_on_error=stop_on_error)
@@ -1625,7 +1689,15 @@ async def delete_objects(params: DeleteInput) -> dict:
 async def execute_script(params: ScriptInput) -> dict:
     """Run arbitrary Python inside Rhino. Powerful escape hatch — prefer structured tools.
 
-    Auto-imported preamble: rhinoscriptsyntax as rs, scriptcontext as sc, Rhino, System.
+    Auto-imported preamble: rhinoscriptsyntax as rs, scriptcontext as sc, Rhino, System,
+    and `rab` — a concise helper library. PREFER rab for common elements:
+      rab.wall((0,0,0), (12000,0,0), height=3000, thickness=200)
+      rab.slab([(0,0),(30000,0),(30000,18000),(0,18000)], thickness=250, z=3600)
+      for pt in rab.grid((0,0), 4, 3, 8400, 8400): rab.column(pt, h=3600)
+      rab.extrude(points, height, z=0, layer_path=...)   # closed profile -> solid
+      rab.ids_on("Wall"), rab.bbox(ids), rab.move(ids, [dx,dy,dz]), rab.copy_to(ids, v)
+      rab.boolean_diff(a_id, b_id)   # validity-checked, raises with a useful hint
+      rab.layer("Building::Walls", color=[180,60,60]), rab.info()
     Use undo_name to wrap in an undo record.
 
     IMPORTANT — Rhino uses IronPython 2. Avoid these Python 3-isms:
@@ -1639,6 +1711,8 @@ async def execute_script(params: ScriptInput) -> dict:
     # Normalize alias: if 'script' came through, map to 'code' for C#
     if "script" in data and "code" not in data:
         data["code"] = data.pop("script")
+    if _RAB_ENABLED and isinstance(data.get("code"), str):
+        data["code"] = _RAB_BOOTSTRAP + data["code"]
     result = await _exec_simple("execute_script", data)
     # Compact mode: if result has many object_ids, summarize to save tokens
     if isinstance(result, dict):
@@ -2120,7 +2194,7 @@ async def trace_pdf(
         import sys as _sys
         return {
             "error": f"pdf_tracer import failed: {e}",
-            "fix": f"Install into the MCP server\'s Python environment:",
+            "fix": "Install into the MCP server\'s Python environment:",
             "command": f"{_sys.executable} -m pip install pymupdf opencv-python numpy",
             "python_path": _sys.executable,
             "note": "This is NOT your system Python or Codex Python — it\'s the MCP bridge\'s own venv."

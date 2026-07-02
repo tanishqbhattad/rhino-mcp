@@ -69,6 +69,8 @@ Before a large or destructive batch: `batch_preview` (free, zero mutations). Bef
 
 `execute_script` runs **IronPython 2** inside Rhino (`rs`, `sc`, `Rhino`, `Rhino.Geometry.*` pre-imported). Hard rules: no f-strings, no type hints, no `encoding=` kwarg on open() (use `io.open`), no `re.fullmatch`. `execute_python3` runs CPython 3 via rhinocode (needs Developer mode) - prefer it for anything with modern-Python dependencies.
 
+The **`rab` helper library is auto-imported** into every `execute_script` - prefer it over raw rhinoscriptsyntax for common elements: `rab.wall(a, b, height, thickness)`, `rab.slab(points, thickness, z)`, `rab.column(pt, w, d, h, z)`, `rab.extrude(points, height, z)`, `rab.grid(origin, nx, ny, sx, sy)`, `rab.ids_on(layer)`, `rab.bbox(ids)`, `rab.move/copy_to(ids, vec)`, `rab.boolean_diff(a, b)` (validity-checked), `rab.layer(path, color)`, `rab.info()`. Five lines of rab beat fifty lines of boilerplate and fail with useful messages.
+
 For repetitive parametric elements (stairs, curtain walls), do NOT generate geometry line-by-line in a script you write from scratch - run the debugged generators in `scripts/` (read the file, set the PARAMS dict at the top, run via `execute_script`). Deterministic code beats improvised geometry.
 
 Cache derived data across calls with `set_state` / `get_state` instead of re-deriving it in every script.
