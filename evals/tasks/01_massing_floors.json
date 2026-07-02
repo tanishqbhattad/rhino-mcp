@@ -1,0 +1,11 @@
+{
+  "id": "massing_floors",
+  "title": "4-storey massing with derived floor plates",
+  "prompt": "In Rhino, create a 4-storey office massing on a 30m x 18m rectangular footprint at the origin. Ground floor is 4200mm floor-to-floor, upper floors 3600mm. Derive the floor slabs from the massing. Put the massing on layer 'Massing' and let slabs go to the 'Slab' layer. Units are mm.",
+  "assertions": [
+    {"type": "layer_count", "layer": "Massing", "min": 1, "max": 2},
+    {"type": "layer_count", "layer": "Slab", "min": 4, "max": 5},
+    {"type": "level_count", "equals": 4},
+    {"type": "scene_bbox_height", "min_mm": 14500, "max_mm": 15500}
+  ]
+}

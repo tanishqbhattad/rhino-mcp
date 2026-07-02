@@ -1,0 +1,9 @@
+{
+  "id": "curtain_wall_generator",
+  "title": "Curtain wall via the skill's generator script",
+  "prompt": "In an empty Rhino scene, build a curtain wall from [0,0,0] to [12000,0,0], 3600mm high, 1500mm module, one transom row at 900mm. Mullions on 'Facade::CurtainWall::Mullions', glass on 'Facade::CurtainWall::Glass'. Use the rhino-architect skill's curtain wall generator script.",
+  "assertions": [
+    {"type": "layer_count", "layer": "Facade::CurtainWall::Mullions", "min": 15, "max": 19},
+    {"type": "layer_count", "layer": "Facade::CurtainWall::Glass", "min": 8, "max": 8}
+  ]
+}

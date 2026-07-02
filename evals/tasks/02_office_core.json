@@ -1,0 +1,10 @@
+{
+  "id": "office_core",
+  "title": "Core with lifts + stair punched through the floor stack",
+  "prompt": "The scene contains a 4-storey massing (30m x 18m, ground 4200mm, uppers 3600mm) with derived slabs. Add a building core near the plate centroid: perimeter walls 200mm thick, two lifts and a stair, full building height (15000mm). Punch the core shafts through the massing and every slab so the voids are real. Core walls on 'Core::Walls'.",
+  "assertions": [
+    {"type": "layer_count", "layer": "Core::Walls", "min": 1, "max": 40},
+    {"type": "clash_free", "max_overlaps": 1},
+    {"type": "level_count", "equals": 4}
+  ]
+}

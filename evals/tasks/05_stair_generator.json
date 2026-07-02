@@ -1,0 +1,8 @@
+{
+  "id": "stair_generator",
+  "title": "Dog-leg stair via the skill's generator script",
+  "prompt": "In an empty Rhino scene, build a dog-leg (U-return) stair for a 3600mm floor-to-floor height at the origin: 1200mm wide flights, 280mm going, ~170mm risers, mid landing, on layer 'Stair'. Use the rhino-architect skill's stair generator script rather than improvising geometry.",
+  "assertions": [
+    {"type": "layer_count", "layer": "Stair", "min": 18, "max": 22}
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "id": "drawing_set",
+  "title": "Plan set for every level",
+  "prompt": "The scene contains a 4-storey building with derived slabs. Generate floor plans for ALL levels at a 1200mm cut height, and create one longitudinal section through the middle of the building labeled 'A'.",
+  "assertions": [
+    {"type": "section_count", "min": 5, "max": 8}
+  ]
+}

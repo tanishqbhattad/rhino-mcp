@@ -1,0 +1,9 @@
+{
+  "id": "clash_detection",
+  "title": "Clash detector finds a deliberate interpenetration (harness self-test)",
+  "prompt": "In an empty Rhino scene, create two 2000mm boxes on layer 'Test' that interpenetrate by 500mm, then run clash detection and report what it finds.",
+  "assertions": [
+    {"type": "clashes_at_least", "min": 1},
+    {"type": "layer_count", "layer": "Test", "min": 2, "max": 2}
+  ]
+}

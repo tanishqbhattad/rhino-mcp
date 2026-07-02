@@ -1,0 +1,8 @@
+{
+  "id": "area_schedule",
+  "title": "GFA schedule matches the brief",
+  "prompt": "The scene contains a 4-storey building on a 30m x 18m footprint with 4 derived slabs. Produce an area schedule by level and report the total GFA in m2.",
+  "assertions": [
+    {"type": "gfa_total", "min_m2": 2000, "max_m2": 2320}
+  ]
+}

@@ -7,3 +7,4 @@ server/.uv-cache/
 .pytest_cache/
 server/.pytest_cache/
 *.pyc
+evals/results.jsonl

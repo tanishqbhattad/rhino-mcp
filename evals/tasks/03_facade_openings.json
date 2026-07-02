@@ -1,0 +1,9 @@
+{
+  "id": "facade_openings",
+  "title": "Wall with rhythmic window openings",
+  "prompt": "In an empty Rhino scene, create one wall from [0,0,0] to [12000,0,0], 3000mm high, 200mm thick, on layer 'Wall'. Then place window openings along it: 3000mm rhythm, 1500mm wide, sill 900mm, head 2400mm, on layer 'Opening'.",
+  "assertions": [
+    {"type": "layer_count", "layer": "Wall", "min": 1, "max": 1},
+    {"type": "layer_count", "layer": "Opening", "min": 3, "max": 4}
+  ]
+}
