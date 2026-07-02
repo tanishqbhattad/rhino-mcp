@@ -52,7 +52,12 @@ namespace RhinoAIBridge
         { "execute_script", "run_python", "execute_python3", "start_script_server", "run_command" };
 
         private static readonly HashSet<string> DestructiveCommands = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        { "delete_objects", "boolean_operation" };
+        {
+            "delete_objects", "boolean_operation",
+            // v4.10: Safe mode consistency - these delete or replace geometry too.
+            "delete_layer", "remove_section", "clear_trace_layers",
+            "delete_checkpoint", "restore_checkpoint",
+        };
 
         private static readonly HashSet<string> AutoCheckpointUndoNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         { "Boolean", "Delete", "DelLayer", "Restore", "RhinoCmd", "Script", "TrimPlanes" };
@@ -75,7 +80,7 @@ namespace RhinoAIBridge
             "validate_architecture", "get_recovery_log", "get_building_systems",
             "get_level_summary", "detect_design_patterns", "find_unassigned_geometry",
             "analyze_architecture", "capture_illustration",
-            "detect_clashes",
+            "detect_clashes", "list_commands",
         };
 
         public CommandHandler()

@@ -144,8 +144,9 @@ namespace RhinoAIBridge
                 _cts = new CancellationTokenSource();
                 _ = Task.Run(() => AcceptLoop(_cts.Token));
 
+                var asmVer = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "?";
                 RhinoApp.WriteLine("==================================================");
-                RhinoApp.WriteLine("  Rhino AI Bridge v4.8.0 (C#)  protocol 5");
+                RhinoApp.WriteLine($"  Rhino AI Bridge v{asmVer} (C#)  protocol {PROTOCOL_VERSION}");
                 RhinoApp.WriteLine($"  Listening on 127.0.0.1:{PORT}  build:{BuildHash}");
                 RhinoApp.WriteLine("  Multiplexed protocol + idempotent retries + cancel");
                 RhinoApp.WriteLine("  Binary image frames, WAL crash recovery, columnar queries");
@@ -646,16 +647,24 @@ namespace RhinoAIBridge
                 // Signal cooperative cancel so the still-running command stops at its
                 // next checkpoint instead of mutating the doc long after the client gave up.
                 if (mutating) OperationRegistry.Cancel(requestId);
+                bool started = e.Data.Contains("started") && e.Data["started"] is bool b && b;
                 result = new JObject
                 {
                     ["status"] = "error",
                     ["error_code"] = "COMMAND_TIMEOUT",
                     ["message"] = e.Message,
-                    ["may_still_be_running"] = true,
+                    ["may_still_be_running"] = started,
                     ["hint"] = requestId != null
-                        ? "A cancel was signaled. Re-sending the same request_id replays the eventual result without re-executing."
+                        ? (started
+                            ? "A cancel was signaled. Re-sending the same request_id replays the eventual result without re-executing."
+                            : "The command never started; re-issuing it is safe.")
                         : null,
                 };
+                // v4.10: a never-started action will NEVER call Complete - finalize the
+                // registry entry now so the request_id doesn't leak in _inFlight (and a
+                // same-id retry doesn't hang in the join window).
+                if (mutating && !started)
+                    OperationRegistry.Complete(requestId, result);
             }
             catch (Exception e)
             {

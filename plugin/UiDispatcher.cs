@@ -28,6 +28,10 @@ namespace RhinoAIBridge
             public readonly TaskCompletionSource<JObject> Completion =
                 new TaskCompletionSource<JObject>(TaskCreationOptions.RunContinuationsAsynchronously);
             public volatile bool Cancelled;
+            // Set by the queued action BEFORE it checks Cancelled - lets a timed-out
+            // caller distinguish "still running on the UI thread" (replay will complete
+            // later) from "never started" (nobody will ever complete it). (v4.10)
+            public volatile bool Started;
         }
 
         public static void Start()
@@ -75,6 +79,10 @@ namespace RhinoAIBridge
             {
                 RhinoApp.InvokeOnUiThread(new Action(() =>
                 {
+                    // Order matters: publish Started BEFORE reading Cancelled so a
+                    // timed-out waiter that observed Started==false can be certain
+                    // this action will bail out and never run func().
+                    slot.Started = true;
                     if (slot.Cancelled || _shuttingDown)
                     {
                         slot.Completion.TrySetResult(new JObject
@@ -104,8 +112,13 @@ namespace RhinoAIBridge
             if (!slot.Completion.Task.Wait(timeout))
             {
                 slot.Cancelled = true;
-                throw new TimeoutException(
-                    $"Command timed out after {timeout.TotalSeconds}s. If Rhino had already started the command, it may still be finishing on the UI thread.");
+                var ex = new TimeoutException(slot.Started
+                    ? $"Command timed out after {timeout.TotalSeconds}s. Rhino already started the command; it may still be finishing on the UI thread."
+                    : $"Command timed out after {timeout.TotalSeconds}s waiting for Rhino's UI thread; it never started and will not run.");
+                // Callers use this to decide whether to expect a late completion
+                // (started) or to finalize the operation registry now (never started).
+                ex.Data["started"] = slot.Started;
+                throw ex;
             }
 
             return slot.Completion.Task.GetAwaiter().GetResult()
