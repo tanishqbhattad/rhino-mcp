@@ -473,7 +473,8 @@ class CreateObjectInput(BaseModel):
             "Type-specific parameters. Examples: "
             "box {origin:[0,0,0], size_x:6000, size_y:6000, size_z:3000}; "
             "wall {start_point:[0,0,0], end_point:[6000,0,0], height:3000, thickness:200}; "
-            "massing {footprint:[[0,0,0],[30000,0,0],[30000,18000,0],[0,18000,0]], levels:4, level_height:3600}; "
+            "massing {footprint:[[0,0,0],[30000,0,0],[30000,18000,0],[0,18000,0]], levels:4, level_height:3600} "
+            "or level_heights:[4200,3600,3600,3600] for variable floors (total = massing height); "
             "core {boundary:[[9000,6000,0],[15000,6000,0],[15000,12000,0],[9000,12000,0]], height:14400}."
         ),
     )

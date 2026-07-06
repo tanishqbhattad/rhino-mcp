@@ -1332,7 +1332,21 @@ namespace RhinoAIBridge
             if (pts.First().DistanceTo(pts.Last()) > 0.01) pts.Add(pts[0]);
             int levels = p["levels"]?.ToObject<int>() ?? 1;
             double levelHeight = MmDef(p, "level_height", 3000);
-            double height = p["height"]?.ToObject<double>() ?? Math.Max(1, levels) * levelHeight;
+            // v4.10.1: accept level_heights[] (same shape derive_floors_from_mass uses)
+            // so a variable floor stack defines the massing height. Previously this
+            // param was silently ignored and the mass came out too short - found by
+            // the eval harness (massing_floors task).
+            var lvlHeights = p["level_heights"]?.ToObject<List<double>>();
+            double height;
+            if (lvlHeights != null && lvlHeights.Count > 0)
+            {
+                levels = lvlHeights.Count;
+                height = p["height"]?.ToObject<double>() ?? lvlHeights.Sum();
+            }
+            else
+            {
+                height = p["height"]?.ToObject<double>() ?? Math.Max(1, levels) * levelHeight;
+            }
             string layer = p["layer"]?.ToString() ?? "Massing";
             string name = p["name"]?.ToString() ?? $"Massing_{levels}L";
             var crv = new Polyline(pts).ToNurbsCurve();

@@ -6,6 +6,8 @@ Footprint = ordered XY loop, counter-clockwise, closed implicitly (don't repeat 
 
 ## Floor stacks
 
+**Height consistency trap:** the massing's total height MUST equal the sum of the floor heights you derive, or the top plate floats below/above the mass. Pass the SAME `level_heights` array to both `create_object(type="massing")` and `derive_floors_from_mass` (plugin ≥4.10.1), or set the massing `height` to the sum explicitly on older plugins. Verify: massing bbox z-max == sum(level_heights).
+
 `derive_floors_from_mass(mass_id, level_heights=[4200,3600,3600])` sections the mass at each accumulated height and extrudes slabs. Variable list beats uniform `levels`+`level_height` whenever the ground floor differs (it almost always does). `slab_thickness` default 250. Slabs land on the `Slab` layer.
 
 For non-extruded masses (tapered towers, terraced hills) the derived plates follow the mass section at each level - this is the whole point: sculpt the mass first, floors follow.
