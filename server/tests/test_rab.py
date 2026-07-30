@@ -47,6 +47,35 @@ def test_bootstrap_parses_and_is_idempotent_marker():
     assert (srv._RAB_BOOTSTRAP + "x=1").startswith(srv._RAB_BOOTSTRAP)
 
 
+def test_binary_image_reattached_at_top_level_and_nested():
+    """Regression: raw bytes from a protocol-5 binary frame must never reach FastMCP.
+
+    protocol.send_batch shortcuts a single non-atomic command to a direct send, so an
+    image-returning op can surface either at the top level or inside results[]. Missing
+    the nested case produced 'invalid utf-8 sequence of 1 bytes from index 0'.
+    """
+    pytest.importorskip("mcp")
+    import base64 as _b64
+
+    import rhino_architect.server as srv
+
+    raw = b"\xff\xd8\xff\xe0JPEGBYTES"
+    top = srv._reattach_binary_image({"status": "ok", "_image_raw": raw})
+    assert "_image_raw" not in top
+    assert top["image_base64"] == _b64.b64encode(raw).decode("ascii")
+
+    nested = srv._reattach_binary_image(
+        {"status": "ok", "results": [{"status": "ok", "_image_raw": raw}], "count": 1}
+    )
+    sub = nested["results"][0]
+    assert "_image_raw" not in sub
+    assert sub["image_base64"] == _b64.b64encode(raw).decode("ascii")
+
+    # An existing base64 payload is never overwritten.
+    keep = srv._reattach_binary_image({"image_base64": "abc", "_image_raw": raw})
+    assert keep["image_base64"] == "abc"
+
+
 def test_deploy_writes_rab_to_aibridge_dir(tmp_path, monkeypatch):
     pytest.importorskip("mcp")
     import rhino_architect.server as srv

@@ -44,6 +44,27 @@ brief -> layers -> massing -> [verify] -> floors/structure -> [verify]
 
 **Phase 7 - QA & handoff.** `detect_clashes` (empty scope = whole scene), `report_areas(by="level")` against the brief, then `log_session` with a 2-4 sentence summary. Always end significant sessions with `log_session`.
 
+## Assert intent, not just validity
+
+Valid geometry is not correct geometry. Doubled base heights, swapped arguments, cutters added instead of subtracted — all produce perfectly closed, valid solids. **After every generation step, assert what you meant:**
+
+```json
+{"assertions": [
+  {"kind": "bbox",      "selector": ["by_name:nave_web"], "z_max": 33000, "tol": 10},
+  {"kind": "count",     "selector": ["by_layer:Vault"],   "expect": 60},
+  {"kind": "supported", "selector": ["last_created"],     "max_gap": 150},
+  {"kind": "envelope",  "selector": ["all"], "box": [[0,-24000,-1000],[130000,24000,97000]]}
+]}
+```
+
+`assert_geometry` returns the offending ids immediately — while the fix is one parameter away, not twenty tool calls later. Also: `find_unsupported` catches floating spires and statuary; `section_preview(axis="y", station=...)` shows the inside of the model in one call (no permanent geometry, camera restored). Use `validate_objects(expect_shells=true, since_version=N)` for material health — it separates real corruption from intentional open shells and can scope to just what you built.
+
+## Reuse code instead of re-pasting it
+
+Write your geometry helpers ONCE with `write_module(name, source)`, then in later scripts `mylib = rab.use('mylib')`. The server writes the file, so nothing inside Rhino ever holds a file handle. `list_modules` / `read_module` to inspect. For repetitive parametric work this is the difference between a 40-call session and a 400-call one.
+
+**Checkpoint economics:** every mutating script can write a full .3dm. Pass `checkpoint="off"` on read-only audits, diagnostics and anything that creates nothing; `checkpoint="force"` before a risky boolean. Left on `auto`, snapshots are skipped when the scene hasn't changed and throttled on large models.
+
 ## Default dimensions (mm) - use unless brief says otherwise
 
 | Element | Default |
@@ -70,6 +91,14 @@ Before a large or destructive batch: `batch_preview` (free, zero mutations). Bef
 `execute_script` runs **IronPython 2** inside Rhino (`rs`, `sc`, `Rhino`, `Rhino.Geometry.*` pre-imported). Hard rules: no f-strings, no type hints, no `encoding=` kwarg on open() (use `io.open`), no `re.fullmatch`. `execute_python3` runs CPython 3 via rhinocode (needs Developer mode) - prefer it for anything with modern-Python dependencies.
 
 The **`rab` helper library is auto-imported** into every `execute_script` - prefer it over raw rhinoscriptsyntax for common elements: `rab.wall(a, b, height, thickness)`, `rab.slab(points, thickness, z)`, `rab.column(pt, w, d, h, z)`, `rab.extrude(points, height, z)`, `rab.grid(origin, nx, ny, sx, sy)`, `rab.ids_on(layer)`, `rab.bbox(ids)`, `rab.move/copy_to(ids, vec)`, `rab.boolean_diff(a, b)` (validity-checked), `rab.layer(path, color)`, `rab.info()`. Five lines of rab beat fifty lines of boilerplate and fail with useful messages.
+
+**Historical / curvilinear work** — do not re-derive this geometry, it is already exact:
+
+- `rab.arch(span, rise, depth, pier, kind)` — kinds: `pointed` (two-centred), `equilateral`, `semicircular`, `segmental`. Centres solve to `c = (h²−s²)/2s`, `R = c+s`; the extrados is concentric (same centres), which is what makes archivolt offsets exact. Default `centered=True` straddles the frame plane, so putting the origin on a wall centreline gives a cutter that booleans cleanly — make `depth` slightly larger than the wall.
+- `rab.arch_geometry(span, rise, kind)` — just the solved centres/radius, when you need the numbers.
+- `rab.vault_quadripartite(corners, springing_z, crown_z)` / `rab.vault_web(a, b, boss, rise)` — courses blend from the wall arch to a flat fold at the boss, so the web lands **exactly** on the crown. A naive Coons patch between the ribs overshoots.
+- `rab.rose_window(center, radius, spokes, foils, ring, depth)` — rim, oculus, radial spokes and foils.
+- `rab.sweep_profile(rail_id, profile, scale)` — named mouldings: roll, keel, cavetto, ovolo, fillet, ogee, scotia.
 
 For repetitive parametric elements (stairs, curtain walls), do NOT generate geometry line-by-line in a script you write from scratch - run the debugged generators in `scripts/` (read the file, set the PARAMS dict at the top, run via `execute_script`). Deterministic code beats improvised geometry.
 

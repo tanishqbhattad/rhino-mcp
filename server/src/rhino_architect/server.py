@@ -27,6 +27,7 @@ import importlib.util
 import logging
 import os
 import orjson
+import re
 import shutil
 import socket
 import subprocess
@@ -204,14 +205,7 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
         if not resp.ok:
             return {"status": "error", "message": resp.message, **(resp.result or {})}
         result = dict(resp.result) if resp.result else {}
-        # Protocol 5 binary image frame: raw bytes arrived out-of-band (no base64
-        # on the wire, no giant-string JSON parse). Re-attach base64 here so every
-        # downstream consumer keeps the same shape.
-        raw_img = result.pop("_image_raw", None)
-        if raw_img is not None and "image_base64" not in result:
-            result["image_base64"] = base64.b64encode(raw_img).decode("ascii")
-            result.pop("image_binary", None)
-            result.pop("image_bytes_length", None)
+        _reattach_binary_image(result)
         result.setdefault("status", "ok")
         if resp.scene_version is not None and "scene_version" not in result:
             result["scene_version"] = resp.scene_version
@@ -234,6 +228,29 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
             "recoverable": True,
             "retry_hint": "Check Rhino command diagnostics and simplify the inputs.",
         }
+
+
+def _reattach_binary_image(result: dict) -> dict:
+    """Re-encode protocol-5 binary image frames as base64, recursively.
+
+    Raw bytes arrive out-of-band (flag 0x02) to avoid base64 inflation on the wire.
+    They MUST be converted before the dict reaches FastMCP, which can only serialize
+    JSON types. Batches need the recursive walk: protocol.send_batch shortcuts a
+    single non-atomic command to a direct send, so an image can surface either at the
+    top level or nested inside results[].
+    """
+    if not isinstance(result, dict):
+        return result
+    raw = result.pop("_image_raw", None)
+    if raw is not None and "image_base64" not in result:
+        result["image_base64"] = base64.b64encode(raw).decode("ascii")
+        result.pop("image_binary", None)
+        result.pop("image_bytes_length", None)
+    subs = result.get("results")
+    if isinstance(subs, list):
+        for s in subs:
+            _reattach_binary_image(s)
+    return result
 
 
 def _as_mcp_image(result: dict, key: str = "image_base64", default_format: str = "png") -> Image | dict:
@@ -421,6 +438,11 @@ async def _exec_batch(
         conn = await get_connection()
         resp = await conn.send_batch(commands, atomic=atomic, stop_on_error=stop_on_error)
         result = dict(resp.result) if resp.result else {}
+        # A single non-atomic sub-command is sent as a direct command, so an
+        # image-returning op (capture, section_preview) can bring back a binary
+        # frame here too. Without this the raw bytes reach FastMCP and blow up
+        # serialization with "invalid utf-8 sequence".
+        _reattach_binary_image(result)
         result.setdefault("status", resp.status)
         if resp.message:
             result.setdefault("message", resp.message)
@@ -470,7 +492,9 @@ class CreateObjectInput(BaseModel):
     params: dict[str, Any] = Field(
         default_factory=dict,
         description=(
-            "Type-specific parameters. Examples: "
+            "Type-specific parameters. ALL EXAMPLES BELOW ARE IN MILLIMETRES - values are raw "
+            "model units, never auto-converted. Check ping.unit_system first and scale "
+            "accordingly (a metres document wants 6.0, not 6000). Examples: "
             "box {origin:[0,0,0], size_x:6000, size_y:6000, size_z:3000}; "
             "wall {start_point:[0,0,0], end_point:[6000,0,0], height:3000, thickness:200}; "
             "massing {footprint:[[0,0,0],[30000,0,0],[30000,18000,0],[0,18000,0]], levels:4, level_height:3600} "
@@ -672,6 +696,59 @@ class CheckIntInput(BaseModel):
 class ValidateInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     object_ids: list[str] = Field(default_factory=list)
+    layer: Optional[str] = Field(None, description="Validate only this layer.")
+    name_pattern: Optional[str] = Field(None, description="Validate only objects whose name matches (trailing * allowed).")
+    since_version: Optional[int] = Field(None, description="Validate only objects added/modified since this tracker version (from get_tracker_version). The usual case: check what you just built.")
+    expect_shells: bool = Field(False, description="True when open geometry is intentional (single-surface roofs, vault webs, glazing). Open breps are then reported separately instead of as issues.")
+    max_checks: int = Field(500, ge=1, le=20000, description="Cap on objects inspected per call.")
+
+
+class AssertGeometryInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    assertions: list[dict[str, Any]] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Post-conditions to check. Each is {kind, selector, ...}. Kinds:\n"
+            "  bbox      - {selector, z_max/z_min/x_max/x_min/y_max/y_min, tol} union bbox of the selection\n"
+            "  envelope  - {selector, box:[[minx,miny,minz],[maxx,maxy,maxz]], tol} everything must fit inside\n"
+            "  count     - {selector, expect} or {selector, min, max}\n"
+            "  count_delta - {since_version, expect} added minus deleted since that tracker version\n"
+            "  watertight- {selector} every match must be a closed valid solid\n"
+            "  supported - {selector, max_gap} nothing may float\n"
+            "Selectors: 'all', 'by_layer:Name', 'by_name:Prefix', 'last_created', 'selected', or GUIDs."
+        ),
+    )
+
+
+class FindUnsupportedInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selector: list[str] = Field(default_factory=lambda: ["all"], description="Scope: 'all', 'by_layer:Name', 'by_name:Prefix', 'last_created', or GUIDs.")
+    max_gap: Optional[float] = Field(None, description="Largest acceptable gap under an object, in model units. Default ~10x document tolerance.")
+
+
+class SectionPreviewInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    axis: str = Field("x", description="Cut plane normal: 'x', 'y' or 'z'.")
+    station: Optional[float] = Field(None, description="Coordinate along the axis to cut at. Defaults to the scene centre.")
+    width: int = 900
+    height: int = 700
+    display_mode: Optional[str] = Field(None, description="Display mode for the cut view (e.g. 'Technical', 'Shaded').")
+    format: str = "auto"
+    quality: int = Field(80, ge=1, le=100)
+    as_json: bool = Field(False, description="Return base64 JSON instead of MCP image content.")
+
+
+class WriteModuleInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str = Field(..., description="Module name without .py (letters, digits, underscore). Import it as `import <name>`.")
+    source: str = Field(..., description="Full Python source. IronPython 2 syntax if you will use it from execute_script.")
+    overwrite: bool = Field(True, description="Replace an existing module of the same name.")
+
+
+class ModuleNameInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    name: str
 
 
 class DetectClashesInput(BaseModel):
@@ -705,6 +782,7 @@ class CameraViewInput(BaseModel):
     direction: Optional[list[float]] = Field(None, description="Camera look direction. Use with target + distance.")
     distance: Optional[float] = Field(None, description="Distance from target when direction is supplied.")
     projection: Optional[str] = Field(None, description="'perspective' | 'parallel'. Defaults to current.")
+    lens_length: Optional[float] = Field(None, description="Lens focal length in mm. 50=normal, 24=wide, 135=tele.")
     box_min: Optional[list[float]] = Field(None, description="Bounding box min [x,y,z] to frame.")
     box_max: Optional[list[float]] = Field(None, description="Bounding box max [x,y,z] to frame.")
 
@@ -740,6 +818,7 @@ class InspectionCaptureInput(CaptureInput):
     direction: Optional[list[float]] = Field(None, description="Camera look direction. Use with target + distance.")
     distance: Optional[float] = Field(None, description="Distance from target when direction is supplied.")
     projection: Optional[str] = Field(None, description="'perspective' | 'parallel'. Defaults to current.")
+    lens_length: Optional[float] = Field(None, description="Lens focal length in mm. 50=normal, 24=wide, 135=tele.")
     box_min: Optional[list[float]] = Field(None, description="Bounding box min [x,y,z] to frame.")
     box_max: Optional[list[float]] = Field(None, description="Bounding box max [x,y,z] to frame.")
 
@@ -905,7 +984,17 @@ class ScriptInput(BaseModel):
     default_layer: Optional[str] = None
     auto_checkpoint: bool = Field(
         default=True,
-        description="If True, save a checkpoint before executing the script. Set False for tiny safe scripts.",
+        description="Legacy switch: False is the same as checkpoint='off'.",
+    )
+    checkpoint: Optional[str] = Field(
+        default=None,
+        description=(
+            "Snapshot policy for this call: 'auto' (default - skipped automatically when the "
+            "scene hasn't changed, throttled on large documents), 'off' (read-only audits, "
+            "diagnostics, anything that creates nothing), or 'force' (always snapshot, e.g. "
+            "before a risky boolean). Full .3dm writes are expensive on big models - use 'off' "
+            "for scripts that only measure or print."
+        ),
     )
     rollback_on_error: bool = Field(
         default=False,
@@ -940,6 +1029,10 @@ class SetCameraInput(BaseModel):
     projection: Optional[str] = Field(None, description="'perspective' | 'parallel'. Defaults to current.")
     box_min: Optional[list[float]] = Field(None, description="Bounding box min [x,y,z] to zoom-frame. Provide with box_max - camera distance auto-computed.")
     box_max: Optional[list[float]] = Field(None, description="Bounding box max [x,y,z] to zoom-frame. Provide with box_min.")
+    fit: Optional[str] = Field(
+        None,
+        description="Disambiguates when BOTH a bbox and a camera are given: 'bbox' frames box_min/box_max, 'camera' uses location/target. Without it, mixing the two modes is rejected.",
+    )
 
 
 class GetRhinoCommandsInput(BaseModel):
@@ -1141,6 +1234,41 @@ async def ping(params: Optional[Empty] = None) -> dict:
         for pkg, module_name in {"pymupdf": "fitz", "cv2": "cv2", "numpy": "numpy"}.items():
             dep_status[pkg] = "installed" if importlib.util.find_spec(module_name) else "missing"
         data["optional_dependencies"] = dep_status
+        # Script engines: state availability outright so an agent never has to infer
+        # it from a version string in a tool description (field report R1/S2).
+        mode = str(data.get("mode") or "").lower()
+        rhino_ver = _parse_rhino_version(data.get("rhino_version"))
+        rhinocode = _find_rhinocode()
+        py3_reasons = []
+        if rhino_ver is None:
+            py3_reasons.append("could not parse the Rhino version")
+        elif rhino_ver < (8, 11):
+            py3_reasons.append(
+                f"RhinoCode needs Rhino 8.11+, found {data.get('rhino_version')}"
+            )
+        if rhinocode is None:
+            py3_reasons.append("rhinocode CLI not found on PATH or in Rhino 8/System")
+        if mode != "developer":
+            py3_reasons.append(f"AIBridge mode is '{mode or 'unknown'}', execute_python3 needs 'developer'")
+        data["script_engines"] = {
+            "ironpython": {
+                "available": True,
+                "tool": "execute_script",
+                "version": "IronPython 2.7",
+                "note": "No f-strings, type hints, or py3-only stdlib. `rab` helpers are auto-imported.",
+            },
+            "python3": {
+                "available": not py3_reasons,
+                "tool": "execute_python3",
+                "engine": "RhinoCode CPython 3",
+                "reason": "; ".join(py3_reasons) if py3_reasons else "ready",
+                "rhinocode_path": rhinocode,
+            },
+            "rab_helpers": {
+                "available": _RAB_ENABLED,
+                "note": "Auto-imported into execute_script. rab.wall/slab/column/grid/arch/vault/tracery/...",
+            },
+        }
         # Protocol 4.x (legacy single-flight) and 5.x (multiplexed) are both supported.
         plugin_ver = data.get("protocol_version", "")
         plugin_major = plugin_ver.split(".", 1)[0] if plugin_ver else ""
@@ -1197,6 +1325,11 @@ async def create_object(params: CreateObjectInput) -> dict:
 
     Returns object_ids and bounding_box. Pass measure=true to also compute area/volume
     (off by default - saves a Brep integration on every floor of a 30-floor stack).
+
+    UNITS: every example below is in MILLIMETRES. Values are raw model units and are never
+    converted - in a metres document use 6.0 rather than 6000. Call ping first and read
+    unit_system. The response echoes unit_system plus a warning if the new geometry looks
+    off by ~1000x for the document's units.
 
     Examples:
     - type='massing', params={footprint:[[0,0,0],[30000,0,0],[30000,18000,0],[0,18000,0]], levels:4, level_height:3600}
@@ -1342,8 +1475,151 @@ async def check_intersection(params: CheckIntInput) -> dict:
 
 @mcp.tool(name="validate_objects", annotations=RO)
 async def validate_objects(params: ValidateInput) -> dict:
-    """Validate geometry. Empty object_ids means whole scene (capped to 100 Breps)."""
-    return await _exec_simple("validate_objects", params.model_dump())
+    """Check geometry health. Separates REAL corruption from mere openness.
+
+    - `invalid`: corrupt breps - always fix these.
+    - `open`: not closed. Legitimate for single-surface roofs, vault webs and glazing.
+      Each entry carries naked_edge_count/naked_edge_length, so a hairline gap (short
+      total length on something that should be solid) is distinguishable from a
+      deliberately open surface. Pass expect_shells=true when open geometry is intended
+      and they stop being counted as issues.
+
+    Scope it instead of scanning the whole scene: `layer`, `name_pattern`, or
+    `since_version` (from get_tracker_version) to validate only what you just created."""
+    return await _exec_simple("validate_objects", params.model_dump(exclude_none=True))
+
+
+@mcp.tool(name="assert_geometry", annotations=RO)
+async def assert_geometry(params: AssertGeometryInput) -> dict:
+    """Assert what the geometry MEANS - catches the errors brep validity cannot.
+
+    Agents generating thousands of parametric objects make arithmetic and wiring
+    mistakes (doubled base heights, swapped arguments, cutters added instead of
+    subtracted) that produce perfectly valid, closed, non-degenerate solids.
+    Run this right after a generation step, while the fix is still cheap.
+
+    Returns pass/fail per assertion with the offending object ids.
+
+    Example - a floor of vault webs that must crown at 33.0m, stay inside the
+    building envelope, and not float:
+        assertions=[
+          {"kind":"bbox","selector":"by_name:nave_web","z_max":33.0,"tol":0.01},
+          {"kind":"envelope","selector":"all","box":[[0,-24,-1],[130,24,97]]},
+          {"kind":"supported","selector":"last_created","max_gap":0.15},
+          {"kind":"count","selector":"by_layer:Vault","expect":60}
+        ]"""
+    return await _exec_simple("assert_geometry", params.model_dump(exclude_none=True))
+
+
+@mcp.tool(name="find_unsupported", annotations=RO)
+async def find_unsupported(params: FindUnsupportedInput) -> dict:
+    """Find objects floating in space - nothing beneath them within max_gap.
+
+    Catches floating spires, pinnacles, statues and disconnected drums: the defect
+    class that otherwise survives until a human notices it in a render. Results are
+    sorted worst-gap first. Bbox-based, so deliberately cantilevered or interlocking
+    geometry can appear as a false positive."""
+    return await _exec_simple("find_unsupported", params.model_dump(exclude_none=True))
+
+
+@mcp.tool(name="section_preview", annotations=RO)
+async def section_preview(params: SectionPreviewInput) -> Any:
+    """Cheap interior inspection: clip at a station, look square at the cut, restore.
+
+    One call to see inside the model - open shafts, floating drums, missing floors,
+    roof planes that stop short. Far faster than hunting camera angles, and unlike
+    create_section/cut_section it creates no permanent geometry: the clipping plane
+    and camera are always restored."""
+    payload = params.model_dump(exclude_none=True)
+    as_json = payload.pop("as_json", False)
+    result = await _exec_simple("section_preview", payload)
+    return result if as_json else _as_mcp_image(result)
+
+
+# Reusable code substrate --------------------------------------------------
+# Modules are written by the SERVER into the AIBridge directory that the script
+# bootstrap already puts on sys.path. Nothing opens a file inside Rhino, so the
+# IronPython handle-leak that used to lock library files can't happen.
+
+_MODULE_NAME_OK = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_MODULES = {"rab", "os", "sys", "io", "re", "math", "json", "Rhino", "System"}
+
+
+@mcp.tool(name="write_module", annotations=WI)
+async def write_module(params: WriteModuleInput) -> dict:
+    """Save a reusable Python module that execute_script can import.
+
+    Write your geometry library ONCE, then `import mylib` (or `rab.use('mylib')` to
+    hot-reload) in every later script instead of re-pasting hundreds of lines.
+
+    The file is written by the MCP server, never by code running inside Rhino, so
+    it cannot leave a locked handle behind. Re-writing the same name is safe -
+    use `rab.use(name)` to pick up the new version without restarting Rhino."""
+    name = params.name.strip()
+    if not _MODULE_NAME_OK.match(name):
+        return {"status": "error", "error_code": "INVALID_MODULE_NAME",
+                "message": "Module names must be a valid Python identifier (letters, digits, underscore; no .py)."}
+    if name in _RESERVED_MODULES:
+        return {"status": "error", "error_code": "RESERVED_MODULE_NAME",
+                "message": f"'{name}' would shadow a built-in or the rab helpers. Choose another name."}
+    try:
+        compile(params.source, f"{name}.py", "exec")
+    except SyntaxError as e:
+        # Only catches py3-parseable errors; IronPython-2-only issues still surface at import.
+        return {"status": "error", "error_code": "SYNTAX_ERROR",
+                "message": f"line {e.lineno}: {e.msg}",
+                "retry_hint": "Fix the syntax and resend. Remember execute_script runs IronPython 2."}
+    path = _aibridge_dir() / f"{name}.py"
+    if path.exists() and not params.overwrite:
+        return {"status": "error", "error_code": "MODULE_EXISTS",
+                "message": f"Module '{name}' already exists. Pass overwrite=true to replace it."}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(params.source, encoding="utf-8")
+    except OSError as e:
+        return {"status": "error", "error_code": "WRITE_FAILED", "message": str(e)}
+    non_ascii = [i + 1 for i, line in enumerate(params.source.splitlines())
+                 if any(ord(ch) > 127 for ch in line)]
+    out = {
+        "status": "ok",
+        "module": name,
+        "path": str(path),
+        "lines": len(params.source.splitlines()),
+        "usage": f"In execute_script: `import {name}` (first use) or `{name} = rab.use('{name}')` to hot-reload.",
+    }
+    if non_ascii:
+        out["warning"] = (f"Non-ASCII characters on lines {non_ascii[:5]} - IronPython 2 rejects them "
+                          "unless the file starts with a coding declaration. Prefer plain ASCII.")
+    return out
+
+
+@mcp.tool(name="list_modules", annotations=RO)
+async def list_modules(params: Optional[Empty] = None) -> dict:
+    """List reusable modules available to execute_script (written via write_module)."""
+    d = _aibridge_dir()
+    mods = []
+    try:
+        for f in sorted(d.glob("*.py")):
+            mods.append({
+                "module": f.stem,
+                "lines": len(f.read_text(encoding="utf-8", errors="replace").splitlines()),
+                "bytes": f.stat().st_size,
+                "builtin": f.stem == "rab",
+            })
+    except OSError as e:
+        return {"status": "error", "message": str(e)}
+    return {"status": "ok", "modules": mods, "count": len(mods), "directory": str(d)}
+
+
+@mcp.tool(name="read_module", annotations=RO)
+async def read_module(params: ModuleNameInput) -> dict:
+    """Read back the source of a saved module."""
+    path = _aibridge_dir() / f"{params.name.strip()}.py"
+    if not path.is_file():
+        return {"status": "error", "error_code": "MODULE_NOT_FOUND",
+                "message": f"No module '{params.name}'. Call list_modules to see what exists."}
+    return {"status": "ok", "module": params.name, "path": str(path),
+            "source": path.read_text(encoding="utf-8")}
 
 
 @mcp.tool(name="detect_clashes", annotations=RO)
@@ -1586,15 +1862,43 @@ async def set_selection(params: SelectInput) -> dict:
 async def set_camera(params: SetCameraInput) -> dict:
     """Precisely position the viewport camera.
 
-    Two modes:
-    1. Explicit: supply location + target (+ optional lens_length, projection).
-    2. Bbox framing: supply box_min + box_max - the plugin auto-computes a camera distance
-       that fits the bounding box in the viewport.
+    Two MUTUALLY EXCLUSIVE modes:
+    1. Explicit camera: location + target (+ optional lens_length, projection).
+    2. Bbox framing: box_min + box_max - camera distance auto-computed to fit the box.
+
+    Passing both is ambiguous and is rejected unless you also pass fit='bbox' or
+    fit='camera' to say which one wins. (Previously the server silently picked one.)
 
     Examples:
         set_camera(location=[10000, -15000, 8000], target=[0, 0, 3000])
         set_camera(box_min=[0,0,0], box_max=[12000,8000,15000], projection="perspective")"""
-    return await _exec_simple("set_camera", params.model_dump(exclude_none=True))
+    data = params.model_dump(exclude_none=True)
+    fit = data.pop("fit", None)
+    has_box = "box_min" in data or "box_max" in data
+    has_cam = "location" in data or "target" in data
+    if has_box and has_cam:
+        if fit == "bbox":
+            data.pop("location", None)
+            data.pop("target", None)
+        elif fit == "camera":
+            data.pop("box_min", None)
+            data.pop("box_max", None)
+        else:
+            return {
+                "status": "error",
+                "error_code": "AMBIGUOUS_CAMERA",
+                "message": "set_camera received BOTH a bounding box (box_min/box_max) and an explicit camera "
+                           "(location/target). These are different framing modes.",
+                "retry_hint": "Pass fit='bbox' or fit='camera' to choose, or send only one mode's parameters.",
+            }
+    if has_box and not ("box_min" in data and "box_max" in data):
+        return {
+            "status": "error",
+            "error_code": "INCOMPLETE_BBOX",
+            "message": "Bbox framing needs BOTH box_min and box_max.",
+            "retry_hint": "Supply the missing corner, or switch to location/target.",
+        }
+    return await _exec_simple("set_camera", data)
 
 
 @mcp.tool(name="get_rhino_commands", annotations=RO)
@@ -2835,6 +3139,9 @@ _STANDARD_TOOLS: frozenset[str] = _LEAN_TOOLS | frozenset({
     # Semantic analysis & QA
     "analyze_architecture", "get_level_summary", "select_by_semantic",
     "detect_clashes", "validate_objects",
+    # Intent validation + reusable code substrate (v4.10.1)
+    "assert_geometry", "find_unsupported", "section_preview",
+    "write_module", "list_modules", "read_module",
     # Vision loop
     "capture_review_set", "capture_inspection_view", "compare_before_after",
     "thumbnail",

@@ -81,6 +81,9 @@ namespace RhinoAIBridge
             "get_level_summary", "detect_design_patterns", "find_unassigned_geometry",
             "analyze_architecture", "capture_illustration",
             "detect_clashes", "list_commands",
+            // Intent-validation reads. section_preview adds a clipping plane but always
+            // removes it in a finally block, so it leaves no trace.
+            "assert_geometry", "find_unsupported", "section_preview",
         };
 
         public CommandHandler()
@@ -197,6 +200,10 @@ namespace RhinoAIBridge
                 ["detect_design_patterns"] = W(DetectDesignPatternsCmd),
                 ["find_unassigned_geometry"] = W(FindUnassignedCmd),
                 ["batch_preview"] = W(BatchPreviewCmd),
+                // v4.10.1: intent validation (field report §4)
+                ["assert_geometry"] = W(AssertGeometry),
+                ["find_unsupported"] = W(FindUnsupported),
+                ["section_preview"] = W(SectionPreview),
                 // v4.7.5: Design Memory (was missing from dispatch)
                 ["set_design_brief"] = W(SetDesignBrief),
                 ["get_design_brief"] = W(GetDesignBrief),
@@ -486,10 +493,21 @@ namespace RhinoAIBridge
             try
             {
                 if (_batchDepth == 0 && _atomicBatchDepth == 0
-                    && p?["auto_checkpoint"]?.ToObject<bool>() != false
                     && AutoCheckpointUndoNames.Contains(name))
                 {
-                    autoCheckpoint = SaveAutoCheckpoint(name);
+                    // v4.10.1: per-call policy. `checkpoint` wins; legacy
+                    // auto_checkpoint:false still means "off".
+                    var policy = p?["checkpoint"]?.ToString();
+                    if (string.IsNullOrWhiteSpace(policy))
+                        policy = p?["auto_checkpoint"]?.ToObject<bool>() == false ? "off" : "auto";
+                    autoCheckpoint = SaveAutoCheckpoint(name, policy);
+                    // Keep responses lean: only report a checkpoint that was actually
+                    // written, or a skip that leaves a real gap (throttled).
+                    if (autoCheckpoint?["skipped"]?.ToObject<bool>() == true &&
+                        autoCheckpoint["reason"]?.ToString()?.StartsWith("throttled") != true)
+                    {
+                        autoCheckpoint = null;
+                    }
                 }
                 using (RedrawScope.Defer())
                 {
@@ -593,14 +611,69 @@ namespace RhinoAIBridge
             return "COMMAND_FAILED";
         }
 
-        JObject SaveAutoCheckpoint(string operation)
+        // --- Checkpoint economics (v4.10.1, field report §5) -----------------
+        // A full .3dm snapshot per mutating call cost ~2.5 GB in one 8,000-object
+        // session, including calls that created nothing. Three guards:
+        //   1. scene unchanged since the last checkpoint  -> skip (the existing file
+        //      is still an accurate rollback point)
+        //   2. large documents                            -> throttle by interval
+        //   3. explicit per-call policy                   -> off | auto | force
+        private static long _lastCpSceneVersion = -1;
+        private static long _lastCpSizeKb;
+        private static DateTime _lastCpTimeUtc = DateTime.MinValue;
+        private const long CP_THROTTLE_ABOVE_KB = 20_000;
+        private static readonly TimeSpan CP_MIN_INTERVAL = TimeSpan.FromMinutes(2);
+
+        private static long CurrentSceneVersion()
         {
+            try { return SceneSnapshotRegistry.Active?.SceneVersion ?? -1; }
+            catch { return -1; }
+        }
+
+        private static void NoteCheckpointTaken(long sceneVersion, long sizeKb)
+        {
+            _lastCpSceneVersion = sceneVersion;
+            _lastCpSizeKb = sizeKb;
+            _lastCpTimeUtc = DateTime.UtcNow;
+        }
+
+        private static JObject CheckpointSkipped(string reason, string operation) => new JObject
+        {
+            ["skipped"] = true,
+            ["reason"] = reason,
+            ["operation"] = operation,
+            ["note"] = "Pass checkpoint='force' to snapshot anyway, or 'off' to never snapshot this call.",
+        };
+
+        JObject SaveAutoCheckpoint(string operation, string policy = "auto")
+        {
+            policy = (policy ?? "auto").ToLowerInvariant();
+            if (policy == "off") return CheckpointSkipped("checkpoint policy 'off'", operation);
+
+            long sv = CurrentSceneVersion();
+            if (policy != "force")
+            {
+                // 1. Nothing has changed since the last snapshot - it still restores
+                //    the current state, so writing an identical copy is pure waste.
+                if (sv >= 0 && sv == _lastCpSceneVersion)
+                    return CheckpointSkipped("scene unchanged since the last checkpoint", operation);
+                // 2. Big documents: don't pay a full write on every call.
+                if (_lastCpSizeKb > CP_THROTTLE_ABOVE_KB &&
+                    DateTime.UtcNow - _lastCpTimeUtc < CP_MIN_INTERVAL)
+                {
+                    return CheckpointSkipped(
+                        $"throttled: last checkpoint was {_lastCpSizeKb / 1024} MB, less than " +
+                        $"{CP_MIN_INTERVAL.TotalMinutes:0} min ago", operation);
+                }
+            }
+
             try
             {
                 var name = $"auto_{operation}_{DateTime.Now:yyyyMMdd_HHmmss}";
                 var cp = SaveCheckpoint(new JObject { ["name"] = name });
                 if (cp?["status"]?.ToString() == "ok")
                 {
+                    NoteCheckpointTaken(sv, cp["size_kb"]?.ToObject<long>() ?? 0);
                     return new JObject
                     {
                         ["checkpoint"] = cp["checkpoint"],
@@ -2529,8 +2602,547 @@ namespace RhinoAIBridge
                       ("objects", arr));
         }
 
+        // v4.10.1 (field report B3/B4): validity and openness are DIFFERENT facts.
+        // A single-surface vault severy or roof plane is an intentional open shell, not
+        // corruption - reporting them together made the tool unusable on a scene where
+        // 743 of 6,500 objects were deliberately open. Now: `invalid` = real corruption,
+        // `open` = topology fact with naked-edge length so a hairline gap (tiny total
+        // length) is distinguishable from a deliberately open surface (long boundary).
+        // Also accepts layer / name_pattern / since_version filters so an agent can
+        // validate exactly what it just made instead of 13 blind whole-scene calls.
+        JObject ValidateObjectsFiltered(JObject p)
+        {
+            bool expectShells = p["expect_shells"]?.ToObject<bool>() ?? false;
+            int maxChecks = Math.Max(1, p["max_checks"]?.ToObject<int>() ?? 500);
+            string layerFilter = p["layer"]?.ToString();
+            string namePattern = p["name_pattern"]?.ToString();
+            int sinceVersion = p["since_version"]?.ToObject<int>() ?? -1;
+
+            var targets = new List<RhinoObject>();
+            string scope;
+
+            if (sinceVersion >= 0)
+            {
+                var (added, _, modified, toVer, truncated) = ChangeTracker.GetDiff(sinceVersion);
+                var changed = added.Concat(modified)
+                    .Select(t => t["id"]?.ToString())
+                    .Where(s => !string.IsNullOrEmpty(s));
+                foreach (var s in changed)
+                    if (Guid.TryParse(s, out var g))
+                    {
+                        var o = Doc.Objects.FindId(g);
+                        if (o != null) targets.Add(o);
+                    }
+                scope = $"changed since tracker version {sinceVersion} (now {toVer})";
+                if (truncated)
+                    scope += " [WARNING: change log truncated - validate the full scene]";
+            }
+            else if (!string.IsNullOrWhiteSpace(layerFilter))
+            {
+                int li = Doc.Layers.FindByFullPath(layerFilter, -1);
+                if (li < 0) return Err($"Layer not found: {layerFilter}", "LAYER_NOT_FOUND");
+                targets.AddRange(AllObjs().Where(o => o.Attributes.LayerIndex == li));
+                scope = $"layer '{layerFilter}'";
+            }
+            else
+            {
+                targets.AddRange(AllObjs());
+                scope = "all objects";
+            }
+
+            if (!string.IsNullOrWhiteSpace(namePattern))
+            {
+                var pat = namePattern.Trim();
+                var starts = pat.EndsWith("*");
+                var core = pat.TrimEnd('*');
+                targets = targets.Where(o =>
+                {
+                    var n = o.Attributes.Name ?? "";
+                    return starts
+                        ? n.StartsWith(core, StringComparison.OrdinalIgnoreCase)
+                        : n.Equals(core, StringComparison.OrdinalIgnoreCase);
+                }).ToList();
+                scope += $", name '{namePattern}'";
+            }
+
+            var invalid = new JArray();
+            var open = new JArray();
+            int checkedCount = 0, solids = 0, notBrep = 0;
+
+            foreach (var o in targets)
+            {
+                if (checkedCount >= maxChecks) break;
+                var b = GetBrep(o);
+                if (b == null) { notBrep++; continue; }
+                checkedCount++;
+                if (!b.IsValid)
+                {
+                    b.IsValidWithLog(out string log);
+                    invalid.Add(new JObject
+                    {
+                        ["id"] = o.Id.ToString(),
+                        ["issue"] = "Invalid Brep",
+                        ["layer"] = Doc.Layers[o.Attributes.LayerIndex]?.FullPath ?? "",
+                        ["name"] = o.Attributes.Name ?? "",
+                        ["detail"] = string.IsNullOrWhiteSpace(log) ? null : log.Split('\n')[0].Trim(),
+                    });
+                    continue;
+                }
+                if (b.IsSolid) { solids++; continue; }
+
+                // Open but valid: quantify the boundary so hairline gaps stand out.
+                double nakedLen = 0; int nakedCount = 0;
+                try
+                {
+                    var edges = b.DuplicateNakedEdgeCurves(true, true);
+                    if (edges != null)
+                    {
+                        nakedCount = edges.Length;
+                        foreach (var c in edges) { nakedLen += c.GetLength(); c.Dispose(); }
+                    }
+                }
+                catch { }
+                open.Add(new JObject
+                {
+                    ["id"] = o.Id.ToString(),
+                    ["layer"] = Doc.Layers[o.Attributes.LayerIndex]?.FullPath ?? "",
+                    ["name"] = o.Attributes.Name ?? "",
+                    ["naked_edge_count"] = nakedCount,
+                    ["naked_edge_length"] = Math.Round(nakedLen, 3),
+                    ["face_count"] = b.Faces.Count,
+                });
+            }
+
+            var result = Ok(
+                ("scope", scope),
+                ("checked", checkedCount),
+                ("solids", solids),
+                ("invalid", invalid),
+                ("invalid_count", invalid.Count),
+                ("open", open),
+                ("open_count", open.Count));
+            result["skipped_non_brep"] = notBrep;
+            if (targets.Count > checkedCount + notBrep)
+            {
+                result["remaining_unchecked"] = targets.Count - checkedCount - notBrep;
+                result["hint"] = "Raise max_checks, or narrow the scope with layer / name_pattern / since_version.";
+            }
+            // Back-compat: `issues` is what older callers read. Open shells are only
+            // counted as issues when the caller has NOT declared them expected.
+            var issues = new JArray(invalid.Select(t => t.DeepClone()));
+            if (!expectShells)
+                foreach (var t in open)
+                    issues.Add(new JObject { ["id"] = t["id"], ["issue"] = "Open Brep",
+                                             ["naked_edge_length"] = t["naked_edge_length"] });
+            result["issues"] = issues;
+            result["interpretation"] =
+                "invalid = real geometry corruption, always fix. open = not closed; legitimate for "
+                + "single-surface roofs/vault webs/glazing. A SHORT naked_edge_length on a shape that "
+                + "should be solid usually means a hairline gap or a missing face.";
+            return result;
+        }
+
+        // =====================================================================
+        // INTENT VALIDATION (v4.10.1, field report §4)
+        // Brep validity is the wrong invariant for generated architecture. An agent
+        // producing thousands of parametric objects makes ARITHMETIC and WIRING
+        // errors - doubled base heights, swapped arguments, cutters added instead of
+        // subtracted - all of which yield perfectly valid, closed, non-degenerate
+        // breps. These commands check intent instead of topology.
+        // =====================================================================
+
+        private List<RhinoObject> ResolveSelector(JToken sel)
+        {
+            var ids = ResIds(sel ?? JToken.FromObject(new[] { "all" }));
+            var list = new List<RhinoObject>();
+            foreach (var s in ids)
+                if (Guid.TryParse(s, out var g))
+                {
+                    var o = Doc.Objects.FindId(g);
+                    if (o != null) list.Add(o);
+                }
+            return list;
+        }
+
+        private static BoundingBox UnionBox(IEnumerable<RhinoObject> objs)
+        {
+            var bb = BoundingBox.Empty;
+            foreach (var o in objs)
+            {
+                var g = o?.Geometry;
+                if (g == null) continue;
+                var b = g.GetBoundingBox(true);
+                if (b.IsValid) bb.Union(b);
+            }
+            return bb;
+        }
+
+        /// <summary>Post-condition contracts: assert what the geometry MEANS, not just that it parses.</summary>
+        JObject AssertGeometry(JObject p)
+        {
+            var asserts = p["assertions"] as JArray;
+            if (asserts == null || asserts.Count == 0)
+                return Err("assertions[] required", "INVALID_INPUT");
+
+            var results = new JArray();
+            int passed = 0;
+
+            foreach (var aTok in asserts)
+            {
+                var a = aTok as JObject ?? new JObject();
+                string kind = (a["kind"]?.ToString() ?? "").ToLowerInvariant();
+                double tol = a["tol"]?.ToObject<double>() ?? Math.Max(Tol, 1e-6);
+                var entry = new JObject { ["kind"] = kind };
+                if (a["selector"] != null) entry["selector"] = a["selector"];
+                bool ok = false;
+                var offenders = new JArray();
+                string detail = "";
+
+                try
+                {
+                    switch (kind)
+                    {
+                        case "bbox":
+                        {
+                            var objs = ResolveSelector(a["selector"]);
+                            if (objs.Count == 0) { detail = "selector matched no objects"; break; }
+                            var bb = UnionBox(objs);
+                            ok = true;
+                            var checks = new (string key, double actual)[]
+                            {
+                                ("x_min", bb.Min.X), ("y_min", bb.Min.Y), ("z_min", bb.Min.Z),
+                                ("x_max", bb.Max.X), ("y_max", bb.Max.Y), ("z_max", bb.Max.Z),
+                            };
+                            var parts = new List<string>();
+                            foreach (var (key, actual) in checks)
+                            {
+                                var want = a[key]?.ToObject<double>();
+                                if (want == null) continue;
+                                double diff = Math.Abs(actual - want.Value);
+                                bool good = diff <= tol;
+                                if (!good) ok = false;
+                                parts.Add($"{key} actual={actual:0.###} expected={want.Value:0.###} diff={diff:0.###}{(good ? "" : " FAIL")}");
+                            }
+                            detail = parts.Count > 0 ? string.Join("; ", parts) : "no bounds given to check";
+                            if (parts.Count == 0) ok = false;
+                            entry["objects"] = objs.Count;
+                            break;
+                        }
+                        case "envelope":
+                        {
+                            var objs = ResolveSelector(a["selector"]);
+                            var box = a["box"];
+                            if (box == null) { detail = "box [[minx,miny,minz],[maxx,maxy,maxz]] required"; break; }
+                            var lo = Pt(box[0]); var hi = Pt(box[1]);
+                            var env = new BoundingBox(
+                                new Point3d(Math.Min(lo.X, hi.X), Math.Min(lo.Y, hi.Y), Math.Min(lo.Z, hi.Z)),
+                                new Point3d(Math.Max(lo.X, hi.X), Math.Max(lo.Y, hi.Y), Math.Max(lo.Z, hi.Z)));
+                            foreach (var o in objs)
+                            {
+                                var b = o.Geometry?.GetBoundingBox(true) ?? BoundingBox.Empty;
+                                if (!b.IsValid) continue;
+                                if (b.Min.X < env.Min.X - tol || b.Min.Y < env.Min.Y - tol || b.Min.Z < env.Min.Z - tol ||
+                                    b.Max.X > env.Max.X + tol || b.Max.Y > env.Max.Y + tol || b.Max.Z > env.Max.Z + tol)
+                                {
+                                    if (offenders.Count < 50)
+                                        offenders.Add(new JObject
+                                        {
+                                            ["id"] = o.Id.ToString(),
+                                            ["name"] = o.Attributes.Name ?? "",
+                                            ["bbox_min"] = PA(b.Min),
+                                            ["bbox_max"] = PA(b.Max),
+                                        });
+                                }
+                            }
+                            ok = offenders.Count == 0;
+                            entry["objects"] = objs.Count;
+                            detail = ok ? $"all {objs.Count} objects inside the envelope"
+                                        : $"{offenders.Count} object(s) outside the envelope";
+                            break;
+                        }
+                        case "count":
+                        {
+                            var objs = ResolveSelector(a["selector"]);
+                            int n = objs.Count;
+                            var expect = a["expect"]?.ToObject<int>();
+                            var min = a["min"]?.ToObject<int>();
+                            var max = a["max"]?.ToObject<int>();
+                            ok = expect.HasValue ? n == expect.Value
+                                 : (!min.HasValue || n >= min.Value) && (!max.HasValue || n <= max.Value);
+                            detail = $"count={n}" + (expect.HasValue ? $" expected={expect.Value}" : $" allowed=[{min},{max}]");
+                            break;
+                        }
+                        case "count_delta":
+                        {
+                            int since = a["since_version"]?.ToObject<int>() ?? -1;
+                            if (since < 0) { detail = "since_version required (get it from get_tracker_version)"; break; }
+                            var (added, deleted, _, toVer, truncated) = ChangeTracker.GetDiff(since);
+                            int delta = added.Count - deleted.Count;
+                            var expect = a["expect"]?.ToObject<int>();
+                            ok = !expect.HasValue || delta == expect.Value;
+                            detail = $"added={added.Count} deleted={deleted.Count} delta={delta}"
+                                     + (expect.HasValue ? $" expected={expect.Value}" : "")
+                                     + $" (tracker now {toVer})" + (truncated ? " [log truncated]" : "");
+                            break;
+                        }
+                        case "watertight":
+                        {
+                            var objs = ResolveSelector(a["selector"]);
+                            int solid = 0, checkedN = 0;
+                            foreach (var o in objs)
+                            {
+                                var b = GetBrep(o);
+                                if (b == null) continue;
+                                checkedN++;
+                                if (b.IsSolid && b.IsValid) solid++;
+                                else if (offenders.Count < 50)
+                                    offenders.Add(new JObject
+                                    {
+                                        ["id"] = o.Id.ToString(),
+                                        ["name"] = o.Attributes.Name ?? "",
+                                        ["issue"] = b.IsValid ? "open" : "invalid",
+                                    });
+                            }
+                            ok = offenders.Count == 0 && checkedN > 0;
+                            entry["objects"] = checkedN;
+                            detail = $"{solid}/{checkedN} closed valid solids";
+                            break;
+                        }
+                        case "supported":
+                        {
+                            var objs = ResolveSelector(a["selector"]);
+                            double maxGap = a["max_gap"]?.ToObject<double>() ?? Math.Max(Tol * 10, 0.05);
+                            var unsupported = FindUnsupportedIn(objs, maxGap, out int checkedN);
+                            foreach (var u in unsupported.Take(50)) offenders.Add(u);
+                            ok = unsupported.Count == 0 && checkedN > 0;
+                            entry["objects"] = checkedN;
+                            detail = ok ? $"all {checkedN} solids rest on something within {maxGap:0.###}"
+                                        : $"{unsupported.Count} floating object(s)";
+                            break;
+                        }
+                        default:
+                            detail = $"unknown assertion kind '{kind}'. Supported: bbox, envelope, count, count_delta, watertight, supported.";
+                            break;
+                    }
+                }
+                catch (Exception e) { detail = $"assertion error: {e.Message}"; ok = false; }
+
+                entry["pass"] = ok;
+                entry["detail"] = detail;
+                if (offenders.Count > 0) entry["offenders"] = offenders;
+                results.Add(entry);
+                if (ok) passed++;
+            }
+
+            var r = Ok(("assertions", results), ("passed", passed), ("failed", asserts.Count - passed));
+            r["status"] = passed == asserts.Count ? "ok" : "error";
+            if (passed != asserts.Count)
+            {
+                r["error_code"] = "ASSERTION_FAILED";
+                r["message"] = $"{asserts.Count - passed} of {asserts.Count} assertions failed.";
+                r["retry_hint"] = "Inspect `offenders` for the specific object ids, fix the generator inputs, and re-assert.";
+            }
+            return r;
+        }
+
+        /// <summary>
+        /// Bbox-shadow support test: an object is "supported" if the ground or another
+        /// object's top surface lies within max_gap directly beneath its footprint.
+        /// Catches floating spires, pinnacles and statuary - the class of defect that
+        /// otherwise survives until a human looks at a render.
+        /// </summary>
+        private List<JObject> FindUnsupportedIn(List<RhinoObject> objs, double maxGap, out int checkedCount)
+        {
+            checkedCount = 0;
+            var result = new List<JObject>();
+
+            // Candidate supporters: every solid/surface in the document.
+            var all = AllObjs().Where(o => o.Geometry != null).ToList();
+            var boxes = new List<(RhinoObject obj, BoundingBox bb)>();
+            foreach (var o in all)
+            {
+                var b = o.Geometry.GetBoundingBox(true);
+                if (b.IsValid) boxes.Add((o, b));
+            }
+            if (boxes.Count == 0) return result;
+
+            var tree = new RTree();
+            for (int i = 0; i < boxes.Count; i++) tree.Insert(boxes[i].bb, i);
+
+            double groundZ = boxes.Min(t => t.bb.Min.Z);
+
+            foreach (var o in objs)
+            {
+                var g = o.Geometry;
+                if (g == null) continue;
+                var bb = g.GetBoundingBox(true);
+                if (!bb.IsValid) continue;
+                checkedCount++;
+
+                // Resting on the lowest plane in the scene counts as grounded.
+                if (bb.Min.Z <= groundZ + maxGap) continue;
+
+                // Search the column directly below this object's footprint.
+                var probe = new BoundingBox(
+                    new Point3d(bb.Min.X + Tol, bb.Min.Y + Tol, bb.Min.Z - maxGap),
+                    new Point3d(bb.Max.X - Tol, bb.Max.Y - Tol, bb.Min.Z + maxGap));
+                if (!probe.IsValid)
+                    probe = new BoundingBox(
+                        new Point3d(bb.Min.X, bb.Min.Y, bb.Min.Z - maxGap),
+                        new Point3d(bb.Max.X, bb.Max.Y, bb.Min.Z + maxGap));
+
+                bool supported = false;
+                double bestTop = double.NegativeInfinity;
+                tree.Search(probe, (sender, args) =>
+                {
+                    var cand = boxes[args.Id];
+                    if (cand.obj.Id == o.Id) return;
+                    // Must actually overlap in plan and reach up to this object's base.
+                    bool xy = cand.bb.Max.X > bb.Min.X && cand.bb.Min.X < bb.Max.X
+                           && cand.bb.Max.Y > bb.Min.Y && cand.bb.Min.Y < bb.Max.Y;
+                    if (!xy) return;
+                    // A supporter must genuinely START below this object. Without that,
+                    // peers sitting at the same level (e.g. the four webs of one vault)
+                    // vouch for each other and everything looks supported.
+                    bool startsBelow = cand.bb.Min.Z < bb.Min.Z - Tol;
+                    if (!startsBelow) return;
+                    if (cand.bb.Max.Z > bestTop) bestTop = cand.bb.Max.Z;
+                    if (cand.bb.Max.Z >= bb.Min.Z - maxGap) supported = true;
+                });
+
+                if (!supported)
+                {
+                    double gap = double.IsNegativeInfinity(bestTop) ? bb.Min.Z - groundZ : bb.Min.Z - bestTop;
+                    result.Add(new JObject
+                    {
+                        ["id"] = o.Id.ToString(),
+                        ["name"] = o.Attributes.Name ?? "",
+                        ["layer"] = Doc.Layers[o.Attributes.LayerIndex]?.FullPath ?? "",
+                        ["base_z"] = Math.Round(bb.Min.Z, 3),
+                        ["gap_below"] = Math.Round(gap, 3),
+                        ["nearest_top_below"] = double.IsNegativeInfinity(bestTop) ? null : (JToken)Math.Round(bestTop, 3),
+                    });
+                }
+            }
+            return result;
+        }
+
+        JObject FindUnsupported(JObject p)
+        {
+            double maxGap = p["max_gap"]?.ToObject<double>() ?? Math.Max(Tol * 10, 0.05);
+            var objs = ResolveSelector(p["selector"] ?? p["object_ids"]);
+            // Only solids/surfaces are meaningful here.
+            objs = objs.Where(o => o.ObjectType == ObjectType.Brep || o.ObjectType == ObjectType.Extrusion
+                                || o.ObjectType == ObjectType.Surface || o.ObjectType == ObjectType.Mesh).ToList();
+            var floating = FindUnsupportedIn(objs, maxGap, out int checkedCount);
+            var arr = new JArray();
+            foreach (var f in floating.OrderByDescending(t => t["gap_below"]?.ToObject<double>() ?? 0).Take(200))
+                arr.Add(f);
+            var r = Ok(("checked", checkedCount), ("unsupported_count", floating.Count), ("unsupported", arr));
+            r["max_gap"] = maxGap;
+            r["interpretation"] =
+                "An object is supported when the scene's lowest plane, or another object's top, lies within "
+                + "max_gap directly under its footprint. Large gap_below on a spire, pinnacle or statue means "
+                + "it is floating. Test is bbox-based: interlocking or cantilevered geometry can report false positives.";
+            return r;
+        }
+
+        /// <summary>Fast interior inspection: clip at a station, look perpendicular, capture, restore.</summary>
+        JObject SectionPreview(JObject p)
+        {
+            string axis = (p["axis"]?.ToString() ?? "x").Trim().ToLowerInvariant();
+            if (axis != "x" && axis != "y" && axis != "z")
+                return Err("axis must be 'x', 'y' or 'z'", "INVALID_INPUT");
+
+            var sceneBox = UnionBox(AllObjs());
+            if (!sceneBox.IsValid) return Err("Scene is empty", "EMPTY_SCENE");
+            var c = sceneBox.Center;
+            var diag = sceneBox.Diagonal.Length;
+            double station = p["station"]?.ToObject<double>()
+                             ?? (axis == "x" ? c.X : axis == "y" ? c.Y : c.Z);
+
+            Vector3d normal = axis == "x" ? Vector3d.XAxis : axis == "y" ? Vector3d.YAxis : Vector3d.ZAxis;
+            Point3d origin = axis == "x" ? new Point3d(station, c.Y, c.Z)
+                           : axis == "y" ? new Point3d(c.X, station, c.Z)
+                                         : new Point3d(c.X, c.Y, station);
+
+            var view = Doc.Views.ActiveView;
+            var vp = view?.ActiveViewport;
+            if (vp == null) return Err("No active viewport");
+
+            var savedLoc = vp.CameraLocation;
+            var savedTgt = vp.CameraTarget;
+            var savedUp = vp.CameraUp;
+            var savedParallel = vp.IsParallelProjection;
+            var savedMode = vp.DisplayMode;
+            Guid clipId = Guid.Empty;
+
+            try
+            {
+                // Clipping plane: keeps the half-space BEHIND the normal visible.
+                var plane = new Plane(origin, normal);
+                double size = diag > 0 ? diag * 1.5 : 1000;
+                clipId = Doc.Objects.AddClippingPlane(plane, size, size, new[] { vp.Id });
+
+                // Camera on the normal side, looking back at the cut face.
+                vp.ChangeToParallelProjection(true);
+                vp.SetCameraDirection(-normal, true);
+                vp.CameraUp = axis == "z" ? Vector3d.YAxis : Vector3d.ZAxis;
+
+                string modeName = p["display_mode"]?.ToString();
+                if (!string.IsNullOrWhiteSpace(modeName))
+                {
+                    var dm = Rhino.Display.DisplayModeDescription.FindByName(modeName);
+                    if (dm != null) vp.DisplayMode = dm;
+                }
+                // Frame the scene WITHOUT losing the direction we just set
+                // (ZoomExtents re-derives the camera and undoes it).
+                var framed = sceneBox;
+                framed.Inflate(diag * 0.02);
+                if (!vp.ZoomBoundingBox(framed)) vp.ZoomExtents();
+                SettleDisplay(vp, vp.DisplayMode?.EnglishName ?? modeName);
+
+                var cap = new JObject
+                {
+                    ["width"] = p["width"]?.ToObject<int>() ?? 900,
+                    ["height"] = p["height"]?.ToObject<int>() ?? 700,
+                    ["restore_state"] = false,
+                    ["format"] = p["format"]?.ToString() ?? "auto",
+                    ["quality"] = p["quality"]?.ToObject<int>() ?? 80,
+                };
+                var img = CaptureViewport(cap);
+                if (img != null && img["status"]?.ToString() == "ok")
+                {
+                    img["axis"] = axis;
+                    img["station"] = station;
+                    img["note"] = "Clipping plane and camera were restored after capture.";
+                }
+                return img;
+            }
+            catch (Exception e) { return ErrFromException(e, "SectionPreview"); }
+            finally
+            {
+                // Always clean up: a stray clipping plane would silently alter every later view.
+                try { if (clipId != Guid.Empty) Doc.Objects.Delete(clipId, true); } catch { }
+                try
+                {
+                    vp.DisplayMode = savedMode;
+                    vp.ChangeToParallelProjection(savedParallel);
+                    vp.SetCameraLocations(savedTgt, savedLoc);
+                    vp.CameraUp = savedUp;
+                    RedrawScope.Mark();
+                }
+                catch { }
+            }
+        }
+
         JObject ValidateObjects(JObject p)
         {
+            // Any filter/policy argument routes to the v4.10.1 implementation.
+            if (p["layer"] != null || p["name_pattern"] != null || p["since_version"] != null
+                || p["expect_shells"] != null || p["max_checks"] != null)
+                return ValidateObjectsFiltered(p);
+
             var ids = p["object_ids"]?.ToObject<List<string>>();
             // Phase 2: when no IDs given, use the snapshot to pre-filter to Brep/Extrusion candidates
             // so we don't fetch geometry for every curve, point, and annotation.
@@ -2700,6 +3312,36 @@ namespace RhinoAIBridge
         ///     disrupts the user's current view. Default true.
         ///   - view / display_mode: optional overrides applied before capture, restored after.
         /// </summary>
+        // v4.10.1 (field report B2): display modes with an ambient-occlusion / accumulation
+        // pass (Arctic, Rendered, Raytraced) need the pipeline to resolve before capture.
+        // Assigning vp.DisplayMode and capturing immediately produced washed-out,
+        // semi-transparent frames showing interior geometry through opaque walls.
+        private static readonly HashSet<string> AccumulatingDisplayModes =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            { "Arctic", "Rendered", "Raytraced", "Ray Traced", "Ambient Occlusion", "Rendered Studio" };
+
+        private static bool IsAccumulatingMode(string modeName) =>
+            !string.IsNullOrEmpty(modeName) && AccumulatingDisplayModes.Contains(modeName);
+
+        /// <summary>Force the display pipeline to finish drawing before a capture.</summary>
+        private static void SettleDisplay(Rhino.Display.RhinoViewport vp, string modeName)
+        {
+            try
+            {
+                var view = vp?.ParentView ?? Doc?.Views?.ActiveView;
+                if (view == null) return;
+                bool heavy = IsAccumulatingMode(modeName);
+                int cycles = heavy ? 6 : 1;
+                for (int i = 0; i < cycles; i++)
+                {
+                    view.Redraw();
+                    RhinoApp.Wait();          // pump messages so the pipeline advances
+                    if (heavy) System.Threading.Thread.Sleep(40);
+                }
+            }
+            catch { /* settling is best-effort; never fail a capture over it */ }
+        }
+
         JObject CaptureViewport(JObject p)
         {
             int w = p["width"]?.ToObject<int>() ?? 800;
@@ -2747,6 +3389,8 @@ namespace RhinoAIBridge
                         return Err($"Display mode not found: {modeOverride}", "DISPLAY_MODE_NOT_FOUND");
                     vp.DisplayMode = dm;
                 }
+                // Let camera and/or display-mode changes fully resolve before capturing.
+                SettleDisplay(vp, vp.DisplayMode?.EnglishName ?? modeOverride);
 
                 // -- Capture --------------------------------------------------
                 Bitmap source;
@@ -4227,6 +4871,9 @@ namespace RhinoAIBridge
             PruneAutoCheckpoints();
             PersistCheckpointRegistry();
             var fi = new FileInfo(filePath);
+            // An explicit checkpoint is also a fresh rollback point - reset the
+            // auto-checkpoint economics so the next mutating call doesn't re-write it.
+            NoteCheckpointTaken(CurrentSceneVersion(), fi.Length / 1024);
 
             return Ok(
                 ("checkpoint", name),
