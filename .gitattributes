@@ -1,0 +1,32 @@
+# Line-ending policy.
+#
+# WHY THIS FILE EXISTS: cmd.exe executes .bat files by tracking a BYTE OFFSET.
+# With LF-only line endings, `goto` and `call` seek to the wrong position and the
+# script jumps around or appears to close instantly. GitHub's "Download ZIP"
+# serves blobs exactly as stored, so a .bat committed with LF is broken for every
+# user who downloads it, regardless of their core.autocrlf setting.
+#
+# Windows script files are therefore pinned to CRLF in the repository itself.
+
+* text=auto
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+
+# Shell scripts must stay LF or they will not run.
+*.sh   text eol=lf
+
+# Binary payloads: never touch these.
+*.rhp    binary
+*.dll    binary
+*.3dm    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.pdf    binary
+*.zip    binary
+*.skill  binary

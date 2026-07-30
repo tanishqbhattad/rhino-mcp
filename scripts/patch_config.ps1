@@ -1,4 +1,4 @@
-﻿# RhinoAIBridge -- Claude Desktop config patcher
+# RhinoAIBridge -- Claude Desktop config patcher
 # Called by INSTALL.bat:  powershell -File patch_config.ps1 "C:\path\to\server"
 param([Parameter(Mandatory)][string]$ServerDir)
 

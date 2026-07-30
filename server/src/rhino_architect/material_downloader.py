@@ -13,6 +13,14 @@ CACHE_DIR = Path(os.environ.get("APPDATA", "")) / "AIBridge" / "materials"
 
 _BASE_URL = "https://ambientcg.com/api/v2/full_json"
 
+# Single-sourced from package metadata so the UA never claims a stale version.
+try:
+    import importlib.metadata as _md
+
+    _USER_AGENT = "RhinoAIBridge/" + _md.version("rhino-architect")
+except Exception:  # pragma: no cover - raw checkout / metadata unavailable
+    _USER_AGENT = "RhinoAIBridge"
+
 # Resolution preference order - first match wins
 _RESOLUTION_PREFERENCE = [
     "2K-PNG", "2K-JPG", "1K-PNG", "1K-JPG",
@@ -38,7 +46,7 @@ def _fetch_json(url: str) -> dict:
     """Fetch parsed JSON, falling back to the last known good response."""
     cache_file = _SCHEMA_CACHE_DIR / f"{hashlib.sha256(url.encode('utf-8')).hexdigest()[:16]}.json"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "RhinoAIBridge/4.8.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         try:
@@ -309,7 +317,7 @@ def download_material(asset_id: str, resolution: str = "2K") -> dict:
         tmp_path = Path(tmp.name)
 
     try:
-        req = urllib.request.Request(download_url, headers={"User-Agent": "RhinoAIBridge/4.8.0"})
+        req = urllib.request.Request(download_url, headers={"User-Agent": _USER_AGENT})
         with urllib.request.urlopen(req, timeout=60) as resp, open(tmp_path, "wb") as out:
             shutil.copyfileobj(resp, out)
 

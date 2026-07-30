@@ -1,9 +1,12 @@
 {
-  "plugin_version": "4.8.0",
+  "plugin_version": "4.11.0",
+  "server_version": "4.11.0",
   "protocol_version": "5.0",
   "min_rhino_version": "8.0",
   "min_python_version": "3.10",
-  "tested_on": ["Rhino 8.10", "Rhino 8.11", "Rhino 8.12"],
+  "tested_on": ["Rhino 8.9", "Rhino 8.10", "Rhino 8.11", "Rhino 8.12"],
+  "tool_profiles": { "lean": 21, "standard": 71, "full": 123 },
+  "plugin_commands": 157,
   "mcp_clients": {
     "claude_desktop": {
       "supported": true,
@@ -26,5 +29,5 @@
     }
   },
   "breaking_changes": [],
-  "notes": "Protocol 5 (v4.8.0): multiplexed connection, idempotent retries via request_id replay, cooperative cancellation, binary image frames, WAL crash recovery. Fully backward compatible: protocol-4 clients get legacy single-flight semantics; the MCP server also works against 4.x plugins."
+  "notes": "Protocol 5: multiplexed connection, idempotent retries via request_id replay, cooperative cancellation, binary image frames, WAL crash recovery. Fully backward compatible: protocol-4 clients get legacy single-flight semantics; the MCP server also works against 4.x plugins. v4.11.0 pins Windows script files to CRLF via .gitattributes (LF endings break cmd.exe goto/call seeking) and CI verifies dist/plugin matches a fresh build."
 }

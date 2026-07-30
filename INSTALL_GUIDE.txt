@@ -1,5 +1,5 @@
 ================================================================
-  RhinoAIBridge v4.8.0 — Installation Guide
+  RhinoAIBridge v4.11.0 - Installation Guide
   by tanishqb | https://github.com/tanishqbhattad/rhino-mcp
 ================================================================
 
@@ -20,7 +20,7 @@ You do NOT need:
   STEP 1 — Extract the zip
 ================================================================
 
-Unzip RhinoAIBridge-v4.8.0.zip to any folder.
+Unzip the downloaded rhino-mcp archive to any folder.
 Example: C:\RhinoAIBridge\
 
 
@@ -30,15 +30,29 @@ Example: C:\RhinoAIBridge\
 
 Double-click INSTALL.bat
 
-Close Rhino before running the installer so the plugin files can be replaced safely.
+IMPORTANT: close BOTH Rhino and your AI client (Claude Desktop / Codex /
+Antigravity) before running the installer. Each of them holds files open that
+the installer needs to replace. The installer checks for this and will tell
+you which one to close.
 
 It will automatically:
   [1] Copy the pre-built plugin files to Rhino's plugin folder
   [2] Install uv (Python package manager) if not already present
-  [3] Install the MCP server's Python dependencies
+  [3] Install the MCP server's Python dependencies and verify it imports
   [4] Patch Claude Desktop, Codex, and Gemini Antigravity configs when detected
 
-Follow any on-screen prompts. The whole process takes 1-2 minutes.
+The whole process takes 1-2 minutes.
+
+When it finishes you get a verification report like this:
+
+     Rhino plugin ........ OK
+     uv .................. OK
+     Python MCP server ... OK
+     Clients configured .. Claude Desktop
+
+If any line says FAIL, the reason is on screen and the full detail is written
+to install-log.txt next to INSTALL.bat. The window always waits for you to
+press ENTER, so it can never vanish before you have read it.
 
 
 ================================================================
@@ -61,16 +75,24 @@ loads automatically every time you open Rhino.
   STEP 4 — Start the bridge
 ================================================================
 
-Every time you want to use AI with Rhino:
-
-1. Open Rhino 8
-2. In the Rhino command line, type:  AIBridge
-3. Choose Safe, Standard, or Developer mode in the access-mode box
+You do NOT need to do anything. Since v4.10 the plugin loads with Rhino and
+starts the bridge automatically, so simply opening Rhino 8 is enough.
 
 You will see a confirmation message in the Rhino console:
-  "AIBridge: Developer mode active. Listening on 127.0.0.1:9544."
+  "Listening on 127.0.0.1:9544"
 
-To stop the bridge:  AIBridgeStop
+Access mode (how much the AI is allowed to do) is controlled by the
+RHINO_AIBRIDGE_MODE environment variable:
+
+  safe       blocks code execution and destructive edits
+  standard   allows delete / boolean, still blocks code
+  developer  full access - required for execute_python3
+
+To set it, search Windows for "environment variables", add a new user
+variable named RHINO_AIBRIDGE_MODE, and restart Rhino.
+
+If the bridge ever does not start, type  AIBridge  in the Rhino command line
+to start it manually.  To stop it:  AIBridgeStop
 
 
 ================================================================

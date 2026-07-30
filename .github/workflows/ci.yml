@@ -18,6 +18,25 @@ jobs:
       - name: Build plugin
         run: dotnet build plugin/RhinoAIBridge.csproj -c Release
 
+      # dist/plugin is what INSTALL.bat actually copies onto a user's machine.
+      # It once drifted six weeks behind the source, so every install shipped a
+      # plugin missing most of the server's commands. Fail the build if the
+      # committed binary is not what the current source produces.
+      - name: dist/plugin must match the freshly built plugin
+        shell: pwsh
+        run: |
+          $built = "plugin/bin/Release/net8.0/RhinoAIBridge.rhp"
+          $shipped = "dist/plugin/RhinoAIBridge.rhp"
+          if (-not (Test-Path $shipped)) { throw "dist/plugin/RhinoAIBridge.rhp is missing." }
+          $a = (Get-FileHash $built).Hash
+          $b = (Get-FileHash $shipped).Hash
+          if ($a -ne $b) {
+            Write-Host "built   $a"
+            Write-Host "shipped $b"
+            throw "dist/plugin is stale. Rebuild and copy plugin/bin/Release/net8.0/* into dist/plugin/ before committing."
+          }
+          Write-Host "dist/plugin is in sync."
+
   python:
     name: Python MCP checks
     runs-on: windows-latest

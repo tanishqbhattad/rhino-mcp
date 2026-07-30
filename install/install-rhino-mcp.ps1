@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    RhinoAIBridge v4.8.0 installer wrapper.
+    RhinoAIBridge v4.11.0 installer wrapper.
 
 .DESCRIPTION
     Uses the maintained root INSTALL.bat so every installation path deploys
