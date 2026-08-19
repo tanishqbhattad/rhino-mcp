@@ -1000,6 +1000,12 @@ class ScriptInput(BaseModel):
         default=False,
         description="If True, delete live objects created by a script that returns failure.",
     )
+    timeout_seconds: Optional[int] = Field(
+        default=None,
+        ge=5,
+        le=600,
+        description="Override the execution budget (default 180s, max 600). Raise it for large parametric builds.",
+    )
 
 
 class Python3Input(BaseModel):
@@ -1554,7 +1560,15 @@ async def write_module(params: WriteModuleInput) -> dict:
 
     The file is written by the MCP server, never by code running inside Rhino, so
     it cannot leave a locked handle behind. Re-writing the same name is safe -
-    use `rab.use(name)` to pick up the new version without restarting Rhino."""
+    use `rab.use(name)` to pick up the new version without restarting Rhino.
+
+    SCOPE: modules are stored per USER, not per document, so a generic name like
+    `site` or `build` will be silently shared by every project. Prefix names with
+    the project (`zb_tower`, `nd_vault`) to avoid collisions.
+
+    NOTE: `rab.use(name)` re-imports the module fresh, which discards any runtime
+    monkey-patching you did to it — re-apply patches after reloading, or better,
+    put the parameter you are iterating on in the module itself."""
     name = params.name.strip()
     if not _MODULE_NAME_OK.match(name):
         return {"status": "error", "error_code": "INVALID_MODULE_NAME",
@@ -1994,6 +2008,20 @@ async def delete_objects(params: DeleteInput) -> dict:
 @mcp.tool(name="execute_script", annotations=WR)
 async def execute_script(params: ScriptInput) -> dict:
     """Run arbitrary Python inside Rhino. Powerful escape hatch — prefer structured tools.
+
+    START WITH `rab.help()` — it prints the whole helper API with signatures AND the
+    document's unit system, so you never guess a name or a scale.
+
+    KNOWN RHINOCOMMON TRAPS (these fail SILENTLY and produce plausible geometry —
+    use the rab wrapper instead of the raw call):
+      - Curve.CreateInterpolatedCurve(pts, 3, ChordPeriodic) returns an OPEN,
+        non-periodic curve. Lofting it splits the skin at the seam.  -> rab.periodic_curve(pts)
+      - Lofted+capped Breps often come back with INWARD normals, and a boolean
+        difference against an inverted solid ADDS material (recesses become bulges).
+        AddBrep() re-orients on insert, so auditing the document afterwards shows
+        nothing wrong.  -> rab.orient(brep); rab.boolean_diff already checks this.
+      - Brep.CreatePlanarBreps needs an explicit System.Array[Curve]; a single Curve
+        silently returns zero results.  -> rab.cap(curve)
 
     Auto-imported preamble: rhinoscriptsyntax as rs, scriptcontext as sc, Rhino, System,
     and `rab` — a concise helper library. PREFER rab for common elements:
@@ -3165,6 +3193,68 @@ _STANDARD_TOOLS: frozenset[str] = _LEAN_TOOLS | frozenset({
 })
 
 
+def _inline_schema_refs(schema: Any, defs: dict[str, Any] | None = None, _depth: int = 0) -> Any:
+    """Resolve $ref/$defs in a JSON schema so it is readable without dereferencing.
+
+    Tools that take a single pydantic model advertise
+        {"properties": {"params": {"$ref": "#/$defs/ScriptInput"}}, "$defs": {...}}
+    The full field list IS present, but only inside $defs. Clients that do not
+    resolve $ref render this as `{"params": {}}`, so an agent has to GUESS every
+    parameter name and only finds out it was wrong from a validation error.
+    That was the single biggest time cost reported from real sessions.
+
+    Inlining keeps the calling convention identical - it only makes the existing
+    schema self-describing.
+    """
+    if _depth > 12:  # cycle guard; our models nest at most 2-3 deep
+        return schema
+    if isinstance(schema, list):
+        return [_inline_schema_refs(v, defs, _depth + 1) for v in schema]
+    if not isinstance(schema, dict):
+        return schema
+
+    if defs is None:
+        defs = schema.get("$defs") or {}
+
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/$defs/"):
+        target = defs.get(ref.split("/")[-1])
+        if isinstance(target, dict):
+            resolved = _inline_schema_refs(target, defs, _depth + 1)
+            # Preserve any sibling keys (e.g. a description on the property).
+            merged = {k: v for k, v in schema.items() if k != "$ref"}
+            return {**resolved, **merged} if merged else resolved
+
+    out = {}
+    for key, value in schema.items():
+        if key == "$defs":
+            continue
+        out[key] = _inline_schema_refs(value, defs, _depth + 1)
+    return out
+
+
+def _flatten_tool_schemas() -> int:
+    """Rewrite every registered tool's advertised schema to be self-describing."""
+    try:
+        tools = mcp._tool_manager._tools
+    except AttributeError:
+        logger.warning("FastMCP tool registry not found - schemas left as-is.")
+        return 0
+    changed = 0
+    for tool in tools.values():
+        schema = getattr(tool, "parameters", None)
+        if not isinstance(schema, dict) or "$defs" not in schema:
+            continue
+        try:
+            tool.parameters = _inline_schema_refs(schema)
+            changed += 1
+        except Exception as e:  # never let schema polish break startup
+            logger.warning("Could not inline schema for %s: %s", tool.name, e)
+    if changed:
+        logger.info("Inlined $ref schemas for %d tools (parameters are now self-describing).", changed)
+    return changed
+
+
 def _exposed_tool_count() -> int:
     try:
         return len(mcp._tool_manager._tools)
@@ -3205,6 +3295,7 @@ def _apply_tool_profile() -> str:
 
 
 _TOOL_PROFILE = _apply_tool_profile()
+_SCHEMAS_INLINED = _flatten_tool_schemas()
 
 
 # =============================================================================

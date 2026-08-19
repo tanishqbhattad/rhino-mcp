@@ -5,11 +5,18 @@
 # no f-strings, no type hints, no py3-only stdlib.
 #
 # Purpose: let the model write 5 lines of intent instead of 50 lines of
-# rhinoscriptsyntax boilerplate. All dimensions in model units (usually mm).
+# rhinoscriptsyntax boilerplate.
 #
-#   rab.wall((0,0,0), (12000,0,0), height=3000, thickness=200)
-#   rab.slab([(0,0),(30000,0),(30000,18000),(0,18000)], thickness=250, z=3600)
-#   for pt in rab.grid((0,0), 4, 3, 8400, 8400): rab.column(pt, h=3600)
+# START HERE:  rab.help()          - the whole API with signatures + your units
+#              rab.help('arch')    - full docs for one function
+#
+# UNITS: every length is in MODEL UNITS, never auto-converted. The examples below
+# are written with rab.m() so they are correct in ANY document; check
+# rab.units() (or ping.unit_system) before hard-coding numbers.
+#
+#   rab.wall((0,0,0), (rab.m(12),0,0), height=rab.m(3), thickness=rab.m(0.2))
+#   rab.slab([(0,0),(rab.m(30),0),(rab.m(30),rab.m(18)),(0,rab.m(18))], thickness=rab.m(0.25))
+#   for pt in rab.grid((0,0), 4, 3, rab.m(8.4), rab.m(8.4)): rab.column(pt, h=rab.m(3.6))
 #   rab.info()
 
 
@@ -169,13 +176,136 @@ def delete(ids):
     return rs.DeleteObjects(ids)
 
 
+def orient(brep):
+    """Force a closed Brep's normals OUTWARD. Returns the same brep, flipped if needed.
+
+    THE TRAP THIS EXISTS FOR: lofted-and-capped Breps frequently come back with
+    INWARD normals. A boolean difference against an inverted solid ADDS material
+    instead of removing it, so window recesses render as bulges. It is especially
+    nasty because sc.doc.Objects.AddBrep() re-orients on insert - so auditing the
+    document afterwards reports zero inverted solids while the bug is live. The
+    corruption exists only in the in-memory Brep, BEFORE it is added.
+
+    Always call this on a Brep you built in memory, before booleaning or adding.
+    """
+    if brep is None:
+        return brep
+    try:
+        if brep.SolidOrientation == Rhino.Geometry.BrepSolidOrientation.Inward:
+            brep.Flip()
+    except Exception:
+        pass
+    return brep
+
+
+def is_inverted(brep):
+    """True when a closed Brep's normals point inward (see orient())."""
+    try:
+        return brep is not None and \
+            brep.SolidOrientation == Rhino.Geometry.BrepSolidOrientation.Inward
+    except Exception:
+        return False
+
+
+def periodic_curve(points, degree=3):
+    """Closed PERIODIC (smooth-seam) curve through points.
+
+    THE TRAP THIS EXISTS FOR: Curve.CreateInterpolatedCurve(pts, 3,
+    CurveKnotStyle.ChordPeriodic) returns an OPEN, non-periodic curve
+    (IsClosed False, IsPeriodic False). Lofting those produces a skin split down
+    the seam and a "solid" that silently is not closed. NurbsCurve.Create(True,
+    degree, pts) is the call that actually gives a periodic curve.
+
+    Pass the points ONCE - do not repeat the first point at the end.
+    """
+    pts = [_p3(p) for p in points]
+    if len(pts) > 2 and pts[0].DistanceTo(pts[-1]) < _tol():
+        pts = pts[:-1]                      # a repeated seam point breaks periodicity
+    if len(pts) < 3:
+        raise ValueError("periodic_curve: need at least 3 distinct points")
+    arr = System.Array[Point3d](pts)
+    crv = NurbsCurve.Create(True, int(degree), arr)
+    if crv is None:
+        raise ValueError("periodic_curve: NurbsCurve.Create returned None (duplicate or collinear points?)")
+    if not crv.IsClosed:
+        raise ValueError("periodic_curve: result is not closed - check for duplicate points")
+    return crv
+
+
+def cap(curves, layer_path=None, name=None, add=False):
+    """Planar Brep(s) from one or more closed planar curves.
+
+    THE TRAP THIS EXISTS FOR: Brep.CreatePlanarBreps overload resolution needs an
+    explicit System.Array[Curve]. Handing it a single Curve silently returns zero
+    results instead of raising, so the failure looks like "the geometry was wrong".
+    """
+    if not isinstance(curves, (list, tuple)):
+        curves = [curves]
+    resolved = []
+    for c in curves:
+        cc = c if isinstance(c, Rhino.Geometry.Curve) else rs.coercecurve(c)
+        if cc is None:
+            raise ValueError("cap: not a curve: %s" % (c,))
+        resolved.append(cc)
+    arr = System.Array[Rhino.Geometry.Curve](resolved)
+    breps = Brep.CreatePlanarBreps(arr, _tol())
+    if not breps or len(breps) == 0:
+        raise ValueError("cap: no planar Brep produced - are the curves closed, planar and coplanar?")
+    if not add:
+        return list(breps)
+    ids = []
+    for b in breps:
+        ids.append(_assign(sc.doc.Objects.AddBrep(orient(b)), layer_path, name))
+    return ids
+
+
+def assign(ids, layer_path=None, name=None, color=None):
+    """Set layer / name / colour on MANY objects in one pass.
+
+    Doing this per object costs two document transactions each; on a 335-object
+    rebuild that is 670 transactions. Returns the ids for chaining.
+    """
+    if isinstance(ids, str):
+        ids = [ids]
+    ids = [str(i) for i in ids]
+    if not ids:
+        return ids
+    if layer_path:
+        layer(layer_path)
+        rs.ObjectLayer(ids, layer_path)          # rhinoscriptsyntax accepts a list
+    if color is not None:
+        rs.ObjectColor(ids, System.Drawing.Color.FromArgb(color[0], color[1], color[2]))
+    if name:
+        # Names must be unique-ish per object; suffix when assigning in bulk.
+        if len(ids) == 1:
+            rs.ObjectName(ids[0], name)
+        else:
+            for i, oid in enumerate(ids):
+                rs.ObjectName(oid, "%s_%d" % (name, i + 1))
+    return ids
+
+
 def boolean_diff(a_id, b_id, delete_input=True):
-    """Boolean difference a - b with validity checks. Returns list of guid strs."""
+    """Boolean difference a - b, with validity AND ORIENTATION checks.
+
+    Orientation is the check that actually matters here: differencing against an
+    inverted solid ADDS material (recesses become bulges). Both operands are
+    oriented outward before the operation.
+    """
     a = rs.coercebrep(a_id); b = rs.coercebrep(b_id)
     if a is None or b is None:
         raise ValueError("boolean_diff: inputs must be Breps/solids")
     if not a.IsValid or not b.IsValid:
         raise ValueError("boolean_diff: invalid input Brep - run validate_objects")
+    flipped = []
+    if is_inverted(a):
+        flipped.append("a")
+    if is_inverted(b):
+        flipped.append("b")
+    orient(a); orient(b)
+    if flipped:
+        print("[rab] boolean_diff: re-oriented inverted operand(s) %s before subtracting"
+              % ", ".join(flipped))
     out = Brep.CreateBooleanDifference([a], [b], _tol())
     if out is None or len(out) == 0:
         raise ValueError("boolean_diff: boolean failed (coplanar faces? oversize the cutter)")
@@ -579,6 +709,100 @@ def sweep_profile(rail_id, profile="roll", scale=1.0, layer_path=None, name=None
     solid = breps[0].CapPlanarHoles(_tol()) or breps[0]
     gid = sc.doc.Objects.AddBrep(solid)
     return _assign(gid, layer_path, name)
+
+
+# --- Discoverability --------------------------------------------------------
+
+_HELP_GROUPS = [
+    ("create",   ["box", "wall", "slab", "column", "line", "extrude", "grid"]),
+    ("historic", ["arch", "arch_geometry", "arch_curve", "arch_profile",
+                  "vault_quadripartite", "vault_web", "rose_window", "sweep_profile"]),
+    ("curves",   ["periodic_curve", "cap"]),
+    ("edit",     ["move", "copy_to", "delete", "boolean_diff", "orient", "is_inverted"]),
+    ("query",    ["ids_on", "bbox", "info", "units"]),
+    ("organise", ["layer", "assign"]),
+    ("modules",  ["use"]),
+]
+
+
+def _signature(fn, fname):
+    try:
+        import inspect
+        spec = inspect.getargspec(fn)
+        args = list(spec.args)
+        defaults = list(spec.defaults or ())
+        n_req = len(args) - len(defaults)
+        parts = []
+        for i, a in enumerate(args):
+            if i < n_req:
+                parts.append(a)
+            else:
+                parts.append("%s=%r" % (a, defaults[i - n_req]))
+        return "%s(%s)" % (fname, ", ".join(parts))
+    except Exception:
+        return "%s(...)" % fname
+
+
+def doc(name):
+    """Print the full signature and docstring of one rab function."""
+    fn = globals().get(name)
+    if fn is None or not callable(fn):
+        print("[rab] no function named '%s'. Run rab.help() for the list." % name)
+        return None
+    print(_signature(fn, name))
+    d = (fn.__doc__ or "(no docstring)").strip()
+    for line in d.split("\n"):
+        print("    " + line.rstrip())
+    return None
+
+
+def help(name=None):
+    """List the rab API with signatures, or rab.help('wall') for one function.
+
+    Start here. The library is not discoverable through dir() alone, and the
+    numbers in these examples depend on the document's unit system - which this
+    prints at the top so you cannot mistake metres for millimetres.
+    """
+    if name:
+        return doc(name)
+    u = units()
+    print("rab %s  |  document units: %s  |  tolerance: %s"
+          % (__version__, u["unit_system"], u["tolerance"]))
+    print("ALL LENGTHS ARE IN MODEL UNITS - a wall 3.0 high in metres is 3000 in millimetres.")
+    print("")
+    for group, names in _HELP_GROUPS:
+        print("[%s]" % group)
+        for fname in names:
+            fn = globals().get(fname)
+            if fn is None or not callable(fn):
+                continue
+            first = ((fn.__doc__ or "").strip().split("\n") or [""])[0]
+            print("  %-58s %s" % (_signature(fn, fname), first[:60]))
+        print("")
+    print("rab.help('arch') for full docs on one function.")
+    return None
+
+
+def units():
+    """Current document unit system, tolerance, and a metres->model-units factor."""
+    try:
+        us = sc.doc.ModelUnitSystem
+        name = str(us)
+    except Exception:
+        name = "Unknown"
+    per_metre = {
+        "Millimeters": 1000.0, "Centimeters": 100.0, "Meters": 1.0,
+        "Inches": 39.3701, "Feet": 3.28084,
+    }.get(name, 1.0)
+    return {"unit_system": name, "tolerance": _tol(), "per_metre": per_metre}
+
+
+def m(metres):
+    """Convert metres to model units. rab.m(3) is 3000 in a mm doc, 3.0 in a metre doc.
+
+    Use this instead of hard-coding numbers when you do not control the document.
+    """
+    return float(metres) * units()["per_metre"]
 
 
 def info():

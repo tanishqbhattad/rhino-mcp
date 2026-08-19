@@ -610,6 +610,11 @@ namespace RhinoAIBridge
                 "batch"            => 180,
                 _                  => 60,
             };
+            // v4.12: let the caller extend the budget for genuinely long work
+            // (large parametric studies ran 40-60s and had no escape hatch).
+            var requested = cmd["params"]?["timeout_seconds"]?.ToObject<int?>();
+            if (requested.HasValue)
+                timeoutSec = Math.Max(5, Math.Min(600, requested.Value));
 
             var token = OperationRegistry.TokenFor(requestId);
             JObject result;

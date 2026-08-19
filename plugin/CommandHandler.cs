@@ -578,6 +578,10 @@ namespace RhinoAIBridge
             j["recoverable"] = code is not ("AUTH_FAILED" or "MODE_BLOCKED" or "INVALID_REQUEST");
             j["retry_hint"] = code switch
             {
+                "SCRIPT_ERROR" => "This is a Python error in your script, not a geometry problem. "
+                                + "Read the message and fix the code. Remember execute_script runs "
+                                + "IronPython 2 (no f-strings/type hints), and call rab.help() to see "
+                                + "the helper API instead of guessing names.",
                 "LAYER_NOT_FOUND" => "Use list_layers or pass the full Parent::Child layer path.",
                 "OBJECT_NOT_FOUND" => "Call query_scene/list_objects again and use the current object id.",
                 "NOT_A_CURVE" => "Pass a curve id, or create/extract a curve first.",
@@ -598,9 +602,37 @@ namespace RhinoAIBridge
             return Err(e.Message, ClassifyErrorCode(e), diag);
         }
 
+        // A Python-level mistake in a script is NOT a geometry problem. Telling the
+        // caller "this is usually a geometry validity issue" for a NameError sent
+        // real sessions off debugging the wrong thing - a misleading hint is worse
+        // than no hint. (field report v4.11)
+        static readonly string[] PythonErrorMarkers =
+        {
+            "is not defined", "invalid syntax", "has no attribute", "unexpected indent",
+            "not callable", "takes exactly", "takes no arguments", "cannot import",
+            "unsupported operand", "object is not", "unexpected token", "IndentationError",
+        };
+
+        static readonly HashSet<string> PythonExceptionTypes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "UnboundNameException", "SyntaxErrorException", "MissingMemberException",
+            "ArgumentTypeException", "ImportException", "IndentationException",
+        };
+
+        static bool LooksLikeScriptError(Exception e)
+        {
+            if (e == null) return false;
+            if (PythonExceptionTypes.Contains(e.GetType().Name)) return true;
+            var m = e.Message ?? "";
+            foreach (var marker in PythonErrorMarkers)
+                if (m.IndexOf(marker, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+
         static string ClassifyErrorCode(Exception e)
         {
             var m = e.Message ?? "";
+            if (LooksLikeScriptError(e)) return "SCRIPT_ERROR";
             if (e is FormatException || e is ArgumentException) return "INVALID_REQUEST";
             if (m.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0) return "OBJECT_NOT_FOUND";
             if (m.IndexOf("not a curve", StringComparison.OrdinalIgnoreCase) >= 0) return "NOT_A_CURVE";
