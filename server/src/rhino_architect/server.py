@@ -816,7 +816,12 @@ class CaptureInput(BaseModel):
             "Accepts a selector ('all', 'by_layer:Massing', 'by_name:tower', 'selected', or GUIDs), "
             "or {selector: ..., margin: 0.04}. width/height define the aspect. "
             "Because the camera is derived from the selection's bounding box it is exact and repeatable: "
-            "the same fit always frames identically."
+            "the same fit always frames identically. "
+            "NOTE: it frames the axis-aligned BOUNDING BOX, so a tall tower on a wide flat site leaves "
+            "visible slack - the box is tight, the geometry inside it is not. Fit a sub-selection "
+            "(fit='by_name:tower') to fill the frame with what you actually want to see. "
+            "fit sets distance and frustum only; it does not choose a view DIRECTION - set that with "
+            "set_camera or view= first, then fit."
         ),
     )
     lens_length: Optional[float] = Field(
