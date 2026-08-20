@@ -809,6 +809,20 @@ class CaptureInput(BaseModel):
     annotation_scope: str = Field(default="selected", description="'selected' or 'visible'. Visible is capped by max_annotations.")
     max_annotations: int = Field(default=20, ge=0, le=200)
     as_json: bool = Field(default=False, description="Return the full JSON payload (base64 + metadata) instead of MCP image content. For clients that cannot render image blocks.")
+    fit: Any = Field(
+        default=None,
+        description=(
+            "Frame a selection to the requested output aspect - use this instead of guessing a camera. "
+            "Accepts a selector ('all', 'by_layer:Massing', 'by_name:tower', 'selected', or GUIDs), "
+            "or {selector: ..., margin: 0.04}. width/height define the aspect. "
+            "Because the camera is derived from the selection's bounding box it is exact and repeatable: "
+            "the same fit always frames identically."
+        ),
+    )
+    lens_length: Optional[float] = Field(
+        default=None,
+        description="Camera focal length in mm for this capture (50 normal, 24 wide, 135 tele). Ignored in parallel projection.",
+    )
 
 
 class InspectionCaptureInput(CaptureInput):
@@ -1666,7 +1680,15 @@ async def capture_viewport(params: CaptureInput) -> Any:
     capture, so inspecting the model from any angle never disrupts the user's current view.
     Pass view='Top' and/or display_mode= to temporarily switch before capturing.
     For explicit camera overrides, either use capture_inspection_view or pass
-    view={location:[x,y,z], target:[x,y,z], projection:'parallel|perspective'}.
+    view={location:[x,y,z], target:[x,y,z], projection:'parallel|perspective', lens_length:35}.
+
+    FRAMING: width/height set the output RESOLUTION, and the live viewport's aspect is
+    unrelated to it, so a differently-shaped request widens the field of view rather than
+    reframing. Do not hunt for a camera - pass `fit` and let the server solve it:
+        capture_viewport(fit="by_layer:Massing", width=1600, height=900)
+        capture_viewport(fit={"selector": "all", "margin": 0.1}, width=1200, height=1200)
+    fit frames that selection exactly to the requested aspect, and is repeatable.
+
     Pass as_json=true to get the base64 JSON payload instead of MCP image content."""
     payload = params.model_dump(exclude_none=True)
     as_json = payload.pop("as_json", False)

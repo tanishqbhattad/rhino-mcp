@@ -578,6 +578,8 @@ namespace RhinoAIBridge
             j["recoverable"] = code is not ("AUTH_FAILED" or "MODE_BLOCKED" or "INVALID_REQUEST");
             j["retry_hint"] = code switch
             {
+                "INVALID_REQUEST" => "A parameter was the wrong shape or type. Re-read the tool schema - "
+                                   + "selectors accept a plain string or an array of strings.",
                 "SCRIPT_ERROR" => "This is a Python error in your script, not a geometry problem. "
                                 + "Read the message and fix the code. Remember execute_script runs "
                                 + "IronPython 2 (no f-strings/type hints), and call rab.help() to see "
@@ -633,6 +635,8 @@ namespace RhinoAIBridge
         {
             var m = e.Message ?? "";
             if (LooksLikeScriptError(e)) return "SCRIPT_ERROR";
+            // A JSON conversion failure is a caller/parameter problem, never geometry.
+            if (e is Newtonsoft.Json.JsonException) return "INVALID_REQUEST";
             if (e is FormatException || e is ArgumentException) return "INVALID_REQUEST";
             if (m.IndexOf("not found", StringComparison.OrdinalIgnoreCase) >= 0) return "OBJECT_NOT_FOUND";
             if (m.IndexOf("not a curve", StringComparison.OrdinalIgnoreCase) >= 0) return "NOT_A_CURVE";
@@ -2785,6 +2789,10 @@ namespace RhinoAIBridge
 
         private List<RhinoObject> ResolveSelector(JToken sel)
         {
+            // Accept a bare string ("all", "by_layer:Foo", a guid) as well as an array.
+            // Requiring the array form is a pointless trap for callers.
+            if (sel != null && sel.Type == JTokenType.String)
+                sel = new JArray(sel.ToString());
             var ids = ResIds(sel ?? JToken.FromObject(new[] { "all" }));
             var list = new List<RhinoObject>();
             foreach (var s in ids)
@@ -3374,6 +3382,118 @@ namespace RhinoAIBridge
             catch { /* settling is best-effort; never fail a capture over it */ }
         }
 
+        /// <summary>
+        /// Frame a selection to the OUTPUT image aspect (field report: the highest-value
+        /// capture addition). width/height change the render resolution, and because the
+        /// live viewport's frustum aspect is unrelated to the requested size, Rhino widens
+        /// the FOV or crops instead of reframing - so every capture became a guess.
+        ///
+        /// This computes the camera EXACTLY: for each bbox corner, in camera space,
+        ///     D >= |v.x| / tan(halfFovH) + v.z    and    D >= |v.y| / tan(halfFovV) + v.z
+        /// Taking the maximum over all corners gives the closest distance at which the
+        /// whole selection is inside the frame. Being absolute (derived from the bbox,
+        /// never from the current camera) it is also idempotent - repeating a capture
+        /// cannot drift.
+        /// </summary>
+        private bool ApplyFitFraming(Rhino.Display.RhinoViewport vp, JToken fitToken,
+                                     int width, int height, out JObject note)
+        {
+            note = null;
+            if (fitToken == null || vp == null) return false;
+
+            JToken selector = fitToken;
+            double margin = 0.04;
+            if (fitToken is JObject fo)
+            {
+                selector = fo["selector"] ?? fo["layers"] ?? fo["ids"] ?? fo["objects"];
+                var mg = fo["margin"]?.ToObject<double?>();
+                if (mg.HasValue) margin = Math.Max(0.0, Math.Min(0.5, mg.Value));
+            }
+            if (selector == null) return false;
+
+            // "by_layer:Foo" / "all" / guid list all resolve through the usual selector path.
+            var objs = ResolveSelector(selector);
+            if (objs.Count == 0)
+            {
+                note = new JObject { ["fit"] = "no objects matched - framing left unchanged" };
+                return false;
+            }
+            var box = UnionBox(objs);
+            if (!box.IsValid) return false;
+
+            double aspect = (double)width / Math.Max(1, height);
+            var vi = new Rhino.DocObjects.ViewportInfo(vp);
+            vi.SetScreenPort(0, width, 0, height, 0, 1);
+            vi.FrustumAspect = aspect;
+
+            if (!vi.GetFrustum(out double fl, out double fr, out double fb, out double ft,
+                               out double fn, out double ff))
+                return false;
+
+            var z = vi.CameraZ; z.Unitize();          // points from target BACK to camera
+            var x = vi.CameraX; x.Unitize();
+            var y = vi.CameraY; y.Unitize();
+            var dir = -z;
+            var c = box.Center;
+            var corners = box.GetCorners();
+
+            if (vi.IsParallelProjection)
+            {
+                double hw = 0, hh = 0, hd = 0;
+                foreach (var pt in corners)
+                {
+                    var v = pt - c;
+                    hw = Math.Max(hw, Math.Abs(v * x));
+                    hh = Math.Max(hh, Math.Abs(v * y));
+                    hd = Math.Max(hd, Math.Abs(v * z));
+                }
+                double halfH = Math.Max(hh, hw / aspect) * (1.0 + margin);
+                if (halfH <= 0) return false;
+                double halfW = halfH * aspect;
+                double dist = hd * 3.0 + 1.0;
+                vi.SetCameraLocation(c - dir * dist);
+                vi.SetFrustum(-halfW, halfW, -halfH, halfH, 0.001, dist + hd * 3.0 + 1.0);
+            }
+            else
+            {
+                // IDEMPOTENCE: the vertical half-angle is read from the frustum and the
+                // frustum is then rewritten, so folding the margin into the angle makes
+                // each call widen the lens a little more - two identical captures drifted
+                // (lens 33.7 -> 32.4). Keep the angles EXACTLY as they are and express the
+                // margin purely as extra camera distance, which cannot feed back.
+                double tanV = ft / fn;
+                if (tanV <= 0) return false;
+                double tanH = tanV * aspect;
+                double d = 0;
+                foreach (var pt in corners)
+                {
+                    var v = pt - c;
+                    double vx = Math.Abs(v * x), vy = Math.Abs(v * y), vz = v * z;
+                    d = Math.Max(d, Math.Max(vx / tanH, vy / tanV) + vz);
+                }
+                d *= (1.0 + margin);
+                if (d <= 0) d = box.Diagonal.Length;
+                double near = Math.Max(d * 0.01, 0.01);
+                double far = d + box.Diagonal.Length * 2.0;
+                vi.SetCameraLocation(c - dir * d);
+                vi.SetFrustum(-tanH * near, tanH * near, -tanV * near, tanV * near, near, far);
+            }
+
+            vi.TargetPoint = c;
+            bool applied = vp.SetViewProjection(vi, true);
+            if (applied)
+            {
+                note = new JObject
+                {
+                    ["fit"] = "framed to the requested output aspect",
+                    ["objects"] = objs.Count,
+                    ["aspect"] = Math.Round(aspect, 4),
+                    ["margin"] = margin,
+                };
+            }
+            return applied;
+        }
+
         JObject CaptureViewport(JObject p)
         {
             int w = p["width"]?.ToObject<int>() ?? 800;
@@ -3421,6 +3541,16 @@ namespace RhinoAIBridge
                         return Err($"Display mode not found: {modeOverride}", "DISPLAY_MODE_NOT_FOUND");
                     vp.DisplayMode = dm;
                 }
+                // Optional lens override, applied BEFORE fit so framing accounts for it.
+                var lens = p["lens_length"]?.ToObject<double?>();
+                if (lens.HasValue && lens.Value > 1 && !vp.IsParallelProjection)
+                    vp.Camera35mmLensLength = lens.Value;
+
+                // fit: frame a selection to the requested OUTPUT aspect.
+                JObject fitNote = null;
+                if (p["fit"] != null)
+                    ApplyFitFraming(vp, p["fit"], w, h, out fitNote);
+
                 // Let camera and/or display-mode changes fully resolve before capturing.
                 SettleDisplay(vp, vp.DisplayMode?.EnglishName ?? modeOverride);
 
@@ -3514,6 +3644,7 @@ namespace RhinoAIBridge
                         ["visible_objects"] = Doc.Objects.Count(o => !o.IsDeleted && o.Visible),
                         ["total_objects"]   = snap2?.Count ?? 0
                     };
+                    if (fitNote != null) r["framing"] = fitNote;
                     if (annotate)
                     {
                         r["annotations"] = CaptureAnnotations(p);
