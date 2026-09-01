@@ -147,6 +147,8 @@ class RhinoProtocol:
         "get_recovery_log",
         "detect_clashes",
         "list_commands",
+        "report_areas", "assert_geometry", "find_unsupported", "section_preview",
+        "get_operation_result", "list_operations",
     })
 
     def __init__(self, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT):
@@ -411,12 +413,29 @@ class RhinoProtocol:
             except asyncio.TimeoutError as exc:
                 if self._server_multiplex:
                     # Connection is healthy - only this command is slow. Leave the
-                    # socket alone (other commands may be in flight). Re-issuing
-                    # the same tool call is safe: the plugin replays/joins by id.
+                    # socket alone (other commands may be in flight). The work keeps
+                    # running in Rhino, so surface the request_id: the caller can fetch
+                    # the eventual result with get_operation_result instead of guessing
+                    # whether it ran (field report A4).
+                    rid = payload.get("request_id")
+                    # A5: an abandoned READ that keeps running holds the UI thread and
+                    # every later command queues behind it - one orphaned report_areas
+                    # stalled four captures and a script. Reads are recomputable, so
+                    # cancelling them costs nothing. Mutations are left alone: their
+                    # result is valuable and retrievable via get_operation_result.
+                    if retry_safe_always:
+                        try:
+                            await asyncio.wait_for(self.cancel(rid), timeout=2.0)
+                            logger.info("Auto-cancelled abandoned read '%s' (%s)", command_type, rid)
+                        except Exception:
+                            pass
                     raise RhinoConnectionError(
                         f"Timed out waiting for '{command_type}' after {timeout:.0f}s. "
-                        "It may still be running in Rhino. Re-running this tool is safe "
-                        "(idempotent request replay) - or use cancel_operation."
+                        f"It is probably STILL RUNNING in Rhino. request_id={rid} - call "
+                        f"get_operation_result(request_id='{rid}') to collect the result "
+                        "once it finishes, cancel_operation to stop it, or simply re-run "
+                        "this tool (idempotent replay returns the same result, it will not "
+                        "duplicate geometry)."
                     ) from exc
                 # Legacy: a timed-out frame would desync FIFO matching - reset.
                 await self.disconnect()

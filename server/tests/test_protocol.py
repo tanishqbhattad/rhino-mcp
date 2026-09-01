@@ -221,11 +221,49 @@ async def test_multiplex_timeout_keeps_socket_and_evicts_future():
 
     async with MockPlugin(multiplex=True, responder=responder) as plugin:
         conn = await make_conn(plugin)
-        with pytest.raises(RhinoConnectionError, match="may still be running"):
+        with pytest.raises(RhinoConnectionError) as exc:
             await conn.send_command("boolean_operation", timeout=0.2)
+        msg = str(exc.value)
+        # The work keeps running in Rhino, so the message must hand back the
+        # request_id and point at get_operation_result - otherwise a timeout is
+        # indistinguishable from a failure (field report A4).
+        assert "STILL RUNNING" in msg
+        assert "get_operation_result" in msg
+        assert "request_id=" in msg
         assert not conn._pending, "timed-out future leaked in _pending"
         assert not conn._fifo, "timed-out future leaked in _fifo"
         assert conn._writer is not None, "healthy multiplexed socket must stay open"
+        await conn.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_abandoned_read_is_auto_cancelled():
+    """A read that times out must be cancelled so it stops holding the UI thread.
+
+    One orphaned report_areas blocked four later captures in a real session (A5).
+    Reads are recomputable, so cancelling costs nothing; mutations are left running
+    because their result is valuable and retrievable.
+    """
+    cancels: list[str] = []
+
+    async def responder(writer, payload, _conn):
+        if payload.get("type") == "cancel":
+            cancels.append(payload["params"]["request_id"])
+            writer.write(enc_json({"status": "ok", "request_id": payload["request_id"]}))
+            await writer.drain()
+            return True
+        return True  # never answer the actual command
+
+    async with MockPlugin(multiplex=True, responder=responder) as plugin:
+        conn = await make_conn(plugin)
+        with pytest.raises(RhinoConnectionError):
+            await conn.send_command("report_areas", timeout=0.2)
+        assert len(cancels) == 1, "an abandoned READ should be cancelled server-side"
+
+        cancels.clear()
+        with pytest.raises(RhinoConnectionError):
+            await conn.send_command("create_object", timeout=0.2)
+        assert cancels == [], "a mutation must NOT be auto-cancelled - its result is wanted"
         await conn.disconnect()
 
 

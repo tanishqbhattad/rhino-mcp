@@ -276,6 +276,26 @@ namespace RhinoAIBridge
             finally { _rw.ExitUpgradeableReadLock(); }
         }
 
+        /// <summary>
+        /// Per-layer object counts keyed by layer INDEX.
+        ///
+        /// v4.14 (field report A1): CountsByLayerName() keys by FullPath while callers
+        /// looked up by leaf Name, so every nested layer reported object_count 0 - and
+        /// duplicate leaf names overwrote each other in the dictionary. Index is the only
+        /// unambiguous key.
+        /// </summary>
+        public Dictionary<int, int> CountsByLayerIndex()
+        {
+            _rw.EnterReadLock();
+            try
+            {
+                var d = new Dictionary<int, int>(_byLayerIndex.Count);
+                foreach (var kv in _byLayerIndex) d[kv.Key] = kv.Value.Count;
+                return d;
+            }
+            finally { _rw.ExitReadLock(); }
+        }
+
         public Dictionary<string, int> CountsByLayerName()
         {
             _rw.EnterReadLock();
@@ -305,27 +325,64 @@ namespace RhinoAIBridge
             finally { _rw.ExitReadLock(); }
         }
 
-        public List<ObjectMeta> ByLayerName(string layerName)
+        /// <summary>
+        /// Objects on a layer AND, by default, all of its descendants.
+        ///
+        /// v4.14 (field report A2): this used to resolve to ONE layer index - exact
+        /// full-path match, else the FIRST layer whose leaf name matched. Two bugs fell
+        /// out of that in real models, where nested trees are the norm and leaf names
+        /// repeat (two "Piers" layers under different parents):
+        ///   - "by_layer:NotreDame::03_Facade" returned nothing, because every object
+        ///     actually lives on a CHILD of that layer;
+        ///   - a bare leaf name silently picked whichever duplicate came first.
+        /// Now every matching layer and its subtree contribute.
+        /// </summary>
+        public List<ObjectMeta> ByLayerName(string layerName, bool includeDescendants = true)
         {
             _rw.EnterReadLock();
             try
             {
-                int idx = -1;
+                var indices = new List<int>();
+                string prefix = layerName + "::";
                 foreach (var kv in _layerNames)
-                    if (string.Equals(kv.Value, layerName, StringComparison.Ordinal)) { idx = kv.Key; break; }
-                if (idx < 0)
                 {
+                    if (string.Equals(kv.Value, layerName, StringComparison.OrdinalIgnoreCase) ||
+                        (includeDescendants && kv.Value.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+                        indices.Add(kv.Key);
+                }
+                if (indices.Count == 0)
+                {
+                    // Fall back to leaf-name matching - but take EVERY match, not the first.
                     foreach (var kv in _layerNames)
                     {
                         var leaf = kv.Value;
-                        int separator = leaf.LastIndexOf("::", StringComparison.Ordinal);
-                        if (separator >= 0) leaf = leaf.Substring(separator + 2);
-                        if (string.Equals(leaf, layerName, StringComparison.Ordinal)) { idx = kv.Key; break; }
+                        int sep = leaf.LastIndexOf("::", StringComparison.Ordinal);
+                        if (sep >= 0) leaf = leaf.Substring(sep + 2);
+                        if (string.Equals(leaf, layerName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            indices.Add(kv.Key);
+                            if (includeDescendants)
+                            {
+                                string sub = kv.Value + "::";
+                                foreach (var kv2 in _layerNames)
+                                    if (kv2.Value.StartsWith(sub, StringComparison.OrdinalIgnoreCase))
+                                        indices.Add(kv2.Key);
+                            }
+                        }
                     }
                 }
-                if (idx < 0) return new List<ObjectMeta>();
-                if (!_byLayerIndex.TryGetValue(idx, out var ids)) return new List<ObjectMeta>();
-                return ids.Select(id => _objects.TryGetValue(id, out var m) ? m : null).Where(m => m != null).ToList();
+                if (indices.Count == 0) return new List<ObjectMeta>();
+
+                var seen = new HashSet<Guid>();
+                var result = new List<ObjectMeta>();
+                foreach (var idx in indices)
+                {
+                    if (!_byLayerIndex.TryGetValue(idx, out var ids)) continue;
+                    foreach (var id in ids)
+                        if (seen.Add(id) && _objects.TryGetValue(id, out var m) && m != null)
+                            result.Add(m);
+                }
+                return result;
             }
             finally { _rw.ExitReadLock(); }
         }

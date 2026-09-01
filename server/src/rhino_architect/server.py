@@ -646,6 +646,10 @@ class AlignGridInput(BaseModel):
 
 class ReportAreasInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    scope: Any = Field(None, description="Restrict to a selector ('by_layer:Building', 'by_name:slab', GUIDs). Default: whole document.")
+    mode: str = Field("fast", description="'fast' (default) integrates volume only for closed solids; 'exact' integrates every Brep. On a large model exact can take minutes - raise timeout_seconds with it.")
+    max_volume_computations: Optional[int] = Field(None, ge=1, description="Cap on volume integrations in fast mode (default 1500).")
+    timeout_seconds: Optional[int] = Field(None, ge=5, le=600, description="Override the execution budget for this call.")
     by: str = "layer"  # layer | level | name
     level_height: float = Field(default=3000, gt=0)
 
@@ -1454,8 +1458,15 @@ async def report_areas(params: ReportAreasInput) -> dict:
     """GFA / NFA-style area schedule grouped by layer, level, or name.
 
     For solid Breps with known volume and bbox height, plan_area = volume / height.
-    Falls back to top-face area, then to bbox footprint."""
-    return await _exec_simple("report_areas", params.model_dump())
+    Falls back to top-face area, then to bbox footprint.
+
+    PERFORMANCE: mode='fast' (default) only integrates volume for CLOSED solids -
+    volume is undefined for an open shell anyway, and integrating hundreds of vault
+    webs or roof planes is what made this time out on large models. Scope it
+    (scope='by_layer:Building') for a phase check, and use mode='exact' with a raised
+    timeout_seconds for a final schedule. The response reports how many volumes were
+    actually computed and how many were skipped."""
+    return await _exec_simple("report_areas", params.model_dump(exclude_none=True))
 
 
 # Layers --------------------------------------------------
@@ -3122,6 +3133,30 @@ async def list_checkpoints() -> dict:
 # =============================================================================
 # v4.8: PROTOCOL 5 TOOLS - cancellation, checkpoint hygiene, crash recovery
 # =============================================================================
+
+class OperationIdInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    request_id: str = Field(..., description="The request_id reported in a timeout message.")
+
+
+@mcp.tool(name="get_operation_result", annotations=RO)
+async def get_operation_result(params: OperationIdInput) -> dict:
+    """Fetch the result of a call that timed out client-side but kept running in Rhino.
+
+    A long script does NOT stop when the client gives up waiting - it finishes, and its
+    output and created ids land in the plugin's replay cache. This retrieves them, so a
+    timeout stops being "did that run or not?".
+
+    state='completed' returns the original result, 'running' means poll again, 'unknown'
+    means it never arrived or has aged out of the cache."""
+    return await _exec_simple("get_operation_result", params.model_dump())
+
+
+@mcp.tool(name="list_operations", annotations=RO)
+async def list_operations(params: Optional[Empty] = None) -> dict:
+    """List operations still executing in Rhino (request_ids). Useful after a timeout."""
+    return await _exec_simple("list_operations", {})
+
 
 @mcp.tool(name="cancel_operation", annotations=WI)
 async def cancel_operation() -> dict:

@@ -81,6 +81,53 @@ namespace RhinoAIBridge
             tcs?.TrySetResult(result);
         }
 
+        /// <summary>
+        /// Look up a finished (or still-running) operation by request_id.
+        ///
+        /// v4.14 (field report A4): when the MCP client gives up before the plugin's
+        /// budget, the command keeps running and completes - but its printed output and
+        /// results were unreachable, so the agent could not tell whether the work had
+        /// happened. The replay cache already held the answer; nothing exposed it.
+        /// </summary>
+        public static JObject Lookup(string requestId)
+        {
+            if (string.IsNullOrEmpty(requestId))
+                return new JObject { ["status"] = "error", ["message"] = "request_id required" };
+            lock (_gate)
+            {
+                if (_completed.TryGetValue(requestId, out var done))
+                    return new JObject
+                    {
+                        ["status"] = "ok",
+                        ["state"] = "completed",
+                        ["request_id"] = requestId,
+                        ["result"] = done.DeepClone(),
+                    };
+                if (_inFlight.ContainsKey(requestId))
+                    return new JObject
+                    {
+                        ["status"] = "ok",
+                        ["state"] = "running",
+                        ["request_id"] = requestId,
+                        ["note"] = "Still executing in Rhino. Poll again, or cancel_operation to stop it.",
+                    };
+            }
+            return new JObject
+            {
+                ["status"] = "ok",
+                ["state"] = "unknown",
+                ["request_id"] = requestId,
+                ["note"] = "No record. Either it never arrived, or it finished long enough ago to fall out "
+                         + "of the replay cache (last " + COMPLETED_CACHE_MAX + " operations).",
+            };
+        }
+
+        /// <summary>Ids of operations currently executing, newest last.</summary>
+        public static JArray InFlightIds()
+        {
+            lock (_gate) return new JArray(_inFlight.Keys);
+        }
+
         public static CancellationToken TokenFor(string requestId)
         {
             if (string.IsNullOrEmpty(requestId)) return CancellationToken.None;

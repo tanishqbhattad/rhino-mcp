@@ -84,6 +84,7 @@ namespace RhinoAIBridge
             // Intent-validation reads. section_preview adds a clipping plane but always
             // removes it in a finally block, so it leaves no trace.
             "assert_geometry", "find_unsupported", "section_preview",
+            "get_operation_result", "list_operations",
         };
 
         public CommandHandler()
@@ -93,6 +94,9 @@ namespace RhinoAIBridge
                 // Context & Scene
                 ["get_context"] = W(GetContext), ["get_selection"] = W(GetSelection),
                 ["list_commands"] = W(ListCommands),
+                // v4.14: retrieve the result of a call the client gave up waiting for.
+                ["get_operation_result"] = W(GetOperationResultCmd),
+                ["list_operations"] = W(ListOperationsCmd),
                 ["get_scene_summary"] = W(GetSceneSummary), ["get_objects"] = W(GetObjects), ["list_objects"] = W(GetObjects),
                 ["get_object_details"] = W(GetObjectDetails), ["get_object_info"] = W(GetObjectDetails),
                 // Architecture
@@ -545,6 +549,15 @@ namespace RhinoAIBridge
             }
         };
 
+        JObject GetOperationResultCmd(JObject p)
+            => OperationRegistry.Lookup(p["request_id"]?.ToString());
+
+        JObject ListOperationsCmd(JObject p)
+        {
+            var running = OperationRegistry.InFlightIds();
+            return Ok(("running", running), ("running_count", running.Count));
+        }
+
         // Machine-readable dispatch table: lets the MCP server generate its
         // capabilities resource from the live registry instead of a hand-
         // maintained list that drifts (v4.10).
@@ -692,7 +705,14 @@ namespace RhinoAIBridge
                 // 1. Nothing has changed since the last snapshot - it still restores
                 //    the current state, so writing an identical copy is pure waste.
                 if (sv >= 0 && sv == _lastCpSceneVersion)
-                    return CheckpointSkipped("scene unchanged since the last checkpoint", operation);
+                {
+                    // Word this as a statement about the PRE-RUN snapshot. "scene unchanged"
+                    // was read as "nothing happened" on a script that went on to create 260
+                    // objects (field report A8).
+                    return CheckpointSkipped(
+                        $"pre-run snapshot identical to the existing checkpoint (scene_version {sv}); "
+                        + "this says nothing about what this command is about to do", operation);
+                }
                 // 2. Big documents: don't pay a full write on every call.
                 if (_lastCpSizeKb > CP_THROTTLE_ABOVE_KB &&
                     DateTime.UtcNow - _lastCpTimeUtc < CP_MIN_INTERVAL)
@@ -917,6 +937,10 @@ namespace RhinoAIBridge
             if (snap != null)
             {
                 if (f == "all") return snap.All().Select(m => m.Id.ToString()).ToList();
+                // by_layer: includes descendants (the common intent in nested trees).
+                // by_layer_exact: restores the old single-layer behaviour.
+                if (f.StartsWith("by_layer_exact:"))
+                    return snap.ByLayerName(f[15..], includeDescendants: false).Select(m => m.Id.ToString()).ToList();
                 if (f.StartsWith("by_layer:"))
                     return snap.ByLayerName(f[9..]).Select(m => m.Id.ToString()).ToList();
                 if (f.StartsWith("by_name:"))
@@ -1702,9 +1726,27 @@ namespace RhinoAIBridge
         {
             string by = (p["by"]?.ToString() ?? "layer").ToLowerInvariant();
             double levelHeight = MmDef(p, "level_height", 3000);
+            // v4.14 (field report A3): this ran VolumeMassProperties.Compute on EVERY Brep,
+            // including hundreds of OPEN vault webs where volume is meaningless, on the UI
+            // thread under a 60s budget - a 900-object scene simply timed out.
+            //   mode "fast" (default): exact volume only for closed solids, and only until
+            //     the budget is spent; open/one-off shapes use the bbox footprint.
+            //   mode "exact": always integrate (the old behaviour), for final schedules.
+            //   scope: restrict to a selector instead of the whole document.
+            string mode = (p["mode"]?.ToString() ?? "fast").ToLowerInvariant();
+            bool exact = mode == "exact";
+            int volumeBudget = p["max_volume_computations"]?.ToObject<int?>() ?? (exact ? int.MaxValue : 1500);
+
+            List<RhinoObject> targets;
+            if (p["scope"] != null) targets = ResolveSelector(p["scope"]);
+            else targets = AllObjs();
+
             var rows = new Dictionary<string, Tuple<int, double, double>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var o in AllObjs())
+            int volumesComputed = 0, openSkipped = 0, budgetSkipped = 0, cancelled = 0;
+
+            foreach (var o in targets)
             {
+                if (OperationRegistry.CancelRequested) { cancelled = 1; break; }
                 if (o?.Geometry == null) continue;
                 var bb = o.Geometry.GetBoundingBox(true); if (!bb.IsValid) continue;
                 string key;
@@ -1715,9 +1757,16 @@ namespace RhinoAIBridge
                 double vol = 0;
                 if (o.Geometry is Brep br)
                 {
-                    var vmp = VolumeMassProperties.Compute(br);
-                    vol = vmp?.Volume ?? 0;
-                    area = EstimatePlanArea(br, bb, vol);
+                    bool wantVolume = exact || br.IsSolid;
+                    if (!br.IsSolid && !exact) openSkipped++;
+                    if (wantVolume && volumesComputed >= volumeBudget) { wantVolume = false; budgetSkipped++; }
+                    if (wantVolume)
+                    {
+                        var vmp = VolumeMassProperties.Compute(br);
+                        vol = vmp?.Volume ?? 0;
+                        volumesComputed++;
+                        area = EstimatePlanArea(br, bb, vol);
+                    }
                 }
                 else if (o.Geometry is Curve crv && crv.IsClosed)
                 {
@@ -1735,7 +1784,26 @@ namespace RhinoAIBridge
                 ["area"] = Math.Round(kv.Value.Item2, 2),
                 ["volume"] = Math.Round(kv.Value.Item3, 2)
             }));
-            return Ok(("by", by), ("rows", arr), ("total_area", Math.Round(rows.Values.Sum(r => r.Item2), 2)), ("unit_system", Doc.ModelUnitSystem.ToString()));
+            var res = Ok(("by", by), ("rows", arr),
+                         ("total_area", Math.Round(rows.Values.Sum(r => r.Item2), 2)),
+                         ("unit_system", Doc.ModelUnitSystem.ToString()));
+            res["objects"] = targets.Count;
+            res["mode"] = exact ? "exact" : "fast";
+            res["volumes_computed"] = volumesComputed;
+            if (openSkipped > 0)
+            {
+                res["open_breps_skipped"] = openSkipped;
+                res["note"] = $"{openSkipped} open Brep(s) got a bounding-box footprint instead of an "
+                            + "integrated volume - volume is undefined for an open shell. Pass mode='exact' to force it.";
+            }
+            if (budgetSkipped > 0)
+            {
+                res["budget_skipped"] = budgetSkipped;
+                res["hint"] = "Volume budget reached. Narrow with scope=, or raise max_volume_computations, "
+                            + "or use mode='exact' with a larger timeout_seconds.";
+            }
+            if (cancelled == 1) { res["cancelled"] = true; res["partial"] = true; }
+            return res;
         }
 
         static double EstimatePlanArea(Brep br, BoundingBox bb, double volume)
@@ -2419,17 +2487,56 @@ namespace RhinoAIBridge
         };
         JObject ListLayers(JObject p)
         {
-            // Phase 2: counts come from the snapshot's per-layer index. O(L) instead of O(N*L).
+            // Counts come from the snapshot's per-layer index. O(L) instead of O(N*L).
+            // v4.14: keyed by INDEX - keying by name reported 0 for every nested layer
+            // and collided on duplicate leaf names (field report A1).
             var snap = Snap;
-            var counts = snap?.CountsByLayerName() ?? new Dictionary<string, int>();
-            return Ok(("layers", new JArray(Doc.Layers.Where(l => !l.IsDeleted).Select(l => new JObject
+            var counts = snap?.CountsByLayerIndex() ?? new Dictionary<int, int>();
+            string prefix = p["prefix"]?.ToString();
+            bool countsIncludeChildren = p["include_descendant_counts"]?.ToObject<bool>() ?? true;
+
+            var layers = Doc.Layers.Where(l => !l.IsDeleted).ToList();
+            var rows = new JArray();
+            foreach (var l in layers)
             {
-                ["name"] = l.Name,
-                ["visible"] = l.IsVisible,
-                ["locked"] = l.IsLocked,
-                ["color"] = new JArray(l.Color.R, l.Color.G, l.Color.B),
-                ["object_count"] = counts.TryGetValue(l.Name, out var c) ? c : 0
-            }))));
+                var full = l.FullPath ?? l.Name;
+                if (!string.IsNullOrEmpty(prefix) &&
+                    !full.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+
+                int own = counts.TryGetValue(l.Index, out var c) ? c : 0;
+                int subtree = own;
+                if (countsIncludeChildren)
+                {
+                    string sub = full + "::";
+                    foreach (var other in layers)
+                    {
+                        if (other.Index == l.Index) continue;
+                        var of = other.FullPath ?? other.Name;
+                        if (of.StartsWith(sub, StringComparison.OrdinalIgnoreCase))
+                            subtree += counts.TryGetValue(other.Index, out var c2) ? c2 : 0;
+                    }
+                }
+                int depth = full.Split(new[] { "::" }, StringSplitOptions.None).Length - 1;
+                string parent = depth > 0 ? full.Substring(0, full.LastIndexOf("::", StringComparison.Ordinal)) : null;
+
+                rows.Add(new JObject
+                {
+                    ["name"] = l.Name,
+                    ["full_path"] = full,
+                    ["parent"] = parent,
+                    ["depth"] = depth,
+                    ["visible"] = l.IsVisible,
+                    ["locked"] = l.IsLocked,
+                    ["color"] = new JArray(l.Color.R, l.Color.G, l.Color.B),
+                    ["object_count"] = own,
+                    ["subtree_count"] = subtree,
+                });
+            }
+            var r = Ok(("layers", rows), ("count", rows.Count));
+            r["note"] = "object_count is objects on THIS layer; subtree_count includes descendants. "
+                      + "Use full_path with by_layer: selectors - by_layer matches a layer and its descendants.";
+            if (!string.IsNullOrEmpty(prefix)) r["prefix"] = prefix;
+            return r;
         }
         JObject CreateLayer(JObject p)
         {

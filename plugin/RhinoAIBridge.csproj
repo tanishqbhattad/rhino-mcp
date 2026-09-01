@@ -4,7 +4,7 @@
     <EnableDynamicLoading>true</EnableDynamicLoading>
     <TargetExt>.rhp</TargetExt>
     <NoWarn>NU1701</NoWarn>
-    <Version>4.13.0</Version>
+    <Version>4.14.0</Version>
     <Title>RhinoAIBridge</Title>
     <Description>AI Bridge for Rhino 8 (protocol 5: multiplexed, idempotent retries, cancellation, binary image frames, WAL crash recovery; intent validation via assert_geometry/find_unsupported/section_preview; live list_commands registry; clash detection; semantic orientation)</Description>
     <AssemblyName>RhinoAIBridge</AssemblyName>

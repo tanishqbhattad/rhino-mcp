@@ -1,6 +1,6 @@
 [project]
 name = "rhino-architect"
-version = "4.13.0"
+version = "4.14.0"
 description = "Rhino MCP server: AI-assisted architectural modelling in Rhino 8 (protocol 5 multiplexed transport, intent validation, rab geometry stdlib, lean/standard/full tool profiles)"
 readme = "README.md"
 license = { text = "MIT" }

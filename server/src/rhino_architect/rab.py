@@ -145,12 +145,39 @@ def grid(origin, nx, ny, sx, sy):
 
 # --- Query & edit -----------------------------------------------------------
 
-def ids_on(layer_path):
-    """Guid strings of all objects on a layer (empty list if no layer)."""
-    if not rs.IsLayer(layer_path):
-        return []
-    got = rs.ObjectsByLayer(layer_path)
-    return [_sid(g) for g in (got or [])]
+def _all_objects(include_hidden=True):
+    """Every object in the document, INCLUDING those on hidden layers.
+
+    The default enumerator skips hidden objects, so rab under-reported by 21 on a
+    942-object model while the C# side (which sets HiddenObjects) was right.
+    """
+    st = Rhino.DocObjects.ObjectEnumeratorSettings()
+    st.NormalObjects = True
+    st.LockedObjects = True
+    st.HiddenObjects = bool(include_hidden)
+    st.IncludeLights = False
+    st.IncludeGrips = False
+    st.DeletedObjects = False
+    return list(sc.doc.Objects.GetObjectList(st))
+
+
+def ids_on(layer_path, include_hidden=True, include_sublayers=True):
+    """Guid strings of objects on a layer, including hidden ones and sublayers.
+
+    include_sublayers=True matches the by_layer: selector on the server side, so
+    'Building' picks up 'Building::Walls' too.
+    """
+    target = layer_path
+    prefix = layer_path + "::"
+    out = []
+    for o in _all_objects(include_hidden):
+        try:
+            lp = sc.doc.Layers[o.Attributes.LayerIndex].FullPath
+        except Exception:
+            continue
+        if lp == target or (include_sublayers and lp.startswith(prefix)):
+            out.append(_sid(o.Id))
+    return out
 
 
 def bbox(ids):
@@ -440,7 +467,9 @@ def arch_curve(span, rise, kind="pointed", offset=0.0, origin=(0, 0, 0),
 
 def arch_profile(span, rise, pier=0.0, kind="pointed", ring=None,
                  origin=(0, 0, 0), along=(1, 0, 0), up=(0, 0, 1)):
-    """Closed planar profile for an arched opening (ring=None) or a voussoir band.
+    """RETURNS A CURVE (PolyCurve), never a GUID - nothing is added to the document.
+
+    Closed planar profile for an arched opening (ring=None) or a voussoir band.
 
     The opening profile is jamb -> arch head -> jamb -> sill, ready to extrude
     into a void for boolean_diff.
@@ -711,6 +740,128 @@ def sweep_profile(rail_id, profile="roll", scale=1.0, layer_path=None, name=None
     return _assign(gid, layer_path, name)
 
 
+def wall_profile(plane, outline, holes=None, thickness=200.0,
+                 layer_path=None, name=None):
+    """A wall panel with openings, built from PLANE-RELATIVE (u, v) coordinates.
+
+    plane     : Rhino.Geometry.Plane - the wall's face plane. u runs along the wall,
+                v runs up. Use rab.plane_from_wall(a, b) if you have two points.
+    outline   : [(u, v), ...] closed loop of the panel face
+    holes     : [[(u, v), ...], ...] openings, each a closed loop
+    thickness : extruded along the plane NORMAL
+
+    THE TRAP THIS EXISTS FOR: Extrusion.AddInnerProfile refuses inner loops when the
+    profile plane is oriented one way but not the other - it worked on XZ-plane walls
+    and failed on every YZ-plane wall (9/9 in one session). That is RhinoCommon
+    profile-plane handedness, not something callers should have to know. This tries
+    the Extrusion path and silently falls back to CreatePlanarBreps +
+    CreateFromOffsetFace, which produced a closed solid every time.
+    """
+    holes = holes or []
+
+    def _loop(uv):
+        pts = [plane.PointAt(float(u), float(v)) for (u, v) in uv]
+        if pts[0].DistanceTo(pts[-1]) > _tol():
+            pts.append(Point3d(pts[0]))
+        return Polyline(pts).ToNurbsCurve()
+
+    outer = _loop(outline)
+    inners = [_loop(h) for h in holes]
+    if not outer.IsClosed:
+        raise ValueError("wall_profile: outline is not closed")
+    t = float(thickness)
+
+    # Attempt 1: Extrusion with inner profiles (cheap and light).
+    try:
+        ext = Extrusion.Create(outer, -t, True)
+        if ext is not None:
+            ok = True
+            for h in inners:
+                if not ext.AddInnerProfile(h):
+                    ok = False
+                    break
+            if ok:
+                brep = ext.ToBrep()
+                if brep is not None and brep.IsSolid:
+                    return _assign(sc.doc.Objects.AddBrep(orient(brep)), layer_path, name)
+    except Exception:
+        pass
+
+    # Attempt 2: planar face with holes, then thicken. Handedness-proof.
+    curves = [outer] + inners
+    faces = Brep.CreatePlanarBreps(System.Array[Rhino.Geometry.Curve](curves), _tol())
+    if not faces or len(faces) == 0:
+        raise ValueError("wall_profile: could not build a planar face - check the loops "
+                         "are closed, planar and that holes lie inside the outline")
+    face = faces[0]
+    solid = face.Faces[0].CreateExtrusion(
+        Line(plane.Origin, plane.Origin - plane.Normal * t).ToNurbsCurve(), True)
+    if solid is None:
+        raise ValueError("wall_profile: extrusion of the planar face failed")
+    return _assign(sc.doc.Objects.AddBrep(orient(solid)), layer_path, name)
+
+
+def plane_from_wall(start, end, up=(0, 0, 1)):
+    """Plane whose X runs start->end (in plan) and Y points up.
+
+    Feed this to wall_profile so its (u, v) coordinates mean "along the wall" and
+    "up the wall" regardless of which way the wall faces.
+    """
+    a = _p3(start)
+    b = _p3(end)
+    along = [b.X - a.X, b.Y - a.Y, 0.0]
+    if abs(along[0]) < 1e-9 and abs(along[1]) < 1e-9:
+        along = [1.0, 0.0, 0.0]
+    return _frame(a, along, up)
+
+
+def mirror_y(ids, y=0.0, copy=True):
+    """Mirror objects about the plane y = <y>. Halves the script for symmetric buildings."""
+    ids = [str(i) for i in (ids if isinstance(ids, (list, tuple)) else [ids])]
+    xf = Rhino.Geometry.Transform.Mirror(Plane(Point3d(0, float(y), 0), Vector3d.YAxis))
+    out = []
+    for oid in ids:
+        nid = sc.doc.Objects.Transform(System.Guid(oid), xf, not copy)
+        if nid != System.Guid.Empty:
+            out.append(_sid(nid))
+    return out
+
+
+def mirror_x(ids, x=0.0, copy=True):
+    """Mirror objects about the plane x = <x>."""
+    ids = [str(i) for i in (ids if isinstance(ids, (list, tuple)) else [ids])]
+    xf = Rhino.Geometry.Transform.Mirror(Plane(Point3d(float(x), 0, 0), Vector3d.XAxis))
+    out = []
+    for oid in ids:
+        nid = sc.doc.Objects.Transform(System.Guid(oid), xf, not copy)
+        if nid != System.Guid.Empty:
+            out.append(_sid(nid))
+    return out
+
+
+def array_x(ids, step, n):
+    """Copy objects n-1 times along X at `step` spacing. Returns ALL ids (originals first)."""
+    ids = [str(i) for i in (ids if isinstance(ids, (list, tuple)) else [ids])]
+    out = list(ids)
+    for i in range(1, int(n)):
+        out.extend(copy_to(ids, [float(step) * i, 0, 0]))
+    return out
+
+
+def radial(ids, center, angles_deg):
+    """Copy objects around a vertical axis at the given angles (degrees)."""
+    ids = [str(i) for i in (ids if isinstance(ids, (list, tuple)) else [ids])]
+    c = _p3(center)
+    out = []
+    for a in angles_deg:
+        xf = Rhino.Geometry.Transform.Rotation(math.radians(float(a)), Vector3d.ZAxis, c)
+        for oid in ids:
+            nid = sc.doc.Objects.Transform(System.Guid(oid), xf, False)
+            if nid != System.Guid.Empty:
+                out.append(_sid(nid))
+    return out
+
+
 # --- Discoverability --------------------------------------------------------
 
 _HELP_GROUPS = [
@@ -806,12 +957,22 @@ def m(metres):
 
 
 def info():
-    """Print a one-line scene summary (object count by layer)."""
+    """Print a scene summary by layer. Counts hidden objects too (and says so)."""
     counts = {}
-    for o in sc.doc.Objects:
-        lp = sc.doc.Layers[o.Attributes.LayerIndex].FullPath
+    hidden = 0
+    for o in _all_objects(True):
+        try:
+            lp = sc.doc.Layers[o.Attributes.LayerIndex].FullPath
+        except Exception:
+            lp = "(unknown)"
         counts[lp] = counts.get(lp, 0) + 1
+        try:
+            if not o.Visible:
+                hidden += 1
+        except Exception:
+            pass
     total = sum(counts.values())
     parts = ["%s:%d" % (k, counts[k]) for k in sorted(counts)]
-    print("rab.info: %d objects | %s" % (total, ", ".join(parts)))
+    suffix = "" if hidden == 0 else "  (+%d hidden)" % hidden
+    print("rab.info: %d objects%s | %s" % (total, suffix, ", ".join(parts)))
     return counts
