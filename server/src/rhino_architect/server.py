@@ -3217,6 +3217,91 @@ class OperationIdInput(BaseModel):
     request_id: str = Field(..., description="The request_id reported in a timeout message.")
 
 
+_SELFTEST_SCRIPT = """
+rab = rab.use('rab')
+rab.delete(rab.ids_on('_selftest'))
+rab.layer('_selftest::Piers')
+rab.layer('_selftest::Walls')
+for i in range(8):
+    rab.box((i * 3000, 0, 0), 800, 800, 4000, layer_path='_selftest::Piers')
+pl = rab.plane_from_wall((0, 6000, 0), (0, 18000, 0))
+rab.wall_profile(pl, [(0, 0), (12000, 0), (12000, 5000), (0, 5000)],
+                 [[(3000, 1000), (5000, 1000), (5000, 3500), (3000, 3500)]],
+                 thickness=400, layer_path='_selftest::Walls')
+rab.wall_profile(rab.plane_from_wall((0, 0, 0), (12000, 0, 0)),
+                 [(0, 0), (12000, 0), (12000, 5000), (0, 5000)],
+                 [[(3000, 1000), (5000, 1000), (5000, 3500), (3000, 3500)]],
+                 thickness=400, layer_path='_selftest::Walls')
+print('selftest built %d objects' % len(rab.ids_on('_selftest')))
+"""
+
+
+class SelfTestInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    cleanup: bool = Field(True, description="Delete the _selftest layer afterwards.")
+
+
+@mcp.tool(name="run_selftest", annotations=WR)
+async def run_selftest(params: Optional[SelfTestInput] = None) -> dict:
+    """End-to-end health check: build ~10 objects, assert them, capture, and time it.
+
+    Far more informative than ping - it proves scripting, the rab helpers (including
+    the YZ-plane opening path), selectors, assertions and capture all actually work
+    together, and reports how long each stage took on THIS machine and model. Run it
+    after an install or when something feels wrong."""
+    params = params or SelfTestInput()
+    stages: list[dict[str, Any]] = []
+    overall_ok = True
+
+    async def stage(name: str, coro) -> dict:
+        nonlocal overall_ok
+        t = time.perf_counter()
+        try:
+            res = await coro
+            ok = str(res.get("status", "ok")) == "ok" if isinstance(res, dict) else True
+        except Exception as e:  # noqa: BLE001 - report, never raise
+            res, ok = {"status": "error", "message": str(e)}, False
+        if not ok:
+            overall_ok = False
+        entry = {"stage": name, "ok": ok, "ms": round((time.perf_counter() - t) * 1000, 1)}
+        if not ok:
+            entry["detail"] = str(res.get("message") or res.get("error_code") or res)[:300]
+        stages.append(entry)
+        return res if isinstance(res, dict) else {}
+
+    health = await stage("ping", _exec_simple("ping", {}))
+    build = await stage("build (script + rab)", _exec_simple(
+        "execute_script", {"code": _RAB_BOOTSTRAP + _SELFTEST_SCRIPT, "checkpoint": "off"}))
+    await stage("selector + assertions", _exec_simple("assert_geometry", {"assertions": [
+        {"kind": "count", "selector": "by_layer:_selftest", "expect": 10},
+        {"kind": "count", "selector": "by_layer:_selftest::Piers", "expect": 8},
+        {"kind": "watertight", "selector": "by_layer:_selftest::Walls"},
+    ]}))
+    await stage("dimensions", _exec_simple("assert_dimensions", {"targets": [
+        {"label": "pier height", "selector": "by_layer:_selftest::Piers",
+         "measure": "height", "target": 4000, "tol": 10},
+    ]}))
+    await stage("capture", _exec_simple("capture_viewport", {
+        "fit": "by_layer:_selftest", "width": 640, "height": 400,
+        "restore_state": True, "max_bytes": 40000}))
+    if params.cleanup:
+        await stage("cleanup", _exec_simple(
+            "delete_objects", {"object_ids": ["by_layer:_selftest"]}))
+
+    return {
+        "status": "ok" if overall_ok else "error",
+        "healthy": overall_ok,
+        "stages": stages,
+        "total_ms": round(sum(s["ms"] for s in stages), 1),
+        "rhino_version": health.get("rhino_version"),
+        "unit_system": health.get("unit_system"),
+        "objects_created": build.get("objects_created"),
+        "note": "Each stage exercises a different layer of the stack: transport, IronPython "
+                "+ rab (including the YZ-plane opening path), selectors, assertions, capture. "
+                "A slow stage here is a slow stage in real work.",
+    }
+
+
 @mcp.tool(name="get_operation_result", annotations=RO)
 async def get_operation_result(params: OperationIdInput) -> dict:
     """Fetch the result of a call that timed out client-side but kept running in Rhino.
@@ -3309,7 +3394,7 @@ _STANDARD_TOOLS: frozenset[str] = _LEAN_TOOLS | frozenset({
     "detect_clashes", "validate_objects",
     # Intent validation + reusable code substrate (v4.10.1)
     "assert_geometry", "assert_dimensions", "find_unsupported", "section_preview",
-    "capture_elevations", "get_operation_result", "list_operations",
+    "capture_elevations", "get_operation_result", "list_operations", "run_selftest",
     "write_module", "list_modules", "read_module",
     # Vision loop
     "capture_review_set", "capture_inspection_view", "compare_before_after",

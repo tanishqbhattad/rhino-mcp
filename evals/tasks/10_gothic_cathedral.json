@@ -1,0 +1,17 @@
+{
+  "id": "gothic_cathedral",
+  "title": "Gothic cathedral fragment - exercises every trap from the v4.14 field report",
+  "prompt": "Model a small Gothic cathedral fragment in Rhino, units mm. Build it in phases and use the rab helpers rather than raw rhinoscriptsyntax.\n\n1. Layer tree, NESTED, with a deliberately repeated leaf name:\n   Cath::01_Nave::Piers, Cath::01_Nave::Walls, Cath::02_Chevet::Piers, Cath::02_Chevet::Apse, Cath::03_Roof\n2. Nave: two rows of 6 piers, 1500 x 1200 in plan, 14000 tall, rows 14500mm clear apart, bays at 8000mm centres, on Cath::01_Nave::Piers.\n3. Nave walls: a wall on each side running the full length of the piers, 600 thick, 14000 tall, EACH with 4 pointed-arch window openings (2000 span, 1500 rise, sill at 6000). Put them on Cath::01_Nave::Walls. Note one wall runs along Y - use rab.wall_profile with a plane from rab.plane_from_wall so the openings actually cut.\n4. Chevet: a semicircular apse wall (rab.annulus_wall) beyond the east end, inner radius 7000, outer 8000, 14000 tall, plus 5 radiating piers on Cath::02_Chevet::Piers.\n5. Roof: a gable roof over the nave, eaves at 14000, ridge at 21000, on Cath::03_Roof.\n6. Finally: assert the dimensions against the brief, check nothing floats, and capture an elevation set excluding nothing.\n\nWork in phases, one heavy call per turn. Verify as you go.",
+  "assertions": [
+    {"type": "layer_count", "layer": "Cath::01_Nave::Piers", "min": 12, "max": 12},
+    {"type": "layer_count", "layer": "Cath::01_Nave::Walls", "min": 2, "max": 2},
+    {"type": "layer_count", "layer": "Cath::02_Chevet::Piers", "min": 5, "max": 5},
+    {"type": "layer_count", "layer": "Cath::03_Roof", "min": 1, "max": 3},
+    {"type": "dimension", "selector": "by_layer:Cath::01_Nave::Piers", "measure": "clear_between", "axis": "y", "target": 14500, "tol": 100},
+    {"type": "dimension", "selector": "by_layer:Cath::01_Nave::Piers", "measure": "height", "target": 14000, "tol": 50},
+    {"type": "dimension", "selector": "by_layer:Cath::03_Roof", "measure": "top_z", "target": 21000, "tol": 200},
+    {"type": "watertight", "selector": "by_layer:Cath::01_Nave::Walls"},
+    {"type": "no_default_layer_geometry", "layer": "Default"}
+  ],
+  "notes": "Traps this covers: nested layers with a duplicate leaf name (Piers appears twice) exercise the A1 count fix and the A2 by_layer descendant fix; the Y-running wall with openings exercises the A7 Extrusion.AddInnerProfile handedness workaround; annulus_wall exercises the apse primitive; watertight on the walls proves the boolean/orientation path; the dimension assertions exercise assert_dimensions."
+}

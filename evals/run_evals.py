@@ -121,7 +121,37 @@ async def a_section_count(a: dict) -> tuple[bool, str]:
     return lo <= n <= hi, f"{n} sections/plans defined (want {lo}..{hi})"
 
 
+async def a_dimension(a: dict) -> tuple[bool, str]:
+    """Delegate to the server's assert_dimensions so evals and live QA agree."""
+    target = {k: v for k, v in a.items() if k != "type"}
+    target.setdefault("label", a.get("measure", "dimension"))
+    r = await call("assert_dimensions", {"targets": [target]})
+    rows = r.get("dimensions") or []
+    if not rows:
+        return False, f"assert_dimensions returned nothing ({r.get('message', '')})"
+    row = rows[0]
+    ok = bool(row.get("pass"))
+    detail = (f"{row.get('measure')} actual={row.get('actual')} "
+              f"target={row.get('target')} deviation={row.get('deviation')}")
+    if not ok and row.get("detail"):
+        detail += f" - {row['detail']}"
+    return ok, detail
+
+
+async def a_watertight(a: dict) -> tuple[bool, str]:
+    r = await call("assert_geometry", {"assertions": [
+        {"kind": "watertight", "selector": a.get("selector", "all")}
+    ]})
+    entries = r.get("assertions") or []
+    if not entries:
+        return False, "assert_geometry returned nothing"
+    e = entries[0]
+    return bool(e.get("pass")), str(e.get("detail", ""))
+
+
 ASSERTIONS = {
+    "dimension": a_dimension,
+    "watertight": a_watertight,
     "layer_count": a_layer_count,
     "level_count": a_level_count,
     "clash_free": a_clash_free,
