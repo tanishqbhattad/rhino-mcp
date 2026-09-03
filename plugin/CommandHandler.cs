@@ -85,6 +85,7 @@ namespace RhinoAIBridge
             // removes it in a finally block, so it leaves no trace.
             "assert_geometry", "find_unsupported", "section_preview",
             "get_operation_result", "list_operations",
+            "assert_dimensions", "capture_elevations",
         };
 
         public CommandHandler()
@@ -97,6 +98,8 @@ namespace RhinoAIBridge
                 // v4.14: retrieve the result of a call the client gave up waiting for.
                 ["get_operation_result"] = W(GetOperationResultCmd),
                 ["list_operations"] = W(ListOperationsCmd),
+                ["assert_dimensions"] = W(AssertDimensions),
+                ["capture_elevations"] = W(CaptureElevations),
                 ["get_scene_summary"] = W(GetSceneSummary), ["get_objects"] = W(GetObjects), ["list_objects"] = W(GetObjects),
                 ["get_object_details"] = W(GetObjectDetails), ["get_object_info"] = W(GetObjectDetails),
                 // Architecture
@@ -548,6 +551,293 @@ namespace RhinoAIBridge
                 return ErrFromException(e);
             }
         };
+
+        /// <summary>
+        /// Summarise what a script actually created, and flag geometry that has landed
+        /// implausibly far from everything else.
+        ///
+        /// v4.14 (field report B): a plane-origin mistake put a roof 66.5 m from the
+        /// building and nothing noticed until a render. A bbox comparison is nearly free
+        /// and catches that class immediately. Also returns solid/open counts so a phase
+        /// script reports its own health without a second round-trip.
+        /// </summary>
+        private void AddCreationPostConditions(JObject r, List<string> newIds, JArray warns)
+        {
+            if (newIds == null || newIds.Count == 0) return;
+            try
+            {
+                var created = BoundingBox.Empty;
+                int solids = 0, open = 0, invalid = 0;
+                foreach (var sid in newIds)
+                {
+                    if (!Guid.TryParse(sid, out var g)) continue;
+                    var o = Doc.Objects.FindId(g);
+                    if (o?.Geometry == null) continue;
+                    var bb = o.Geometry.GetBoundingBox(true);
+                    if (bb.IsValid) created.Union(bb);
+                    var br = GetBrep(o);
+                    if (br == null) continue;
+                    if (!br.IsValid) invalid++;
+                    else if (br.IsSolid) solids++;
+                    else open++;
+                }
+                if (!created.IsValid) return;
+
+                r["created_bbox"] = new JObject
+                {
+                    ["min"] = PA(created.Min),
+                    ["max"] = PA(created.Max),
+                    ["size"] = PA(new Point3d(created.Max.X - created.Min.X,
+                                              created.Max.Y - created.Min.Y,
+                                              created.Max.Z - created.Min.Z)),
+                };
+                r["created_solid_count"] = solids;
+                r["created_open_count"] = open;
+                if (invalid > 0) r["created_invalid_count"] = invalid;
+
+                // Drift check against the rest of the model.
+                var scene = SceneSnapshotRegistry.Active?.SceneBoundingBox() ?? BoundingBox.Empty;
+                if (scene.IsValid)
+                {
+                    double diag = scene.Diagonal.Length;
+                    if (diag > Tol)
+                    {
+                        double dist = created.Center.DistanceTo(scene.Center);
+                        if (dist > 2.0 * diag)
+                        {
+                            warns.Add($"New geometry sits {dist:0.#} from the scene centre, more than 2x the "
+                                    + $"scene diagonal ({diag:0.#}). That usually means a plane origin or a "
+                                    + "coordinate was wrong. Check created_bbox.");
+                            r["drift_warning"] = true;
+                            r["drift_distance"] = Math.Round(dist, 2);
+                        }
+                    }
+                }
+            }
+            catch { /* post-conditions are advisory - never fail the command over them */ }
+        }
+
+        /// <summary>
+        /// Check measured dimensions against a brief and return a target/actual/deviation
+        /// table. This is the QA call for brief-driven work: "the nave should be 12.5 m
+        /// wide and 33 m to the vault crown" is checkable, where "is the geometry valid"
+        /// is not (field report C).
+        /// </summary>
+        /// <summary>
+        /// A full orthographic set in one call: correct parallel projections, each framed
+        /// on the same selection, with layers you can exclude from the FIT so a ground
+        /// slab stops dominating every view (field report C).
+        /// </summary>
+        JObject CaptureElevations(JObject p)
+        {
+            var views = (p["views"] as JArray)?.Select(v => v.ToString().ToLowerInvariant()).ToList()
+                        ?? new List<string> { "n", "s", "e", "w", "plan", "hero" };
+            int w = p["width"]?.ToObject<int>() ?? 1200;
+            int h = p["height"]?.ToObject<int>() ?? 800;
+            string mode = p["display_mode"]?.ToString();
+
+            // What to FRAME on: everything, minus excluded layers.
+            var fitSel = p["fit"] ?? JToken.FromObject("all");
+            var objs = ResolveSelector(fitSel);
+            var excluded = (p["exclude_layers"] as JArray)?.Select(t => t.ToString()).ToList() ?? new List<string>();
+            if (excluded.Count > 0)
+            {
+                objs = objs.Where(o =>
+                {
+                    var lp = Doc.Layers[o.Attributes.LayerIndex]?.FullPath ?? "";
+                    foreach (var ex in excluded)
+                        if (lp.Equals(ex, StringComparison.OrdinalIgnoreCase) ||
+                            lp.StartsWith(ex + "::", StringComparison.OrdinalIgnoreCase)) return false;
+                    return true;
+                }).ToList();
+            }
+            if (objs.Count == 0) return Err("Nothing to frame after exclusions", "EMPTY_SELECTION");
+            var box = UnionBox(objs);
+            if (!box.IsValid) return Err("Selection has no valid bounding box", "EMPTY_SELECTION");
+
+            var view = Doc.Views.ActiveView;
+            var vp = view?.ActiveViewport;
+            if (vp == null) return Err("No active viewport");
+
+            var savedLoc = vp.CameraLocation;
+            var savedTgt = vp.CameraTarget;
+            var savedUp = vp.CameraUp;
+            bool savedParallel = vp.IsParallelProjection;
+            var savedMode = vp.DisplayMode;
+
+            var frames = new JArray();
+            var ids = new List<Guid>();
+            try
+            {
+                foreach (var v in views)
+                {
+                    Vector3d dir; Vector3d up = Vector3d.ZAxis; bool parallel = true;
+                    switch (v)
+                    {
+                        case "n": case "north": dir = new Vector3d(0, -1, 0); break;
+                        case "s": case "south": dir = new Vector3d(0, 1, 0); break;
+                        case "e": case "east":  dir = new Vector3d(-1, 0, 0); break;
+                        case "w": case "west":  dir = new Vector3d(1, 0, 0); break;
+                        case "plan": case "top": dir = new Vector3d(0, 0, -1); up = Vector3d.YAxis; break;
+                        case "hero": dir = new Vector3d(-1, 1, -0.55); parallel = false; break;
+                        default:
+                            frames.Add(new JObject { ["view"] = v, ["status"] = "error",
+                                                     ["message"] = "unknown view" });
+                            continue;
+                    }
+                    dir.Unitize();
+                    vp.ChangeToParallelProjection(parallel);
+                    if (!parallel) vp.ChangeToPerspectiveProjection(false, vp.Camera35mmLensLength);
+                    vp.SetCameraDirection(dir, true);
+                    vp.CameraUp = up;
+
+                    var capParams = new JObject
+                    {
+                        ["width"] = w,
+                        ["height"] = h,
+                        ["restore_state"] = false,
+                        ["fit"] = new JObject { ["selector"] = JToken.FromObject(
+                                                    objs.Select(o => o.Id.ToString()).ToArray()),
+                                                ["margin"] = p["margin"] ?? 0.05 },
+                    };
+                    if (!string.IsNullOrWhiteSpace(mode)) capParams["display_mode"] = mode;
+                    if (p["max_bytes"] != null) capParams["max_bytes"] = p["max_bytes"];
+
+                    var img = CaptureViewport(capParams);
+                    if (img != null) img["view"] = v;
+                    frames.Add(img);
+                }
+            }
+            finally
+            {
+                try
+                {
+                    vp.DisplayMode = savedMode;
+                    vp.ChangeToParallelProjection(savedParallel);
+                    vp.SetCameraLocations(savedTgt, savedLoc);
+                    vp.CameraUp = savedUp;
+                    RedrawScope.Mark();
+                }
+                catch { }
+            }
+
+            var res = Ok(("frames", frames), ("count", frames.Count));
+            res["framed_objects"] = objs.Count;
+            if (excluded.Count > 0) res["excluded_layers"] = new JArray(excluded);
+            res["note"] = "Every view is framed on the SAME selection, so scales are comparable. "
+                        + "The viewport was restored afterwards.";
+            return res;
+        }
+
+        JObject AssertDimensions(JObject p)
+        {
+            var targets = p["targets"] as JArray;
+            if (targets == null || targets.Count == 0)
+                return Err("targets[] required", "INVALID_INPUT");
+
+            var rows = new JArray();
+            int passed = 0;
+            foreach (var tTok in targets)
+            {
+                var t = tTok as JObject ?? new JObject();
+                string label = t["label"]?.ToString() ?? "(unlabelled)";
+                string measure = (t["measure"]?.ToString() ?? "height").ToLowerInvariant();
+                var want = t["target"]?.ToObject<double?>();
+                double tol = t["tol"]?.ToObject<double?>() ?? Math.Max(Tol * 10, 1.0);
+
+                var row = new JObject { ["label"] = label, ["measure"] = measure };
+                if (t["selector"] != null) row["selector"] = t["selector"];
+
+                try
+                {
+                    var objs = ResolveSelector(t["selector"]);
+                    if (objs.Count == 0)
+                    {
+                        row["pass"] = false;
+                        row["detail"] = "selector matched no objects";
+                        rows.Add(row); continue;
+                    }
+                    var bb = UnionBox(objs);
+                    double actual;
+                    switch (measure)
+                    {
+                        case "length_x": case "width_x": actual = bb.Max.X - bb.Min.X; break;
+                        case "width_y": case "length_y": actual = bb.Max.Y - bb.Min.Y; break;
+                        case "height": case "height_z": actual = bb.Max.Z - bb.Min.Z; break;
+                        case "top_z": case "crown": actual = bb.Max.Z; break;
+                        case "base_z": actual = bb.Min.Z; break;
+                        case "span":
+                            actual = Math.Max(bb.Max.X - bb.Min.X, bb.Max.Y - bb.Min.Y); break;
+                        case "clear_between":
+                        {
+                            // Gap between the two lowest-X (or -Y) clusters: pier clear span.
+                            var axis = (t["axis"]?.ToString() ?? "x").ToLowerInvariant();
+                            var boxes = objs.Select(o => o.Geometry.GetBoundingBox(true))
+                                            .Where(b => b.IsValid)
+                                            .OrderBy(b => axis == "y" ? b.Min.Y : b.Min.X).ToList();
+                            if (boxes.Count < 2)
+                            {
+                                row["pass"] = false; row["detail"] = "clear_between needs at least 2 objects";
+                                rows.Add(row); continue;
+                            }
+                            double gap = double.MaxValue;
+                            for (int i = 1; i < boxes.Count; i++)
+                            {
+                                double g = axis == "y"
+                                    ? boxes[i].Min.Y - boxes[i - 1].Max.Y
+                                    : boxes[i].Min.X - boxes[i - 1].Max.X;
+                                if (g > 0) gap = Math.Min(gap, g);
+                            }
+                            actual = gap == double.MaxValue ? 0 : gap;
+                            break;
+                        }
+                        default:
+                            row["pass"] = false;
+                            row["detail"] = $"unknown measure '{measure}'. Supported: length_x, width_y, "
+                                          + "height, top_z, base_z, span, clear_between.";
+                            rows.Add(row); continue;
+                    }
+
+                    row["actual"] = Math.Round(actual, 3);
+                    row["objects"] = objs.Count;
+                    if (want.HasValue)
+                    {
+                        double dev = actual - want.Value;
+                        bool ok = Math.Abs(dev) <= tol;
+                        row["target"] = want.Value;
+                        row["deviation"] = Math.Round(dev, 3);
+                        row["tol"] = tol;
+                        row["pass"] = ok;
+                        if (Math.Abs(want.Value) > Tol)
+                            row["deviation_pct"] = Math.Round(100.0 * dev / want.Value, 2);
+                        if (ok) passed++;
+                    }
+                    else
+                    {
+                        row["pass"] = true;   // measurement only, nothing asserted
+                        passed++;
+                    }
+                }
+                catch (Exception e)
+                {
+                    row["pass"] = false;
+                    row["detail"] = "error: " + e.Message;
+                }
+                rows.Add(row);
+            }
+
+            var r = Ok(("dimensions", rows), ("passed", passed), ("failed", targets.Count - passed));
+            r["unit_system"] = Doc.ModelUnitSystem.ToString();
+            if (passed != targets.Count)
+            {
+                r["status"] = "error";
+                r["error_code"] = "DIMENSION_MISMATCH";
+                r["message"] = $"{targets.Count - passed} of {targets.Count} dimensions are out of tolerance.";
+                r["retry_hint"] = "Read `deviation` - a consistent sign across rows usually means one wrong "
+                                + "base coordinate, not many wrong objects.";
+            }
+            return r;
+        }
 
         JObject GetOperationResultCmd(JObject p)
             => OperationRegistry.Lookup(p["request_id"]?.ToString());
@@ -4574,6 +4864,9 @@ namespace RhinoAIBridge
                     warns.Add($"\u26a0\ufe0f {boolFails} boolean operation(s) returned empty/None. Check geometry validity (IsSolid, overlap).");
                     r["boolean_failures"] = boolFails;
                 }
+                // v4.14 (field report B): validate-lite post-conditions, so a phase script
+                // self-reports instead of needing a follow-up validate_objects call.
+                AddCreationPostConditions(r, newIds, warns);
                 if (warns.Count > 0) r["warnings"] = warns;
                 if (!ok) r["message"] = "Script failed";
                 if (autoCheckpoint != null) r["auto_checkpoint"] = autoCheckpoint;
@@ -5051,7 +5344,21 @@ namespace RhinoAIBridge
         // and roll back without losing work.
         private static readonly Dictionary<string, string> _checkpoints = new Dictionary<string, string>();
         private static bool _checkpointsLoaded;
-        private const int MAX_AUTO_CHECKPOINTS = 10;
+        // Retention for auto-checkpoints. Override with RHINO_MAX_AUTO_CHECKPOINTS -
+        // 10 full .3dm snapshots of a large model is real disk (field report B).
+        private static readonly int MAX_AUTO_CHECKPOINTS = ReadIntEnv("RHINO_MAX_AUTO_CHECKPOINTS", 10, 1, 100);
+
+        private static int ReadIntEnv(string name, int fallback, int min, int max)
+        {
+            try
+            {
+                var raw = System.Environment.GetEnvironmentVariable(name);
+                if (!string.IsNullOrWhiteSpace(raw) && int.TryParse(raw, out var v))
+                    return Math.Max(min, Math.Min(max, v));
+            }
+            catch { }
+            return fallback;
+        }
 
         static string CheckpointDir()
         {
@@ -5234,7 +5541,21 @@ namespace RhinoAIBridge
                 }
                 list.Add(entry);
             }
-            return Ok(("checkpoints", list), ("count", list.Count));
+            long totalKb = 0;
+            foreach (var kv in _checkpoints)
+                if (File.Exists(kv.Value)) totalKb += new FileInfo(kv.Value).Length / 1024;
+
+            var res = Ok(("checkpoints", list), ("count", list.Count));
+            res["total_size_mb"] = Math.Round(totalKb / 1024.0, 1);
+            res["directory"] = CheckpointDir();
+            res["auto_retained"] = MAX_AUTO_CHECKPOINTS;
+            // v4.14 (field report B): 11 checkpoints x 12 MB accumulated with no visibility.
+            // Auto-checkpoints self-prune; NAMED ones live until deleted, so surface the cost.
+            if (totalKb > 200 * 1024)
+                res["hint"] = $"Checkpoints are using {Math.Round(totalKb / 1024.0, 1)} MB. Auto-checkpoints keep "
+                            + $"the {MAX_AUTO_CHECKPOINTS} newest; named ones are never pruned - delete_checkpoint "
+                            + "the ones you no longer need. Set RHINO_MAX_AUTO_CHECKPOINTS to change retention.";
+            return res;
         }
 
         JObject DeleteCheckpoint(JObject p)

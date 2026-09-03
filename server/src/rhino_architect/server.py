@@ -186,6 +186,11 @@ async def _exec(command: str, params: dict[str, Any]) -> dict:
 # Opt-in per-call timing: RHINO_TIMING=1 adds elapsed_ms to every response.
 # Off by default to keep responses token-lean.
 _TIMING = os.environ.get("RHINO_TIMING", "").strip().lower() in ("1", "true", "yes")
+# Even with timing off, always report calls slower than this (ms). 0 disables.
+try:
+    _SLOW_CALL_MS = int(os.environ.get("RHINO_SLOW_CALL_MS", "5000"))
+except ValueError:
+    _SLOW_CALL_MS = 5000
 
 
 async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
@@ -199,6 +204,7 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
     if blocked:
         return blocked
     t0 = time.perf_counter() if _TIMING else 0.0
+    t1 = time.perf_counter()
     try:
         conn = await get_connection()
         resp = await conn.send_command(command, params)
@@ -211,6 +217,14 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
             result["scene_version"] = resp.scene_version
         if _TIMING:
             result["elapsed_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        elif _SLOW_CALL_MS and "elapsed_ms" not in result:
+            # Always report timing for genuinely slow calls even when RHINO_TIMING is
+            # off, so the model learns what is expensive instead of being surprised by
+            # a timeout later (field report B).
+            elapsed = (time.perf_counter() - t1) * 1000
+            if elapsed >= _SLOW_CALL_MS:
+                result["elapsed_ms"] = round(elapsed, 1)
+                result["slow_call"] = True
         return result
     except RhinoConnectionError as e:
         return {
@@ -723,6 +737,36 @@ class AssertGeometryInput(BaseModel):
             "Selectors: 'all', 'by_layer:Name', 'by_name:Prefix', 'last_created', 'selected', or GUIDs."
         ),
     )
+
+
+class AssertDimensionsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    targets: list[dict[str, Any]] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Dimensions to check, each {label, selector, measure, target, tol}. "
+            "measure: length_x | width_y | height | top_z | base_z | span | clear_between "
+            "(clear_between takes axis='x'|'y' and reports the smallest gap between objects). "
+            "Omit `target` to just measure. Example: "
+            "[{'label':'nave width','selector':'by_layer:Nave::Piers','measure':'clear_between',"
+            "'axis':'x','target':12500,'tol':50}]"
+        ),
+    )
+
+
+class CaptureElevationsInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    views: list[str] = Field(default_factory=lambda: ["n", "s", "e", "w", "plan", "hero"],
+                             description="Any of n/s/e/w, plan, hero.")
+    fit: Any = Field("all", description="What to frame - selector or {selector, margin}.")
+    exclude_layers: list[str] = Field(default_factory=list,
+                                      description="Layers excluded from the FIT (not hidden). Use for a site slab that would otherwise dominate every view.")
+    width: int = 1200
+    height: int = 800
+    display_mode: Optional[str] = None
+    margin: float = Field(0.05, ge=0.0, le=0.5)
+    max_bytes: Optional[int] = Field(None, description="Per-image byte cap. Lower it when requesting many views.")
 
 
 class FindUnsupportedInput(BaseModel):
@@ -1545,6 +1589,40 @@ async def assert_geometry(params: AssertGeometryInput) -> dict:
           {"kind":"count","selector":"by_layer:Vault","expect":60}
         ]"""
     return await _exec_simple("assert_geometry", params.model_dump(exclude_none=True))
+
+
+@mcp.tool(name="assert_dimensions", annotations=RO)
+async def assert_dimensions(params: AssertDimensionsInput) -> dict:
+    """Check measured dimensions against the brief - target vs actual vs deviation.
+
+    This is the QA call for brief-driven work. "The nave is 12.5m clear and the vault
+    crowns at 33m" is checkable; "the geometry is valid" is not. Pair it with
+    set_design_brief so the numbers you assert are the numbers you promised.
+
+    A consistent deviation SIGN across several rows usually means one wrong base
+    coordinate rather than many wrong objects - the response says so."""
+    return await _exec_simple("assert_dimensions", params.model_dump(exclude_none=True))
+
+
+@mcp.tool(name="capture_elevations", annotations=RO)
+async def capture_elevations(params: CaptureElevationsInput) -> Any:
+    """A full orthographic set (N/S/E/W + plan + hero) in one call, consistently framed.
+
+    Every view frames the SAME selection, so the scales are comparable. Use
+    exclude_layers to keep a ground slab or site context out of the FIT - otherwise
+    it dominates the bounding box and the building shrinks in every frame.
+
+    Returns one image per view plus metadata; the viewport is restored afterwards."""
+    payload = params.model_dump(exclude_none=True)
+    result = await _exec_simple("capture_elevations", payload)
+    frames = result.get("frames") if isinstance(result, dict) else None
+    if not isinstance(frames, list):
+        return result
+    content: list[Any] = [{k: v for k, v in result.items() if k != "frames"}]
+    for f in frames:
+        if isinstance(f, dict):
+            content.extend(_named_image_content(str(f.get("view", "view")), f))
+    return content
 
 
 @mcp.tool(name="find_unsupported", annotations=RO)
@@ -3230,7 +3308,8 @@ _STANDARD_TOOLS: frozenset[str] = _LEAN_TOOLS | frozenset({
     "analyze_architecture", "get_level_summary", "select_by_semantic",
     "detect_clashes", "validate_objects",
     # Intent validation + reusable code substrate (v4.10.1)
-    "assert_geometry", "find_unsupported", "section_preview",
+    "assert_geometry", "assert_dimensions", "find_unsupported", "section_preview",
+    "capture_elevations", "get_operation_result", "list_operations",
     "write_module", "list_modules", "read_module",
     # Vision loop
     "capture_review_set", "capture_inspection_view", "compare_before_after",

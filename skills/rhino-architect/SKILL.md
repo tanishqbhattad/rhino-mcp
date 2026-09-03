@@ -59,6 +59,21 @@ Valid geometry is not correct geometry. Doubled base heights, swapped arguments,
 
 `assert_geometry` returns the offending ids immediately — while the fix is one parameter away, not twenty tool calls later. Also: `find_unsupported` catches floating spires and statuary; `section_preview(axis="y", station=...)` shows the inside of the model in one call (no permanent geometry, camera restored). Use `validate_objects(expect_shells=true, since_version=N)` for material health — it separates real corruption from intentional open shells and can scope to just what you built.
 
+## Long builds (anything over ~200 objects)
+
+Large models fail differently from small ones. The rules that matter:
+
+- **One heavy call per turn.** Rhino executes on a single UI thread, so a slow call blocks every later one. Do not send a big script and four captures together — the captures will queue behind it and time out.
+- **Keep scripts under ~60 s.** Split by phase (layers → plan → walls → openings → vaults → roof). Pass `timeout_seconds` when a phase genuinely needs longer.
+- **A client timeout does NOT mean it failed.** The script keeps running and finishes. Take the `request_id` from the error and call `get_operation_result(request_id=...)`, or `list_operations` to see what is still going. Re-running the same tool is also safe (idempotent replay).
+- **Write a module in phase 1.** `write_module('nd_lib', ...)` then `nd = rab.use('nd_lib')` in every later script. Prefix the name with the project — modules are per-user, not per-document.
+- **Verify after any timeout** with `ping` (compare `scene_version`) then `query_scene(scope='summary')` before rebuilding anything.
+- **Scope your QA.** `report_areas(scope='by_layer:Building')` and `validate_objects(since_version=N)` instead of whole-scene sweeps; whole-scene volume integration on thousands of objects is what times out.
+- **Check the brief with `assert_dimensions`**, not by eye. A consistent deviation sign across rows means one wrong base coordinate, not many wrong objects.
+- **`checkpoint="off"`** on read-only audits and diagnostics; every mutating script can otherwise write a full .3dm.
+
+**Engine note:** `execute_python3` needs Rhino 8.11+. On 8.9 it is unavailable — `ping.script_engines.python3.reason` says so explicitly. Everything runs in IronPython 2 there, so no f-strings, no type hints.
+
 ## Reuse code instead of re-pasting it
 
 Write your geometry helpers ONCE with `write_module(name, source)`, then in later scripts `mylib = rab.use('mylib')`. The server writes the file, so nothing inside Rhino ever holds a file handle. `list_modules` / `read_module` to inspect. For repetitive parametric work this is the difference between a 40-call session and a 400-call one.

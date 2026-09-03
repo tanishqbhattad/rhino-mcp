@@ -6,7 +6,7 @@
   "compilationOptions": {},
   "targets": {
     ".NETCoreApp,Version=v8.0": {
-      "RhinoAIBridge/4.14.0": {
+      "RhinoAIBridge/4.15.0": {
         "dependencies": {
           "Newtonsoft.Json": "13.0.3",
           "RhinoCommon": "8.17.25066.7001",
@@ -55,7 +55,7 @@
     }
   },
   "libraries": {
-    "RhinoAIBridge/4.14.0": {
+    "RhinoAIBridge/4.15.0": {
       "type": "project",
       "serviceable": false,
       "sha512": ""

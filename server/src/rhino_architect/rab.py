@@ -539,6 +539,135 @@ def arch(span, rise, depth, pier=0.0, kind="pointed", ring=None,
     return _assign(gid, layer_path, name)
 
 
+def annulus_wall(center, r_in, r_out, z0, z1, a0=0.0, a1=360.0,
+                 layer_path=None, name=None):
+    """A curved wall segment: the solid between two radii, swept a0->a1 degrees.
+
+    The apse/chevet primitive. r_in=0 gives a solid pier rather than failing - a
+    zero-radius inner circle is a degenerate curve, not an annulus.
+    """
+    c = _p3(center)
+    z0 = float(z0); z1 = float(z1)
+    if abs(z1 - z0) < _tol():
+        raise ValueError("annulus_wall: z0 and z1 are equal")
+    pl = Plane(Point3d(c.X, c.Y, min(z0, z1)), Vector3d.ZAxis)
+    full = abs(float(a1) - float(a0)) >= 359.999
+
+    if full:
+        outer = Circle(pl, float(r_out)).ToNurbsCurve()
+        curves = [outer]
+        if float(r_in) > _tol():
+            curves.append(Circle(pl, float(r_in)).ToNurbsCurve())
+        faces = Brep.CreatePlanarBreps(System.Array[Rhino.Geometry.Curve](curves), _tol())
+    else:
+        a0r = math.radians(float(a0)); a1r = math.radians(float(a1))
+        pts = []
+        steps = max(8, int(abs(a1r - a0r) / 0.12))
+        for i in range(steps + 1):
+            t = a0r + (a1r - a0r) * i / float(steps)
+            pts.append(pl.PointAt(math.cos(t) * float(r_out), math.sin(t) * float(r_out)))
+        inner_r = max(float(r_in), 0.0)
+        for i in range(steps, -1, -1):
+            t = a0r + (a1r - a0r) * i / float(steps)
+            pts.append(pl.PointAt(math.cos(t) * inner_r, math.sin(t) * inner_r))
+        pts.append(Point3d(pts[0]))
+        loop = Polyline(pts).ToNurbsCurve()
+        faces = Brep.CreatePlanarBreps(System.Array[Rhino.Geometry.Curve]([loop]), _tol())
+
+    if not faces or len(faces) == 0:
+        raise ValueError("annulus_wall: could not build the base face")
+    solid = faces[0].Faces[0].CreateExtrusion(
+        Line(Point3d(c.X, c.Y, min(z0, z1)),
+             Point3d(c.X, c.Y, max(z0, z1))).ToNurbsCurve(), True)
+    if solid is None:
+        raise ValueError("annulus_wall: extrusion failed")
+    return _assign(sc.doc.Objects.AddBrep(orient(solid)), layer_path, name)
+
+
+def buttress_pier(base, width, depth, height, setbacks=None, layer_path="Buttress", name=None):
+    """Stepped buttress pier. setbacks = [(at_height, inset), ...] applied cumulatively."""
+    b = _p3(base)
+    setbacks = sorted(setbacks or [], key=lambda s: s[0])
+    ids = []
+    z = b.Z
+    w = float(width); d = float(depth); inset = 0.0
+    stages = list(setbacks) + [(float(height) + b.Z, 0.0)]
+    for (at_h, step) in stages:
+        top = min(float(at_h), b.Z + float(height))
+        if top - z < _tol():
+            continue
+        ids.append(box((b.X - w / 2.0 + inset, b.Y - d / 2.0 + inset, z),
+                       w - 2 * inset, d - 2 * inset, top - z, layer_path, name))
+        z = top
+        inset += float(step)
+        if z >= b.Z + float(height) - _tol():
+            break
+    return ids
+
+
+def spire(center, base_radius, height, sides=8, stages=1, layer_path="Spire", name=None):
+    """Tapered polygonal spire. stages>1 gives a stepped silhouette rather than one cone."""
+    c = _p3(center)
+    ids = []
+    n = max(3, int(sides))
+    for s in range(max(1, int(stages))):
+        f0 = s / float(stages)
+        f1 = (s + 1) / float(stages)
+        r0 = float(base_radius) * (1.0 - f0)
+        r1 = float(base_radius) * (1.0 - f1)
+        z0 = c.Z + float(height) * f0
+        z1 = c.Z + float(height) * f1
+        if r0 < _tol():
+            break
+
+        def ring(r, z):
+            pts = []
+            for i in range(n):
+                a = 2.0 * math.pi * i / n
+                pts.append(Point3d(c.X + r * math.cos(a), c.Y + r * math.sin(a), z))
+            pts.append(Point3d(pts[0]))
+            return Polyline(pts).ToNurbsCurve()
+
+        if r1 < _tol():
+            # Final taper to a point: loft to a tiny ring instead of a degenerate apex,
+            # because a true apex makes the result un-booleanable.
+            r1 = max(float(base_radius) * 0.02, _tol() * 10)
+        breps = Brep.CreateFromLoft([ring(r0, z0), ring(r1, z1)],
+                                    Point3d.Unset, Point3d.Unset,
+                                    Rhino.Geometry.LoftType.Straight, False)
+        if not breps or len(breps) == 0:
+            continue
+        solid = breps[0].CapPlanarHoles(_tol()) or breps[0]
+        ids.append(_assign(sc.doc.Objects.AddBrep(orient(solid)), layer_path, name))
+    return ids
+
+
+def gable_roof(a, b, width, ridge_height, eaves_z, layer_path="Roof", name=None):
+    """Gable roof over a rectangular bay: a->b is the ridge line in plan."""
+    pa = _p3(a); pb = _p3(b)
+    run = Vector3d(pb - pa); run.Z = 0.0
+    if run.Length < _tol():
+        raise ValueError("gable_roof: a and b coincide")
+    u = Vector3d(run); u.Unitize()
+    v = Vector3d.CrossProduct(Vector3d.ZAxis, u)
+    hw = float(width) / 2.0
+    ez = float(eaves_z); rz = float(ridge_height)
+    p0 = Point3d(pa.X, pa.Y, ez) - v * hw
+    p1 = Point3d(pa.X, pa.Y, ez) + v * hw
+    q0 = Point3d(pb.X, pb.Y, ez) - v * hw
+    q1 = Point3d(pb.X, pb.Y, ez) + v * hw
+    ra = Point3d(pa.X, pa.Y, rz)
+    rb = Point3d(pb.X, pb.Y, rz)
+    section = Polyline([p0, ra, p1, Point3d(p1), Point3d(p0)]).ToNurbsCurve()
+    section2 = Polyline([q0, rb, q1, Point3d(q1), Point3d(q0)]).ToNurbsCurve()
+    breps = Brep.CreateFromLoft([section, section2], Point3d.Unset, Point3d.Unset,
+                                Rhino.Geometry.LoftType.Straight, False)
+    if not breps or len(breps) == 0:
+        raise ValueError("gable_roof: loft failed")
+    solid = breps[0].CapPlanarHoles(_tol()) or breps[0]
+    return _assign(sc.doc.Objects.AddBrep(orient(solid)), layer_path, name)
+
+
 def vault_web(springing_a, springing_b, boss, crown_rise, courses=8,
               layer_path="Vault", name=None):
     """One severy (web) of a rib vault, as a lofted masonry-course surface.
