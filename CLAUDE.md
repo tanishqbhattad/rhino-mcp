@@ -26,7 +26,7 @@ New features should be able to tell the model *it built the wrong thing* — not
 ```powershell
 # Python
 uv --directory server sync --group dev --frozen
-uv --directory server run python -m pytest -q          # 120 collected
+uv --directory server run python -m pytest -q          # 140 collected
 # If uv can't reinstall because a running MCP server holds rhino-architect.exe open
 # (happens after a version bump), add --no-sync - the install is editable anyway.
 uv --directory server run ruff check src tests ../evals
@@ -70,12 +70,16 @@ uv --directory server run python ../evals/distill_session.py report latest
     `type == "progress"` *before* future matching, and `_dispatch_progress` swallows callback
     exceptions — a raise there tears down the connection and fails every in-flight command.
     Both are covered by tests in `test_protocol.py`.
+13. **Destructive confirmations fail closed, but only for clients that can ask.** `delete_objects`
+    and `restore_checkpoint` elicit confirmation. A client *without* the capability must behave
+    exactly as before (never refuse). One that claimed it and then failed is refused. Both
+    directions are pinned in `test_elicitation.py`, and mutation-tested.
 
 ## Where things live
 
 | Need | File |
 |---|---|
-| Tool definitions, profiles, schema flattening | `server/src/rhino_architect/server.py` (3694 L) |
+| Tool definitions, profiles, schema flattening | `server/src/rhino_architect/server.py` (3802 L) |
 | Transport: multiplex, retry, cancel, WAL | `server/src/rhino_architect/protocol.py` |
 | Geometry stdlib injected into scripts (51 fns) | `server/src/rhino_architect/rab.py` |
 | C# command dispatch (160 commands) | `plugin/CommandHandler.cs` (5903 L) |

@@ -38,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+import mcp.types as mcp_types
 from mcp.server.fastmcp import Context, FastMCP, Image
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -191,6 +192,73 @@ try:
     _SLOW_CALL_MS = int(os.environ.get("RHINO_SLOW_CALL_MS", "5000"))
 except ValueError:
     _SLOW_CALL_MS = 5000
+
+
+# Elicitation: confirm destructive operations with the human -------------------
+# WHY: the server knows the blast radius and the model does not. The model sends
+# delete_objects(["all"]) without knowing that resolves to 842 objects including
+# hidden ones; restore_checkpoint silently discards everything built since the save.
+# A generic ask_user tool would add little - the model can already ask in chat. So
+# elicitation is used only where the SERVER has the missing fact, and it quotes it.
+#
+# Rules:
+#   - a client without the elicitation capability behaves exactly as before
+#   - declined / cancelled / timed out -> the operation does NOT run
+#   - a client that CLAIMED the capability but failed to ask -> also does not run
+#     (fail closed: it said it could check with the human, so do not guess)
+# This guards the structured tools only. execute_script can still delete anything:
+# it is a safety net for the common path, not a security boundary.
+
+try:
+    _CONFIRM_DELETE_OVER = int(os.environ.get("RHINO_CONFIRM_DELETE_OVER", "25"))
+except ValueError:
+    _CONFIRM_DELETE_OVER = 25
+# A person may have walked away. Treat silence as "no" rather than hanging the tool.
+_CONFIRM_TIMEOUT_S = 300.0
+
+
+class _Confirmation(BaseModel):
+    confirm: bool = Field(description="Tick to go ahead. Leave unticked to cancel.")
+
+
+def _client_can_elicit(ctx: Any) -> bool:
+    if ctx is None:
+        return False
+    try:
+        return bool(ctx.session.check_client_capability(
+            mcp_types.ClientCapabilities(elicitation=mcp_types.ElicitationCapability())))
+    except Exception:
+        return False
+
+
+async def _confirm(ctx: Any, message: str) -> str:
+    """Ask the human. Returns 'accepted', 'declined', 'cancelled', 'unsupported' or 'error'."""
+    if not _client_can_elicit(ctx):
+        return "unsupported"
+    try:
+        res = await asyncio.wait_for(ctx.elicit(message=message, schema=_Confirmation),
+                                     timeout=_CONFIRM_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return "cancelled"
+    except Exception:
+        logger.warning("Elicitation failed; refusing the destructive operation", exc_info=True)
+        return "error"
+    if res.action == "accept":
+        return "accepted" if getattr(res.data, "confirm", False) else "declined"
+    return "declined" if res.action == "decline" else "cancelled"
+
+
+def _not_confirmed(verdict: str, what: str) -> dict:
+    return {
+        "status": "cancelled",
+        "error_code": "USER_DECLINED" if verdict in ("declined", "cancelled") else "CONFIRMATION_FAILED",
+        "confirmation": verdict,
+        "message": (f"Not done: the user did not confirm {what}."
+                    if verdict != "error" else
+                    f"Not done: the confirmation for {what} could not be shown."),
+        "retry_hint": ("Do not retry on your own. Ask the user in chat what they want, and "
+                       "narrow the selection if the scope was the concern."),
+    }
 
 
 def _progress_bridge(ctx: Any) -> Any:
@@ -2229,9 +2297,34 @@ async def boolean_operation(params: BooleanInput) -> dict:
 
 
 @mcp.tool(name="delete_objects", annotations=WR)
-async def delete_objects(params: DeleteInput) -> dict:
-    """Delete objects by GUID or selector string: 'all', 'by_layer:Layer', 'by_name:Pattern', 'selected'."""
-    return await _exec_simple("delete_objects", params.model_dump())
+async def delete_objects(params: DeleteInput, ctx: Context = None) -> dict:
+    """Delete objects by GUID or selector string: 'all', 'by_layer:Layer', 'by_name:Pattern', 'selected'.
+
+    Large deletes (RHINO_CONFIRM_DELETE_OVER, default 25 objects) and anything under
+    'all' ask the user to confirm first when the client supports it. If the response
+    has status 'cancelled', the user said no - do not retry; ask them in chat."""
+    payload = params.model_dump()
+    verdict = None
+    if _CONFIRM_DELETE_OVER > 0 and _client_can_elicit(ctx):
+        # Count with the plugin's own dry run: the SAME selector resolution the delete
+        # uses, so the number the user sees is the number that would go.
+        preview = await _exec_simple("delete_objects", {**payload, "dry_run": True})
+        if preview.get("status") != "ok":
+            return preview
+        n = int(preview.get("count") or 0)
+        wipes_scene = any(str(s).strip().lower() == "all" for s in params.object_ids)
+        if n >= _CONFIRM_DELETE_OVER or (wipes_scene and n > 0):
+            layers = sorted({str(o.get("layer") or "") for o in preview.get("would_delete") or []} - {""})
+            where = (f" on {len(layers)} layer(s): " + ", ".join(layers[:6])
+                     + (" ..." if len(layers) > 6 else "")) if layers else ""
+            scope = "the ENTIRE scene" if wipes_scene else ", ".join(params.object_ids[:3])
+            verdict = await _confirm(ctx, f"Delete {n} object(s) - {scope}{where}?")
+            if verdict != "accepted":
+                return _not_confirmed(verdict, f"deleting {n} object(s)")
+    result = await _exec_simple("delete_objects", payload)
+    if verdict:
+        result["confirmation"] = verdict
+    return result
 
 # Escape hatches --------------------------------------------------
 
@@ -3344,15 +3437,30 @@ async def save_checkpoint(name: str) -> dict:
 
 
 @mcp.tool(name="restore_checkpoint", annotations=WR)
-async def restore_checkpoint(name: str) -> dict:
+async def restore_checkpoint(name: str, ctx: Context = None) -> dict:
     """Restore the model to a previously saved checkpoint.
 
     WARNING: This replaces all current geometry with the checkpoint state.
     Save a new checkpoint first if you want to preserve current work.
+    When the client supports it, the user is asked to confirm first; status
+    'cancelled' means they said no - do not retry, ask them in chat.
 
     name: checkpoint name (from save_checkpoint)
     """
-    return await _exec_simple("restore_checkpoint", {"name": name})
+    verdict = None
+    if _client_can_elicit(ctx):
+        summary = await _exec_simple("query_scene", {"scope": "summary"})
+        n = summary.get("total_objects")
+        current = f"the current scene ({n} objects)" if isinstance(n, int) else "the current scene"
+        verdict = await _confirm(
+            ctx, f"Restore checkpoint '{name}'? This replaces {current}; anything built "
+                 "since that checkpoint is lost unless you save a new checkpoint first.")
+        if verdict != "accepted":
+            return _not_confirmed(verdict, f"restoring checkpoint '{name}'")
+    result = await _exec_simple("restore_checkpoint", {"name": name})
+    if verdict:
+        result["confirmation"] = verdict
+    return result
 
 
 @mcp.tool(name="list_checkpoints", annotations=RO)

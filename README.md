@@ -248,6 +248,9 @@ Best local models: `qwen2.5-coder:32b`, `deepseek-r1:32b`, `llama3.1:70b`.
 | `RHINO_SAFE_MODE` | unset | `1` blocks destructive tools on the Python side too |
 | `RHINO_TIMING` | unset | `1` adds `elapsed_ms` to every response |
 | `RHINO_RAB` | `1` | `0` disables the auto-imported `rab` helpers |
+| `RHINO_CONFIRM_DELETE_OVER` | `25` | Deletes this large (and any delete of `all`) ask you to confirm first, if your client supports MCP elicitation. `0` turns it off |
+| `RHINO_SLOW_CALL_MS` | `5000` | Calls slower than this always report `elapsed_ms`. `0` turns it off |
+| `RHINO_MAX_AUTO_CHECKPOINTS` | `10` | How many automatic checkpoints to keep (plugin side) |
 
 ---
 
@@ -311,7 +314,9 @@ CI builds the plugin, lints, and runs the test suite on every push.
 - **`execute_python3` fixed** — it now returns the script's real `stdout`/`stderr`, reports a script that raises as an error with a traceback (it previously came back `ok`), and actually honours `timeout_seconds`
 - **Session distiller** (`evals/distill_session.py`) — turns the write-ahead log every session already keeps into a report (command mix, failures, retries, slow calls) and a draft eval task measured from the live scene
 - The `dist/` staleness check now also verifies the protocol version and advertised features — it previously passed while `dist/` lacked protocol 5.1 entirely
-- `build.bat` reads its version from `VERSION`; release notes for v4.10–v4.15 added in `docs/`
+- **Confirmation before big deletes and checkpoint restores** (MCP elicitation) — the server knows what the model doesn't: that `delete_objects(["all"])` means 842 objects including hidden ones, or that a restore throws away everything since the save. Clients that support elicitation ask you first, quoting the real count; saying no means nothing is touched. Clients without it behave as before
+- **Distilled eval tasks check elevation**, not just size — a roof dropped from 8 m to the ground used to pass every drafted assertion
+- **`build.bat` fixed**: it no longer reports `BUILD SUCCESSFUL` when Rhino blocked the install (it also used to delete the plugin's DLLs before failing), and it now works from any folder. It also reads its version from `VERSION`; release notes for v4.10–v4.15 added in `docs/`
 
 ### v4.12.0 – v4.15.0
 - Self-describing tool schemas, `capture(fit=...)`, layer/selector fixes, `assert_dimensions`, `capture_elevations`, `run_selftest` and eval task 10 — see [`docs/RELEASE_NOTES_v4.10-v4.15.md`](docs/RELEASE_NOTES_v4.10-v4.15.md)

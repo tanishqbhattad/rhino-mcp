@@ -2,9 +2,9 @@
 
 **Written:** 2026-09-11 · **Updated:** 2026-09-22 for v4.16.0
 **Repo:** `C:\Users\Tanishq\Documents\rhino-mcp` → https://github.com/tanishqbhattad/rhino-mcp
-**State:** `v4.16.0` committed on branch `release/v4.16.0`, **not pushed, not merged, not
-tagged**. `main` is still at v4.15.0 (`1ba368e`). The last git tag is `v4.8.0` — nothing
-after it was ever tagged.
+**State:** `v4.16.0` is on branch `release/v4.16.0`, pushed to `origin`. **No PR yet, so no
+CI has run; not merged, not tagged.** `main` is still at v4.15.0 (`1ba368e`). The last git tag
+is `v4.8.0` — nothing after it was ever tagged.
 
 This document is written for an engineer (or Claude Code) picking the project up cold.
 Read §1–§3 to get oriented, §4 before you touch anything, §5 to run it, §9 for what's open.
@@ -71,14 +71,14 @@ rhino-mcp/
 │   ├── uv.lock                  committed; CI runs --frozen
 │   ├── chat.py                  standalone OpenAI-compatible chat client (Ollama etc.)
 │   ├── src/rhino_architect/
-│   │   ├── server.py            3694 L  — 128 FastMCP tools, profiles, schema flattening
+│   │   ├── server.py            3802 L  — 128 FastMCP tools, profiles, schema flattening
 │   │   ├── protocol.py           663 L  — Protocol 5.1 transport: multiplex, retry, cancel, progress
 │   │   ├── rab.py               1107 L  — 51-fn geometry stdlib injected into execute_script
 │   │   ├── pdf_tracer.py         488 L
 │   │   ├── material_downloader.py 374 L
 │   │   ├── doctor.py             190 L  — `uv run rhino-architect-doctor`
 │   │   └── validation.py          12 L
-│   └── tests/                   120 collected tests, 6 files — see §6
+│   └── tests/                   140 collected tests, 7 files — see §6
 │
 ├── plugin/                      the C# half (12,104 L of .cs total)
 │   ├── CommandHandler.cs        5903 L  — THE dispatch table. All 160 commands land here.
@@ -258,8 +258,14 @@ Resolve it in the function body instead.
 
 ### 4.8 Rhino holds the .rhp open
 
-Plugin copy fails while Rhino is running. `build.bat` / the deploy step uses a verified retry
-loop. **Close Rhino before a plugin rebuild**, or expect to retry.
+Plugin copy fails while Rhino is running. **Close Rhino before a plugin rebuild.** There is no
+retry loop. Until v4.16.0, `build.bat` deleted the dependency DLLs *first*, then let the copy
+fail silently, and still printed `BUILD SUCCESSFUL`. It now checks the `.rhp` is not held open
+before deleting anything, fails loudly with "close Rhino", and exits 1. The fresh build is still
+left in `plugin\bin\Release\net8.0`.
+
+Compiling does **not** need Rhino closed: `dotnet build plugin/RhinoAIBridge.csproj -c Release`
+works any time. Only installing into the plug-in folder does.
 
 ### 4.9 `uv` must use the managed standalone Python
 
@@ -338,10 +344,12 @@ First time ever: Rhino 8 → `PlugInManager` → Install → browse to the `.rhp
 After that it auto-loads. `AIBridge` at the Rhino command line restarts the TCP server.
 Logs: `%APPDATA%\AIBridge\logs\`
 
-> **`build.bat` assumes its cwd is `plugin/`.** Its banner now reads `VERSION` via `%~dp0`, but
-> `dotnet restore`, `dotnet build` and `set BD=bin\Release\net8.0` are still cwd-relative. Run it
-> from `plugin/`, or it restores and builds in the wrong place while looking fine. A
-> `pushd "%~dp0"` at the top would fix it; not done yet.
+> **`build.bat` runs from its own folder** (`pushd "%~dp0"`), so it works from any cwd. Before
+> v4.16.0 its `dotnet` calls were cwd-relative and silently built in the wrong place.
+>
+> **In Claude Code, call it by full path:** `cmd /c 'call "<repo>\plugin\build.bat" < NUL'`.
+> The session sets `NoDefaultCurrentDirectoryInExePath=1`, so a bare `build.bat` is "not
+> recognized" even from `plugin/`. `< NUL` gets past the final `pause`.
 
 ### Shipping a release
 
@@ -363,15 +371,16 @@ running Rhino and a running MCP server, and holds the window open with `set /p`.
 
 ## 6. Tests and evals
 
-### Unit tests — 120 collected, 6 files
+### Unit tests — 140 collected, 7 files
 
 | File | Collected | Covers |
 |---|---|---|
 | `test_rhino_ai_bridge.py` | 53 | the original broad suite |
 | `test_protocol.py` | 23 | Protocol 5.1: framing, multiplex, retry, cancel, progress + its MCP bridge |
-| `test_field_report_regressions.py` | 15 | field-report fixes A1/A2/A6/A7, schema/eval contracts, progress wiring |
+| `test_field_report_regressions.py` | 17 | field-report fixes A1/A2/A6/A7, schema/eval contracts, progress wiring |
 | `test_python3_harness.py` | 14 | `execute_python3` output/exception capture (runs the harness, no Rhino) |
-| `test_distill_session.py` | 10 | WAL parsing, pairing, truncation, failure/retry mining |
+| `test_distill_session.py` | 15 | WAL parsing, pairing, truncation, failure/retry mining, draft tolerances |
+| `test_elicitation.py` | 13 | delete/restore confirmation over a real in-memory MCP client |
 | `test_rab.py` | 5 | `rab` helpers |
 
 > Counted as pytest *collects* them, not as `def test_` lines. They differ:
@@ -431,7 +440,10 @@ uv --directory server run python ../evals/distill_session.py draft latest --id m
   thrash the v4.13 `fit` work was built to remove. That is what this is for.
 - **`draft`** — emits a runnable eval task whose assertions are *measured from the live scene*
   the session produced, so a good session becomes a regression test instead of being lost when
-  Rhino closes. Needs Rhino up with that model still open.
+  Rhino closes. Needs Rhino up with that model still open. Verified live: a drafted task scores
+  17/17 on its source scene, and catches a deleted pier (count) and a roof dropped 8 m (`top_z`).
+  Drafting `height` alone missed that second one entirely, which is why every layer gets both.
+  Tolerances are 1% of the measured scale, so they work in mm and m documents alike.
 
 > **Known limit, stated in the tool's own output:** the plugin truncates journaled params at
 > ~300 chars, and for `execute_script` that budget is entirely consumed by the `rab` bootstrap
@@ -480,9 +492,10 @@ verified live in Rhino before being called done.
 
 ## 9. What's open
 
-### v4.16.0 is committed on a branch, not shipped.
-`release/v4.16.0` holds the whole release (see `README.md` changelog). To ship it: push the
-branch, confirm CI is green, merge to `main`, and tag it. Nothing else is mid-flight.
+### v4.16.0 is pushed on a branch, not shipped.
+`release/v4.16.0` holds the whole release (see `README.md` changelog). To ship it: open a PR
+into `main` (CI only runs on PRs and on `main`), confirm CI is green, merge, and tag
+`v4.16.0`. Nothing else is mid-flight.
 
 ### Two items that need Tan (not code)
 
@@ -500,11 +513,13 @@ branch, confirm CI is green, merge to `main`, and tag it. Nothing else is mid-fl
 
 ### Known gaps
 
-- **`build.bat` is cwd-dependent** — see §5. A `pushd "%~dp0"` fixes it.
 - **Only `batch` reports *real* percent progress.** Everything else long gets the elapsed-time
   heartbeat. `place_openings_on_facade` and `derive_floors_from_mass` walk lists internally and
   could report `wall i of n` from their loops — worth doing if they turn out to be slow.
-- **`distill_session.py draft` has never run against a live scene** — unit-tested only.
+- **Which real MCP clients show elicitation prompts is unverified.** The confirmations are
+  proven against the SDK's own client and a live Rhino, but not yet inside Claude Desktop or
+  Claude Code. A client that doesn't advertise the capability simply never gets asked, which
+  is the pre-v4.16 behaviour.
 - **The WAL truncates params at ~300 chars**, so `execute_script` bodies never reach it and the
   distiller cannot mine `rab` usage. Widening the budget is a plugin change.
 - **`run_selftest` measures ~700 ms warm** here vs ~570 ms when written. Not isolated.
@@ -516,7 +531,7 @@ v4.16.0 delivered the MCP-spec progress work and the session distiller. Still op
 | Option | Why | Size |
 |---|---|---|
 | **Grasshopper bridge** | The single biggest capability gap. Parametric definitions are where Rhino power users live, and no MCP does this well. | Large — plan first |
-| **Rest of the MCP spec work** | Elicitation (ask the user mid-build) and structured output. | Medium |
+| **Structured output** | The last MCP-spec item: typed tool results clients can validate. | Medium |
 
 ---
 

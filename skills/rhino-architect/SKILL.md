@@ -129,6 +129,7 @@ Cache derived data across calls with `set_state` / `get_state` instead of re-der
 - Do not use `run_command` when a structured tool exists - it has no rollback.
 - Do not leave low-confidence traced geometry unreviewed: after `trace_pdf`, inspect the `Traced::REVIEW` layer with the user.
 - Do not delete with `delete_objects(["all"])` unless the user explicitly asked to clear the scene; prefer `by_layer:` scoping.
+- Do not retry a tool that returned `status: "cancelled"` with `error_code: "USER_DECLINED"`. Large deletes and `restore_checkpoint` ask the user to confirm first (when the client supports it), and that status means they said no. Ask them in chat what they want instead, usually a narrower selection. `CONFIRMATION_FAILED` means the dialog could not be shown: ask in chat.
 - Do not disturb the user's viewport: keep `restore_state`/`restore_view` defaults on captures and drawing tools.
 
 ## When things go wrong
