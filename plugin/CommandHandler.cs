@@ -305,7 +305,13 @@ namespace RhinoAIBridge
                             failed.Add(i);
                             break;
                         }
+                        // v5.1: same checkpoint reports progress. A 40-op batch is
+                        // otherwise a silent multi-minute wait.
                         var raw = commands[i] as JObject ?? new JObject();
+                        ProgressReporter.ReportStep(
+                            i, commands.Count,
+                            string.Format("op {0}/{1}: {2}", i + 1, commands.Count,
+                                          raw["type"]?.ToString() ?? "?"));
                         JObject sub;
                         try
                         {

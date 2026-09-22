@@ -22,8 +22,8 @@ Several Rhino MCP servers exist. This one is built for **long, real modelling se
 
 |  | This project |
 |---|---|
-| **Tool surface** | 123 tools, curated into `lean` / `standard` / `full` profiles so small models aren't drowned |
-| **Transport** | **Protocol 5** — multiplexed, so reads, `ping` and cancel answer instantly while a 3-minute script runs |
+| **Tool surface** | 128 tools, curated into `lean` / `standard` / `full` profiles so small models aren't drowned |
+| **Transport** | **Protocol 5.1** — multiplexed, so reads, `ping` and cancel answer instantly while a 3-minute script runs, and long batches report live progress |
 | **Reliability** | Idempotent retries (no duplicate geometry on reconnect), atomic batches with rollback, write-ahead-log crash recovery |
 | **Correctness** | **Intent validation** — asserts what the geometry *means*, not just that it parses |
 | **Geometry stdlib** | `rab` helpers auto-imported into every script: walls, slabs, grids, **pointed arches, rib vaults, rose tracery, mouldings** |
@@ -114,15 +114,15 @@ The two-centred arch solver uses `c = (h²−s²)/2s`, `R = c+s`, and the extrad
 
 ---
 
-## Tool surface: 123 tools, three profiles
+## Tool surface: 128 tools, three profiles
 
 Set `RHINO_TOOLS=lean|standard|full` in the server environment:
 
 | Profile | Tools | For |
 |---|---|---|
-| `lean` | ~21 | small/local models (Ollama), minimal context |
-| `standard` *(default)* | ~71 | Claude / GPT-class daily driving |
-| `full` | 123 | everything, including JSON twins and compatibility aliases |
+| `lean` | 21 | small/local models (Ollama), minimal context |
+| `standard` *(default)* | 76 | Claude / GPT-class daily driving |
+| `full` | 128 | everything, including JSON twins and compatibility aliases |
 
 Anything not exposed in the active profile is **still callable** as a `batch` sub-command, and the live command list is always available from `list_commands` and the `rhino://capabilities` resource.
 
@@ -257,7 +257,7 @@ Best local models: `qwen2.5-coder:32b`, `deepseek-r1:32b`, `llama3.1:70b`.
 Claude Desktop / ChatGPT / Codex / Antigravity / Ollama
          |  MCP (stdio)
          v
-  server/src/rhino_architect/server.py   <- FastMCP Python server (123 tools, profile-gated)
+  server/src/rhino_architect/server.py   <- FastMCP Python server (128 tools, profile-gated)
          |  TCP 127.0.0.1:9544
          |  per-user auth token + [1-byte flag][4-byte len][payload]
          v
@@ -306,7 +306,17 @@ CI builds the plugin, lints, and runs the test suite on every push.
 
 ## Changelog
 
-### v4.11.0 (current)
+### v4.16.0 (current)
+- **Live progress for long operations** (protocol 5.1) — batches report `op 7/40` as they run, surfaced as MCP progress notifications, so a long build no longer looks like a hang. Negotiated: older plugins and clients keep working unchanged
+- **`execute_python3` fixed** — it now returns the script's real `stdout`/`stderr`, reports a script that raises as an error with a traceback (it previously came back `ok`), and actually honours `timeout_seconds`
+- **Session distiller** (`evals/distill_session.py`) — turns the write-ahead log every session already keeps into a report (command mix, failures, retries, slow calls) and a draft eval task measured from the live scene
+- The `dist/` staleness check now also verifies the protocol version and advertised features — it previously passed while `dist/` lacked protocol 5.1 entirely
+- `build.bat` reads its version from `VERSION`; release notes for v4.10–v4.15 added in `docs/`
+
+### v4.12.0 – v4.15.0
+- Self-describing tool schemas, `capture(fit=...)`, layer/selector fixes, `assert_dimensions`, `capture_elevations`, `run_selftest` and eval task 10 — see [`docs/RELEASE_NOTES_v4.10-v4.15.md`](docs/RELEASE_NOTES_v4.10-v4.15.md)
+
+### v4.11.0
 - **Installer rewritten** — verification report, `install-log.txt`, detects locked files from a running Rhino or AI client, and never closes without explaining itself
 - **`.gitattributes` pins Windows scripts to CRLF** — LF endings made `cmd.exe` mis-seek on `goto`/`call`, which is why the installer appeared to close instantly for ZIP downloads
 - **Shipped plugin refreshed** — `dist/plugin/` had drifted a month and a half behind the source

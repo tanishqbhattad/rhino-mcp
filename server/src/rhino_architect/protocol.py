@@ -17,6 +17,12 @@ Protocol 5 (v4.8):
   - viewport captures skip base64 inflation on the wire.
 - CANCELLATION: cancel(request_id) signals the plugin to stop a running command
   at its next checkpoint.
+- PROGRESS (5.1, feature "progress"): a running command may emit any number of
+  out-of-band frames {"type":"progress","request_id":...,"percent":..,"message":..}
+  BEFORE its single real response. They carry no result and never resolve the
+  request. A 3-minute script is otherwise indistinguishable from a hang.
+  Negotiated: the client sets want_progress only when the plugin advertised the
+  feature, so an older plugin is never sent a parameter it would have to ignore.
 - LEGACY COMPATIBILITY: plugins that do not echo request_id are served by FIFO
   response matching (they answer strictly in order), with single-flight retry
   semantics preserved.
@@ -82,7 +88,7 @@ MAX_RETRIES = 2
 HEADER_SIZE = 4
 MAX_FRAME = 50 * 1024 * 1024   # 50MB cap, matches server
 
-CLIENT_FEATURES = ["multiplex", "binary_image", "idempotent_retry", "cancel"]
+CLIENT_FEATURES = ["multiplex", "binary_image", "idempotent_retry", "cancel", "progress"]
 
 
 @dataclass
@@ -166,9 +172,13 @@ class RhinoProtocol:
         # that do not echo request_id (they respond strictly in order).
         self._pending: dict[str, asyncio.Future] = {}
         self._fifo: deque[asyncio.Future] = deque()
+        # request_id -> progress callback. Progress frames are informational: they
+        # must never consume the request's future or its FIFO slot.
+        self._progress_cbs: dict[str, Any] = {}
         # Negotiated server capabilities (set by the "hello" handshake).
         self._server_multiplex = False
         self._server_binary = False
+        self._server_progress = False
         self._server_features: set[str] = set()
         # The most recent mutating request id - used by cancel_operation.
         self.last_mutating_request_id: Optional[str] = None
@@ -243,6 +253,7 @@ class RhinoProtocol:
         self._server_features = set(feats)
         self._server_multiplex = "multiplex" in self._server_features
         self._server_binary = "binary_image" in self._server_features
+        self._server_progress = "progress" in self._server_features
 
     def _close_writer_nolock(self) -> None:
         w = self._writer
@@ -319,6 +330,16 @@ class RhinoProtocol:
             while True:
                 raw = await self._recv_frame()  # no idle timeout - quiet is normal
                 rid = raw.get("request_id") if isinstance(raw, dict) else None
+
+                # Progress frames are out-of-band status for an IN-FLIGHT request and
+                # must be handled before any future matching. Resolving the future
+                # would complete the command with a progress payload, and popping a
+                # FIFO slot would desync legacy in-order matching for every later
+                # response on this connection.
+                if isinstance(raw, dict) and raw.get("type") == "progress":
+                    self._dispatch_progress(rid, raw)
+                    continue
+
                 fut: asyncio.Future | None = None
                 if rid is not None:
                     fut = self._pending.pop(rid, None)
@@ -345,6 +366,23 @@ class RhinoProtocol:
         except Exception as exc:
             self._abort_connection(exc)
 
+    def _dispatch_progress(self, rid: str | None, frame: dict[str, Any]) -> None:
+        """Hand a progress frame to the callback registered for that request.
+
+        Deliberately total: a missing or raising callback must never propagate into
+        the reader loop. An exception there calls _abort_connection and fails EVERY
+        in-flight request - a catastrophic penalty for a cosmetic status update.
+        """
+        if rid is None:
+            return
+        cb = self._progress_cbs.get(rid)
+        if cb is None:
+            return  # late frame for a request that already finished or was abandoned
+        try:
+            cb(frame)
+        except Exception:
+            logger.debug("Progress callback for %s raised; ignoring", rid, exc_info=True)
+
     def _abort_connection(self, exc: Exception) -> None:
         """Reader-side teardown (no async lock - we may be inside the reader task)."""
         self._reader_task = None
@@ -355,6 +393,7 @@ class RhinoProtocol:
         pending = list(self._pending.values()) + list(self._fifo)
         self._pending.clear()
         self._fifo.clear()
+        self._progress_cbs.clear()
         seen = set()
         for fut in pending:
             if id(fut) in seen:
@@ -363,11 +402,18 @@ class RhinoProtocol:
             if not fut.done():
                 fut.set_exception(exc)
 
-    async def _roundtrip(self, payload: dict[str, Any], timeout: float, sent_flag: list) -> dict[str, Any]:
+    async def _roundtrip(
+        self, payload: dict[str, Any], timeout: float, sent_flag: list,
+        on_progress: Any = None,
+    ) -> dict[str, Any]:
         rid = payload.get("request_id") or uuid.uuid4().hex
         payload["request_id"] = rid
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
+        if on_progress is not None:
+            # Register before the send: the plugin may emit progress the instant it
+            # starts, and a frame that arrives before registration is dropped.
+            self._progress_cbs[rid] = on_progress
         try:
             async with self._write_lock:
                 # Register inside the write lock so FIFO order == wire order
@@ -383,6 +429,7 @@ class RhinoProtocol:
             # legacy servers the FIFO entry must stay until the reader consumes the
             # matching frame (keeps strict in-order alignment after a timeout).
             self._pending.pop(rid, None)
+            self._progress_cbs.pop(rid, None)
             if self._server_multiplex:
                 try:
                     self._fifo.remove(fut)
@@ -393,8 +440,15 @@ class RhinoProtocol:
 
     async def send_command(
         self, command_type: str, params: dict[str, Any] | None = None,
-        *, timeout: float = READ_TIMEOUT,
+        *, timeout: float = READ_TIMEOUT, on_progress: Any = None,
     ) -> RhinoResponse:
+        """Send one command and await its response.
+
+        on_progress: optional sync callable invoked with each progress frame for
+        this request, e.g. {"percent": 42.0, "message": "walls 42/100", "stage": ...}.
+        It is best-effort - a plugin without the "progress" feature simply never
+        emits one, and the command behaves exactly as before.
+        """
         payload: dict[str, Any] = {"type": command_type, "request_id": uuid.uuid4().hex}
         if params:
             payload["params"] = params
@@ -408,7 +462,14 @@ class RhinoProtocol:
             sent = [False]
             try:
                 await self._ensure_connected()
-                raw = await self._roundtrip(payload, timeout, sent)
+                # Decide on progress AFTER connecting: the "progress" feature is only
+                # known once the hello handshake has run, and on the very first
+                # command that happens inside _ensure_connected above. Asking a
+                # plugin that did not negotiate it would send a param it must ignore.
+                cb = on_progress if (on_progress is not None and self._server_progress) else None
+                if cb is not None:
+                    payload["want_progress"] = True
+                raw = await self._roundtrip(payload, timeout, sent, on_progress=cb)
                 return self._parse_response(raw)
             except asyncio.TimeoutError as exc:
                 if self._server_multiplex:
@@ -464,10 +525,16 @@ class RhinoProtocol:
         *,
         atomic: bool = False,
         stop_on_error: Optional[bool] = None,
+        on_progress: Any = None,
     ) -> RhinoResponse:
-        """Send a batch with atomic rollback / stop_on_error semantics."""
+        """Send a batch with atomic rollback / stop_on_error semantics.
+
+        on_progress: see send_command. A batch is the clearest case for it - the
+        plugin can report "op 7 of 40" as it walks the list.
+        """
         if len(commands) == 1 and not atomic:
-            r = await self.send_command(commands[0]["type"], commands[0].get("params"))
+            r = await self.send_command(
+                commands[0]["type"], commands[0].get("params"), on_progress=on_progress)
             return RhinoResponse(
                 status=r.status,
                 result={"results": [{"status": r.status, **r.result}], "count": 1, "atomic": False},
@@ -488,7 +555,11 @@ class RhinoProtocol:
             sent = [False]
             try:
                 await self._ensure_connected()
-                raw = await self._roundtrip(payload, READ_TIMEOUT, sent)
+                # Same rule as send_command: only ask once the feature is negotiated.
+                cb = on_progress if (on_progress is not None and self._server_progress) else None
+                if cb is not None:
+                    payload["want_progress"] = True
+                raw = await self._roundtrip(payload, READ_TIMEOUT, sent, on_progress=cb)
                 return self._parse_response(raw)
             except asyncio.TimeoutError as exc:
                 if self._server_multiplex:
@@ -565,6 +636,11 @@ class RhinoProtocol:
     @property
     def server_features(self) -> list[str]:
         return sorted(self._server_features)
+
+    @property
+    def supports_progress(self) -> bool:
+        """True when the connected plugin negotiated the "progress" feature."""
+        return self._server_progress
 
     @staticmethod
     def _parse_response(raw: dict[str, Any]) -> RhinoResponse:

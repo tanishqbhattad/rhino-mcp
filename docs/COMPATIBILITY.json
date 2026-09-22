@@ -1,12 +1,22 @@
 {
-  "plugin_version": "4.11.0",
-  "server_version": "4.11.0",
-  "protocol_version": "5.0",
+  "plugin_version": "4.16.0",
+  "server_version": "4.16.0",
+  "protocol_version": "5.1",
   "min_rhino_version": "8.0",
   "min_python_version": "3.10",
-  "tested_on": ["Rhino 8.9", "Rhino 8.10", "Rhino 8.11", "Rhino 8.12"],
-  "tool_profiles": { "lean": 21, "standard": 71, "full": 123 },
-  "plugin_commands": 157,
+  "tested_on": [
+    "Rhino 8.9",
+    "Rhino 8.10",
+    "Rhino 8.11",
+    "Rhino 8.12",
+    "Rhino 8.18"
+  ],
+  "tool_profiles": {
+    "lean": 21,
+    "standard": 76,
+    "full": 128
+  },
+  "plugin_commands": 160,
   "mcp_clients": {
     "claude_desktop": {
       "supported": true,
@@ -29,5 +39,5 @@
     }
   },
   "breaking_changes": [],
-  "notes": "Protocol 5: multiplexed connection, idempotent retries via request_id replay, cooperative cancellation, binary image frames, WAL crash recovery. Fully backward compatible: protocol-4 clients get legacy single-flight semantics; the MCP server also works against 4.x plugins. v4.11.0 pins Windows script files to CRLF via .gitattributes (LF endings break cmd.exe goto/call seeking) and CI verifies dist/plugin matches a fresh build."
+  "notes": "Protocol 5.1 adds the 'progress' feature: out-of-band progress frames during long commands, surfaced as MCP progress notifications. Purely additive and negotiated - 5.0 plugins and clients keep working, progress simply never appears. Protocol 5: multiplexed connection, idempotent retries via request_id replay, cooperative cancellation, binary image frames, WAL crash recovery. execute_python3 needs Rhino 8.11+ and now returns real stdout/stderr and tracebacks."
 }

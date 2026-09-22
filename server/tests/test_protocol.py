@@ -42,9 +42,14 @@ async def read_client_frame(reader: asyncio.StreamReader) -> dict:
 class MockPlugin:
     """Scriptable stand-in for the Rhino AIBridge TCP server."""
 
-    def __init__(self, multiplex: bool = True, responder=None):
+    # What a protocol-5 plugin advertised before the "progress" feature existed.
+    # Kept as the default so every pre-existing test still exercises the old plugin.
+    BASE_FEATURES = ["multiplex", "binary_image", "idempotent_retry", "cancel"]
+
+    def __init__(self, multiplex: bool = True, responder=None, features=None):
         self.multiplex = multiplex
         self.responder = responder  # async (writer, payload, conn_index) -> handled: bool
+        self.features = list(self.BASE_FEATURES if features is None else features)
         self.connections = 0
         self._server: asyncio.AbstractServer | None = None
         self.port = 0
@@ -69,7 +74,7 @@ class MockPlugin:
                     if self.multiplex:
                         writer.write(enc_json({
                             "status": "ok", "request_id": rid,
-                            "features": ["multiplex", "binary_image", "idempotent_retry", "cancel"],
+                            "features": self.features,
                         }))
                     else:  # legacy plugins answer in order, without echoing request_id
                         writer.write(enc_json({"status": "error", "message": "Unknown command: hello"}))
@@ -308,6 +313,190 @@ async def test_cancel_rejected_on_legacy_plugin():
         assert result["status"] == "error"
         assert result["error_code"] == "NOT_SUPPORTED"
         await conn.disconnect()
+
+
+# ── Progress notifications (protocol 5.1) ────────────────────────────────
+
+PROGRESS_FEATURES = MockPlugin.BASE_FEATURES + ["progress"]
+
+
+def _progress_responder(steps, final=None):
+    """Emit `steps` progress frames, then one real response."""
+    async def responder(writer, payload, _conn):
+        if payload["type"] != "work":
+            return False
+        rid = payload["request_id"]
+        for i in steps:
+            writer.write(enc_json({
+                "type": "progress", "request_id": rid,
+                "percent": i, "message": f"step {i}",
+            }))
+            await writer.drain()
+        writer.write(enc_json({"status": "ok", "request_id": rid,
+                               **(final or {"done": True})}))
+        await writer.drain()
+        return True
+    return responder
+
+
+@pytest.mark.asyncio
+async def test_progress_feature_is_negotiated():
+    async with MockPlugin(features=PROGRESS_FEATURES) as plugin:
+        conn = await make_conn(plugin)
+        assert conn.supports_progress is True
+        await conn.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_progress_frames_reach_the_callback_and_do_not_resolve_the_request():
+    """The whole point: progress arrives DURING the call, the result still lands."""
+    seen = []
+    async with MockPlugin(responder=_progress_responder([10, 50, 90]),
+                          features=PROGRESS_FEATURES) as plugin:
+        conn = await make_conn(plugin)
+        resp = await conn.send_command("work", on_progress=seen.append)
+        assert resp.ok
+        assert resp.result == {"done": True}          # real response, not a progress frame
+        assert [f["percent"] for f in seen] == [10, 50, 90]
+        assert [f["message"] for f in seen] == ["step 10", "step 50", "step 90"]
+        await conn.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_progress_is_not_requested_from_a_plugin_that_lacks_the_feature():
+    """An older plugin must never be sent want_progress - it would have to ignore it."""
+    seen_payloads = []
+
+    async def responder(writer, payload, _conn):
+        if payload["type"] != "work":
+            return False
+        seen_payloads.append(payload)
+        writer.write(enc_json({"status": "ok", "request_id": payload["request_id"]}))
+        await writer.drain()
+        return True
+
+    async with MockPlugin(responder=responder) as plugin:   # BASE_FEATURES: no progress
+        conn = await make_conn(plugin)
+        assert conn.supports_progress is False
+        resp = await conn.send_command("work", on_progress=lambda f: None)
+        assert resp.ok                                   # degrades silently, still works
+        assert "want_progress" not in seen_payloads[0]
+        await conn.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_raising_progress_callback_cannot_kill_the_connection():
+    """A cosmetic status update must never tear down every in-flight request."""
+    def boom(_frame):
+        raise RuntimeError("callback is broken")
+
+    async with MockPlugin(responder=_progress_responder([25, 75]),
+                          features=PROGRESS_FEATURES) as plugin:
+        conn = await make_conn(plugin)
+        resp = await conn.send_command("work", on_progress=boom)
+        assert resp.ok                                   # survived both raising frames
+        # And the connection is still usable afterwards.
+        again = await conn.send_command("ping")
+        assert again.ok
+        await conn.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_progress_frames_do_not_desync_legacy_fifo_matching():
+    """Progress must not consume a FIFO slot: legacy matching is strictly positional."""
+    async def responder(writer, payload, _conn):
+        t = payload["type"]
+        if t not in ("a", "b"):
+            return False
+        if t == "a":
+            # Interleave a progress frame with NO request_id echo, legacy style.
+            writer.write(enc_json({"type": "progress", "percent": 50, "message": "half"}))
+            await writer.drain()
+        writer.write(enc_json({"status": "ok", "which": t}))   # legacy: no request_id
+        await writer.drain()
+        return True
+
+    async with MockPlugin(multiplex=False, responder=responder) as plugin:
+        conn = await make_conn(plugin)
+        first = await conn.send_command("a")
+        second = await conn.send_command("b")
+        # If the progress frame had eaten a FIFO slot, "b" would receive "a"'s response.
+        assert first.result == {"which": "a"}
+        assert second.result == {"which": "b"}
+        await conn.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_late_progress_frame_after_completion_is_dropped():
+    """A frame arriving after the response must not raise or leak a callback."""
+    seen = []
+
+    async def responder(writer, payload, _conn):
+        if payload["type"] != "work":
+            return False
+        rid = payload["request_id"]
+        writer.write(enc_json({"status": "ok", "request_id": rid}))
+        writer.write(enc_json({"type": "progress", "request_id": rid, "percent": 100}))
+        await writer.drain()
+        return True
+
+    async with MockPlugin(responder=responder, features=PROGRESS_FEATURES) as plugin:
+        conn = await make_conn(plugin)
+        resp = await conn.send_command("work", on_progress=seen.append)
+        assert resp.ok
+        await asyncio.sleep(0.05)          # let the trailing frame be processed
+        assert conn._progress_cbs == {}    # unregistered, no leak
+        follow = await conn.send_command("ping")
+        assert follow.ok                   # connection unharmed
+        await conn.disconnect()
+
+
+# ── The server-side bridge to MCP progress notifications ─────────────────
+
+@pytest.mark.asyncio
+async def test_progress_bridge_forwards_frames_as_mcp_notifications():
+    """Plugin frame -> ctx.report_progress(percent, 100, message)."""
+    from rhino_architect.server import _progress_bridge
+
+    calls = []
+
+    class FakeCtx:
+        async def report_progress(self, progress, total, message=None):
+            calls.append((progress, total, message))
+
+    bridge = _progress_bridge(FakeCtx())
+    bridge({"percent": 40, "message": "op 4/10: create_object"})
+    bridge({"percent": 80, "message": "op 8/10: create_object"})
+    await asyncio.sleep(0.05)          # report_progress is fired as a task, not awaited
+
+    assert calls == [
+        (40.0, 100.0, "op 4/10: create_object"),
+        (80.0, 100.0, "op 8/10: create_object"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_progress_bridge_is_inert_without_a_context():
+    """Tools that never declare a Context must cost nothing."""
+    from rhino_architect.server import _progress_bridge
+    assert _progress_bridge(None) is None
+
+
+@pytest.mark.asyncio
+async def test_progress_bridge_ignores_frames_without_a_percent():
+    """A malformed frame must not raise inside the reader task."""
+    from rhino_architect.server import _progress_bridge
+
+    calls = []
+
+    class FakeCtx:
+        async def report_progress(self, progress, total, message=None):
+            calls.append(progress)
+
+    bridge = _progress_bridge(FakeCtx())
+    bridge({"message": "no percent here"})     # must not raise
+    await asyncio.sleep(0.05)
+    assert calls == []
 
 
 # ── Pure functions ───────────────────────────────────────────────────────

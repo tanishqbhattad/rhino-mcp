@@ -1,7 +1,9 @@
 @echo off
+for /f "usebackq delims=" %%v in ("%~dp0..\VERSION") do set "VER=%%v"
+if not defined VER set "VER=unknown"
 echo.
 echo   ====================================
-echo    Building Rhino AI Bridge v4.11.0
+echo    Building Rhino AI Bridge v%VER%
 echo   ====================================
 echo.
 where dotnet >nul 2>&1

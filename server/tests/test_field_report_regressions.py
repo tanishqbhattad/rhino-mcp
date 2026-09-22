@@ -39,6 +39,59 @@ def test_snapshot_exposes_counts_by_index():
     assert "public Dictionary<int, int> CountsByLayerIndex()" in src
 
 
+# --- 5.1: the progress sink must be armed on the UI thread -------------------
+
+def test_progress_sink_is_armed_on_the_ui_thread():
+    """[ThreadStatic] state armed on the wrong thread fails SILENTLY.
+
+    ProgressReporter mirrors OperationRegistry's cancellation token: both are
+    [ThreadStatic], and commands run on Rhino's UI thread via UiDispatcher.Invoke
+    while the caller sits on a thread-pool task. Arming the sink in the calling task
+    (the first attempt at this) left every handler seeing a null sink - the batch ran
+    fine and emitted zero frames, with nothing in any log to say why. Caught only by
+    a live probe, so pin it here: SetCurrent must sit inside the Invoke lambda,
+    adjacent to the token it mirrors.
+    """
+    src = _cs("AIBridgeServer.cs")
+    invoke = src.index("UiDispatcher.Invoke(")
+    # The lambda body runs on the UI thread; both arms must be inside it.
+    body = src[invoke:invoke + 2500]
+    assert "OperationRegistry.SetCurrent(token);" in body, "cancellation arming moved"
+    assert "ProgressReporter.SetCurrent(progressSink);" in body, (
+        "ProgressReporter.SetCurrent must be INSIDE UiDispatcher.Invoke - arming it in "
+        "the calling thread-pool task silently emits no progress frames"
+    )
+    assert "ProgressReporter.ClearCurrent();" in body, "sink must be cleared on the UI thread"
+    # And it must NOT be armed in the dispatch/Task.Run region that precedes it.
+    before = src[:invoke]
+    assert "ProgressReporter.SetCurrent" not in before, (
+        "ProgressReporter armed before UiDispatcher.Invoke - wrong thread"
+    )
+
+
+def test_progress_is_negotiated_end_to_end():
+    """Client and plugin must both advertise "progress", or frames never flow."""
+    assert '"progress"' in _cs("AIBridgeServer.cs"), "plugin must advertise the feature"
+    assert 'PROTOCOL_VERSION = "5.1"' in _cs("AIBridgeServer.cs")
+    proto = (SRC / "protocol.py").read_text(encoding="utf-8")
+    assert '"progress"' in proto and "CLIENT_FEATURES" in proto
+    # want_progress is only ever sent when the plugin negotiated it.
+    assert "self._server_progress" in proto
+
+
+def test_progress_frames_never_resolve_a_request():
+    """The guard that keeps a progress frame from completing a command."""
+    proto = (SRC / "protocol.py").read_text(encoding="utf-8")
+    loop_start = proto.index("async def _reader_loop")
+    body = proto[loop_start:loop_start + 1600]
+    guard = body.index('raw.get("type") == "progress"')
+    matching = body.index("self._pending.pop(rid, None)")
+    assert guard < matching, (
+        "progress frames must be intercepted BEFORE future matching, or they resolve "
+        "the request with a progress payload and desync legacy FIFO alignment"
+    )
+
+
 # --- A2: by_layer must include descendants -----------------------------------
 
 def test_by_layer_includes_descendants_and_has_exact_escape_hatch():

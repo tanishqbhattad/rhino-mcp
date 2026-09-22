@@ -74,6 +74,8 @@ Large models fail differently from small ones. The rules that matter:
 
 **Engine note:** `execute_python3` needs Rhino 8.11+. On 8.9 it is unavailable — `ping.script_engines.python3.reason` says so explicitly. Everything runs in IronPython 2 there, so no f-strings, no type hints.
 
+On 8.11+, `execute_python3` returns the script's real `stdout`/`stderr`, and a script that raises comes back as `status: "error"` with `error_code: "PY3_SCRIPT_ERROR"` and a `traceback` pointing at your line. So `print()` is a fine way to report measurements, and a clean `status: "ok"` means the script genuinely ran to the end. `timeout_seconds` (default 45, max 300) is the real wait; on `PY3_TIMEOUT` the script may still be running in Rhino and its output lands in `result_path`.
+
 ## Reuse code instead of re-pasting it
 
 Write your geometry helpers ONCE with `write_module(name, source)`, then in later scripts `mylib = rab.use('mylib')`. The server writes the file, so nothing inside Rhino ever holds a file handle. `list_modules` / `read_module` to inspect. For repetitive parametric work this is the difference between a 40-call session and a 400-call one.

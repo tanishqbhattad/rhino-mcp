@@ -37,9 +37,13 @@ namespace RhinoAIBridge
     public class AIBridgeServer
     {
         private const int PORT = 9544;
-        public const string PROTOCOL_VERSION = "5.0";
+        // 5.1 adds the "progress" feature: out-of-band status frames during a long
+        // command. Purely additive - a 5.0 client never sets want_progress, so it
+        // never receives one.
+        public const string PROTOCOL_VERSION = "5.1";
         public static readonly string[] FEATURES =
-            { "multiplex", "idempotent_retry", "cancel", "binary_image", "columnar_query", "wal" };
+            { "multiplex", "idempotent_retry", "cancel", "binary_image", "columnar_query", "wal",
+              "progress" };
 
         // Cap concurrent client connections so a flood of fire-and-forget tasks can't
         // exhaust threads/sockets. (security hardening #4)
@@ -517,12 +521,33 @@ namespace RhinoAIBridge
                             var capturedCmd = cmd;
                             var capturedType = cmdType;
                             var capturedId = requestId;
+                            // Protocol 5.1: only build a sink when this client asked for
+                            // progress on this command. Otherwise it stays null and
+                            // ProgressReporter is inert - zero cost on the hot path.
+                            Action<double, string> progressSink = null;
+                            if (cmd["want_progress"]?.ToObject<bool>() == true)
+                            {
+                                progressSink = (pct, msg) =>
+                                {
+                                    var frame = new JObject
+                                    {
+                                        ["type"] = "progress",
+                                        ["request_id"] = capturedId,
+                                        ["percent"] = Math.Round(pct, 1),
+                                    };
+                                    if (!string.IsNullOrEmpty(msg)) frame["message"] = msg;
+                                    // WriteFrameSafe takes the per-connection write lock, so a
+                                    // progress frame can never interleave INSIDE another frame.
+                                    WriteFrameSafe(conn, frame);
+                                };
+                            }
                             conn.InFlight.Wait(ct);
                             _ = Task.Run(() =>
                             {
                                 try
                                 {
-                                    var result = ExecuteOnUi(capturedCmd, capturedType, capturedId);
+                                    var result = ExecuteOnUi(capturedCmd, capturedType, capturedId,
+                                                             progressSink);
                                     result["request_id"] = capturedId;
                                     LogDispatch(capturedCmd, capturedType, result);
                                     WriteFrameSafe(conn, result);
@@ -561,7 +586,8 @@ namespace RhinoAIBridge
         /// Run one command on the UI thread with timeout, cancellation and (for mutating
         /// commands with a request_id) idempotency registration + WAL bracketing.
         /// </summary>
-        private JObject ExecuteOnUi(JObject cmd, string cmdType, string requestId)
+        private JObject ExecuteOnUi(JObject cmd, string cmdType, string requestId,
+                                    Action<double, string> progressSink = null)
         {
             bool mutating = requestId != null && !CommandHandler.ReadOnlyCommands.Contains(cmdType);
             if (mutating)
@@ -623,6 +649,12 @@ namespace RhinoAIBridge
                 result = UiDispatcher.Invoke(() =>
                 {
                     OperationRegistry.SetCurrent(token);
+                    // Protocol 5.1: the progress sink is [ThreadStatic], exactly like the
+                    // cancellation token above, so it MUST be armed here - inside the UI
+                    // thread that actually runs Dispatch. Arming it in the calling
+                    // thread-pool task sets it on the wrong thread and every handler sees
+                    // a null sink (no frames are emitted, silently).
+                    ProgressReporter.SetCurrent(progressSink);
                     try
                     {
                         JObject r;
@@ -644,7 +676,11 @@ namespace RhinoAIBridge
                         }
                         return r;
                     }
-                    finally { OperationRegistry.ClearCurrent(); }
+                    finally
+                    {
+                        OperationRegistry.ClearCurrent();
+                        ProgressReporter.ClearCurrent();
+                    }
                 }, TimeSpan.FromSeconds(timeoutSec));
             }
             catch (TimeoutException e)

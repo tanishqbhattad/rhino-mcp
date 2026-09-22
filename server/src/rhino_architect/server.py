@@ -38,7 +38,7 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.fastmcp import Context, FastMCP, Image
 from pydantic import BaseModel, ConfigDict, Field
 
 from rhino_architect.protocol import (
@@ -193,12 +193,44 @@ except ValueError:
     _SLOW_CALL_MS = 5000
 
 
-async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
+def _progress_bridge(ctx: Any) -> Any:
+    """Adapt plugin progress frames to MCP progress notifications.
+
+    The reader task calls this synchronously, so it must return immediately and must
+    not raise: ctx.report_progress is a coroutine, so it is fired off as a task and
+    never awaited. Dropping a status update is always preferable to stalling the
+    reader (which would delay every other in-flight response) or killing it.
+    """
+    if ctx is None:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+    def on_frame(frame: dict[str, Any]) -> None:
+        pct = frame.get("percent")
+        msg = frame.get("message") or frame.get("stage")
+        if pct is None:
+            return
+        try:
+            # total=100 so clients render a percentage rather than a bare counter.
+            loop.create_task(ctx.report_progress(float(pct), 100.0, msg))
+        except Exception:
+            logger.debug("Could not forward progress frame", exc_info=True)
+
+    return on_frame
+
+
+async def _exec_simple(command: str, params: dict[str, Any], ctx: Any = None) -> dict:
     """Execute a command and return the raw result dict.
 
     Returns dict, not str: FastMCP serializes once on the way out.
     Phase 2: surfaces scene_version on every response so the model can use it as
     an etag for caching scene queries between turns.
+    ctx: when a tool declares a FastMCP Context, progress frames from the plugin are
+    forwarded to the client as MCP progress notifications (protocol 5.1). Optional
+    everywhere - a plugin without the "progress" feature simply never emits one.
     """
     blocked = _check_safe_mode(command)
     if blocked:
@@ -207,7 +239,7 @@ async def _exec_simple(command: str, params: dict[str, Any]) -> dict:
     t1 = time.perf_counter()
     try:
         conn = await get_connection()
-        resp = await conn.send_command(command, params)
+        resp = await conn.send_command(command, params, on_progress=_progress_bridge(ctx))
         if not resp.ok:
             return {"status": "error", "message": resp.message, **(resp.result or {})}
         result = dict(resp.result) if resp.result else {}
@@ -372,6 +404,82 @@ def _find_rhinocode() -> str | None:
     return None
 
 
+# execute_python3 harness ----------------------------------------------------
+# WHY THIS EXISTS: `rhinocode script` hands the file to Rhino's script server and
+# returns after ~1s - it does NOT wait for the script, and it never relays the
+# script's output or its exit status. Measured on Rhino 8.18: print() output is
+# lost, a script that raises still yields exit code 0 with empty stderr (so a crashed
+# geometry script was reported as status "ok"), and timeout_seconds governed nothing.
+#
+# So the user's code runs inside this harness, which captures stdout/stderr and any
+# exception and writes them to a result file atomically (tmp + os.replace, so a
+# half-written file is never read). The server then polls for that file within the
+# timeout. This is CPython 3 inside Rhino, not IronPython - rab.py's ASCII/no-f-string
+# rules do not apply here, but placeholders are substituted with str.replace rather
+# than str.format so the harness's own braces need no escaping.
+_PY3_HARNESS = r'''
+import io, json, os, sys, traceback
+_USER = __USER__
+_RESULT = __RESULT__
+_out, _err = io.StringIO(), io.StringIO()
+_saved = (sys.stdout, sys.stderr)
+_rec = {"ok": True, "traceback": None, "exit_code": None}
+sys.stdout, sys.stderr = _out, _err
+try:
+    with open(_USER, encoding="utf-8") as _f:
+        _src = _f.read()
+    exec(compile(_src, _USER, "exec"), {"__name__": "__main__", "__file__": _USER})
+except SystemExit as _e:
+    _rec["exit_code"] = _e.code
+    if _e.code not in (None, 0):
+        _rec["ok"] = False
+        _rec["traceback"] = "SystemExit: %r" % (_e.code,)
+except BaseException:
+    _rec["ok"] = False
+    _t, _v, _tb = sys.exc_info()
+    # Skip the harness's own exec frame so the traceback starts in the user's file.
+    _rec["traceback"] = "".join(traceback.format_exception(_t, _v, _tb.tb_next if _tb else None))
+finally:
+    # Rhino's script server is long-lived: leaving stdout redirected would swallow
+    # output for every later script in the session.
+    sys.stdout, sys.stderr = _saved
+_rec["stdout"] = _out.getvalue()
+_rec["stderr"] = _err.getvalue()
+with open(_RESULT + ".tmp", "w", encoding="utf-8") as _f:
+    json.dump(_rec, _f)
+os.replace(_RESULT + ".tmp", _RESULT)
+'''
+
+# Keep responses token-lean: a runaway print loop should not flood the context.
+_PY3_OUTPUT_CAP = 50_000
+
+
+def _py3_harness(user_path: str, result_path: str) -> str:
+    return (_PY3_HARNESS
+            .replace("__USER__", repr(user_path))
+            .replace("__RESULT__", repr(result_path)))
+
+
+def _cap_output(text: str) -> tuple[str, bool]:
+    if len(text) <= _PY3_OUTPUT_CAP:
+        return text, False
+    return text[:_PY3_OUTPUT_CAP] + f"\n... [truncated {len(text) - _PY3_OUTPUT_CAP} chars]", True
+
+
+async def _await_result_file(path: str, deadline: float, poll: float = 0.1) -> dict | None:
+    """Poll for the harness result until the deadline. None means it never arrived."""
+    while True:
+        if os.path.exists(path):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    return orjson.loads(f.read())
+            except (OSError, ValueError):
+                pass  # os.replace makes this near-impossible; retry once more below
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(poll)
+
+
 async def _run_process(args: list[str], timeout_seconds: int) -> dict[str, Any]:
     """Run a subprocess without blocking the MCP event loop."""
     def _run() -> subprocess.CompletedProcess[str]:
@@ -431,6 +539,7 @@ async def _exec_batch(
     commands: list[dict[str, Any]],
     atomic: bool = True,
     stop_on_error: Optional[bool] = None,
+    ctx: Any = None,
 ) -> dict:
     """Phase 3 - execute a batch with optional atomic semantics."""
     for i, command in enumerate(commands):
@@ -450,7 +559,9 @@ async def _exec_batch(
                     sub["code"] = _RAB_BOOTSTRAP + code
     try:
         conn = await get_connection()
-        resp = await conn.send_batch(commands, atomic=atomic, stop_on_error=stop_on_error)
+        resp = await conn.send_batch(
+            commands, atomic=atomic, stop_on_error=stop_on_error,
+            on_progress=_progress_bridge(ctx))
         result = dict(resp.result) if resp.result else {}
         # A single non-atomic sub-command is sent as a direct command, so an
         # image-returning op (capture, section_preview) can bring back a binary
@@ -1431,7 +1542,7 @@ async def modify_object(params: ModifyObjectInput) -> dict:
 
 
 @mcp.tool(name="batch", annotations=WR)
-async def batch(params: BatchCommandInput) -> dict:
+async def batch(params: BatchCommandInput, ctx: Context = None) -> dict:
     """Run many Rhino commands in one round-trip. Supports atomic rollback and $N references.
 
     WHEN TO USE BATCH (already know all params upfront):
@@ -1460,18 +1571,20 @@ async def batch(params: BatchCommandInput) -> dict:
     With atomic=False: each sub-op commits independently - use for large bulk builds.
     Legacy commands (any name from rhino://capabilities) are callable inside batch."""
     raw_commands = [c.model_dump() for c in params.commands]
-    return await _exec_batch(raw_commands, atomic=params.atomic, stop_on_error=params.stop_on_error)
+    return await _exec_batch(
+        raw_commands, atomic=params.atomic, stop_on_error=params.stop_on_error, ctx=ctx)
 
 
 # Architect intelligence layer --------------------------------------------------
 
 @mcp.tool(name="derive_floors_from_mass", annotations=WR)
-async def derive_floors_from_mass(params: DeriveFloorsFromMassInput) -> dict:
+async def derive_floors_from_mass(params: DeriveFloorsFromMassInput, ctx: Context = None) -> dict:
     """Section a massing solid at floor heights and extrude each section into a slab.
 
     Variable level_heights[] for non-uniform floor heights (e.g. taller ground floor).
     Pair with create_object(type='massing') in a batch - chain via $1.mass_id."""
-    return await _exec_simple("derive_floors_from_mass", params.model_dump(exclude_none=True))
+    return await _exec_simple(
+        "derive_floors_from_mass", params.model_dump(exclude_none=True), ctx=ctx)
 
 
 @mcp.tool(name="create_core", annotations=WR)
@@ -1484,11 +1597,12 @@ async def create_core(params: CreateCoreInput) -> dict:
 
 
 @mcp.tool(name="place_openings_on_facade", annotations=WR)
-async def place_openings_on_facade(params: PlaceOpeningsInput) -> dict:
+async def place_openings_on_facade(params: PlaceOpeningsInput, ctx: Context = None) -> dict:
     """Distribute repeated openings (windows or doors) along walls at a constant rhythm.
 
     The whole facade in one call. Pass wall_ids=['by_layer:Wall'] to facade-ize every wall."""
-    return await _exec_simple("place_openings_on_facade", params.model_dump(exclude_none=True))
+    return await _exec_simple(
+        "place_openings_on_facade", params.model_dump(exclude_none=True), ctx=ctx)
 
 
 @mcp.tool(name="align_to_grid", annotations=WR)
@@ -1498,7 +1612,7 @@ async def align_to_grid(params: AlignGridInput) -> dict:
 
 
 @mcp.tool(name="report_areas", annotations=RO)
-async def report_areas(params: ReportAreasInput) -> dict:
+async def report_areas(params: ReportAreasInput, ctx: Context = None) -> dict:
     """GFA / NFA-style area schedule grouped by layer, level, or name.
 
     For solid Breps with known volume and bbox height, plan_area = volume / height.
@@ -1510,7 +1624,7 @@ async def report_areas(params: ReportAreasInput) -> dict:
     (scope='by_layer:Building') for a phase check, and use mode='exact' with a raised
     timeout_seconds for a final schedule. The response reports how many volumes were
     actually computed and how many were skipped."""
-    return await _exec_simple("report_areas", params.model_dump(exclude_none=True))
+    return await _exec_simple("report_areas", params.model_dump(exclude_none=True), ctx=ctx)
 
 
 # Layers --------------------------------------------------
@@ -1745,13 +1859,13 @@ async def read_module(params: ModuleNameInput) -> dict:
 
 
 @mcp.tool(name="detect_clashes", annotations=RO)
-async def detect_clashes(params: DetectClashesInput) -> dict:
+async def detect_clashes(params: DetectClashesInput, ctx: Context = None) -> dict:
     """Real clash / coordination check. Broad phase: an RTree over bounding boxes finds candidate
     pairs; narrow phase: a true Brep-Brep intersection (not just bbox overlap) with tolerance
     confirms real contact. Returns each clashing pair with a contact point, intersection length,
     and kind ('overlap' = hard interpenetration, 'touch'/'intersect' = surfaces meet). Scope with
     object_ids/layer; empty scope checks every solid in the scene."""
-    return await _exec_simple("detect_clashes", params.model_dump(exclude_none=True))
+    return await _exec_simple("detect_clashes", params.model_dump(exclude_none=True), ctx=ctx)
 
 
 @mcp.tool(name="select_by_semantic", annotations=RO)
@@ -2122,7 +2236,7 @@ async def delete_objects(params: DeleteInput) -> dict:
 # Escape hatches --------------------------------------------------
 
 @mcp.tool(name="execute_script", annotations=WR)
-async def execute_script(params: ScriptInput) -> dict:
+async def execute_script(params: ScriptInput, ctx: Context = None) -> dict:
     """Run arbitrary Python inside Rhino. Powerful escape hatch — prefer structured tools.
 
     START WITH `rab.help()` — it prints the whole helper API with signatures AND the
@@ -2163,7 +2277,7 @@ async def execute_script(params: ScriptInput) -> dict:
         data["code"] = data.pop("script")
     if _RAB_ENABLED and isinstance(data.get("code"), str):
         data["code"] = _RAB_BOOTSTRAP + data["code"]
-    result = await _exec_simple("execute_script", data)
+    result = await _exec_simple("execute_script", data, ctx=ctx)
     # Compact mode: if result has many object_ids, summarize to save tokens
     if isinstance(result, dict):
         ids = result.get("object_ids", [])
@@ -2185,6 +2299,12 @@ async def execute_python3(params: Python3Input) -> dict:
     """Run CPython 3 in Rhino 8 via RhinoCode's official `rhinocode` CLI.
 
     This supplements `execute_script`, which uses Rhino's legacy IronPython engine.
+
+    Returns the script's real stdout/stderr - print() your measurements. A script that
+    raises returns status "error" with error_code PY3_SCRIPT_ERROR and a traceback
+    pointing at your line, so status "ok" means it genuinely ran to the end.
+    timeout_seconds is the real wait (the script keeps running in Rhino past it).
+
     Requirements:
     - Rhino 8.11+ with RhinoCode installed
     - RhinoCode script server running (`StartScriptServer`; this tool starts it)
@@ -2222,35 +2342,72 @@ async def execute_python3(params: Python3Input) -> dict:
             "start_result": start,
         }
 
-    with tempfile.NamedTemporaryFile("w", suffix=".py", prefix="rab_py3_", delete=False, encoding="utf-8") as f:
-        script_path = f.name
-        f.write(params.code)
-        if not params.code.endswith("\n"):
-            f.write("\n")
+    work = tempfile.mkdtemp(prefix="rab_py3_")
+    user_path = os.path.join(work, "script.py")
+    result_path = os.path.join(work, "result.json")
+    runner_path = os.path.join(work, "run.py")
+    with open(user_path, "w", encoding="utf-8") as f:
+        f.write(params.code if params.code.endswith("\n") else params.code + "\n")
+    with open(runner_path, "w", encoding="utf-8") as f:
+        f.write(_py3_harness(user_path, result_path))
 
     args = [rhinocode]
     if params.rhino_id:
         args.extend(["--rhino", params.rhino_id])
-    args.extend(["script", script_path])
-    proc = await _run_process(args, params.timeout_seconds)
+    args.extend(["script", runner_path])
 
-    if not params.keep_script:
-        try:
-            os.unlink(script_path)
-        except OSError:
-            pass
+    t0 = time.monotonic()
+    deadline = t0 + params.timeout_seconds
+    # The CLI only hands the file over (~1s); the real wait is on the result file.
+    proc = await _run_process(args, min(params.timeout_seconds, 30))
+    keep = params.keep_script
 
-    ok = proc["returncode"] == 0
-    return {
-        "status": "ok" if ok else "error",
-        "engine": "RhinoCode CPython 3",
-        "rhinocode": rhinocode,
-        "returncode": proc["returncode"],
-        "stdout": proc["stdout"] or "(no stdout)",
-        "stderr": proc["stderr"] or "",
-        "script_path": script_path if params.keep_script else None,
-        "message": None if ok else "rhinocode script returned a non-zero exit code.",
-    }
+    base: dict[str, Any] = {"engine": "RhinoCode CPython 3", "rhinocode": rhinocode,
+                            "returncode": proc["returncode"]}
+    if keep:
+        base["script_path"] = user_path
+    try:
+        if proc["returncode"] != 0:
+            return {
+                **base, "status": "error", "error_code": "RHINOCODE_FAILED",
+                "message": "rhinocode could not hand the script to Rhino's script server.",
+                "stdout": proc["stdout"], "stderr": proc["stderr"],
+                "retry_hint": "Check `rhinocode list` shows this Rhino, or pass rhino_id.",
+            }
+
+        rec = await _await_result_file(result_path, deadline)
+        elapsed_ms = round((time.monotonic() - t0) * 1000, 1)
+        if rec is None:
+            # The script may still be running inside Rhino - it cannot be cancelled
+            # from here. Keep the work dir so its result can still be read later.
+            keep = True
+            return {
+                **base, "status": "error", "error_code": "PY3_TIMEOUT",
+                "message": (f"No result after {params.timeout_seconds}s. The script may still "
+                            "be running inside Rhino; its output will land in result_path."),
+                "result_path": result_path, "elapsed_ms": elapsed_ms,
+                "retry_hint": "Raise timeout_seconds (max 300) or split the work into phases.",
+            }
+
+        stdout, out_cut = _cap_output(rec.get("stdout") or "")
+        stderr, err_cut = _cap_output(rec.get("stderr") or "")
+        ok = bool(rec.get("ok"))
+        result = {
+            **base, "status": "ok" if ok else "error",
+            "stdout": stdout, "stderr": stderr, "elapsed_ms": elapsed_ms,
+        }
+        if out_cut or err_cut:
+            result["output_truncated"] = True
+        if rec.get("exit_code") is not None:
+            result["exit_code"] = rec["exit_code"]
+        if not ok:
+            result["error_code"] = "PY3_SCRIPT_ERROR"
+            result["traceback"] = rec.get("traceback")
+            result["message"] = "The script raised inside Rhino - see traceback."
+        return result
+    finally:
+        if not keep:
+            shutil.rmtree(work, ignore_errors=True)
 
 
 @mcp.tool(name="undo", annotations=WI)

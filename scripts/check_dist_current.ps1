@@ -101,4 +101,58 @@ Rebuild and refresh dist/plugin before committing.
 "@
 }
 
+# --- 3. protocol version + negotiated features ---------------------------
+# WHY: checks 1 and 2 both passed while dist/plugin lacked protocol 5.1 entirely.
+# A protocol bump that adds no new COMMAND and no new assembly VERSION is invisible
+# to them - and a feature the plugin never advertises simply never negotiates, so
+# the client degrades silently and the capability just does not exist for users who
+# installed from GitHub. That is the same class of miss as the six-week-stale
+# plugin, on an axis nothing was measuring.
+$server = Join-Path $RepoRoot 'plugin/AIBridgeServer.cs'
+if (-not (Test-Path $server)) { throw "Required file missing: $server" }
+$serverSrc = Get-Content $server -Raw
+
+$protoMatch = [regex]::Match($serverSrc, 'PROTOCOL_VERSION\s*=\s*"([^"]+)"')
+if (-not $protoMatch.Success) { throw "Could not find PROTOCOL_VERSION in AIBridgeServer.cs" }
+$protoVersion = $protoMatch.Groups[1].Value
+
+$featMatch = [regex]::Match($serverSrc, 'FEATURES\s*=\s*\{(.*?)\}', 'Singleline')
+if (-not $featMatch.Success) { throw "Could not find the FEATURES array in AIBridgeServer.cs" }
+$features = [regex]::Matches($featMatch.Groups[1].Value, '"([a-z0-9_]+)"') |
+    ForEach-Object { $_.Groups[1].Value } |
+    Sort-Object -Unique
+
+if ($features.Count -lt 3) {
+    throw "Only $($features.Count) features parsed from FEATURES - the parser is probably wrong."
+}
+
+function Test-InBinary($needle) {
+    return ($ascii.Contains($needle) -or $utf16a.Contains($needle) -or $utf16b.Contains($needle))
+}
+
+$protoOk = Test-InBinary $protoVersion
+$missingFeatures = @($features | Where-Object { -not (Test-InBinary $_) })
+
+Write-Host "protocol in source : $protoVersion  (shipped: $(if ($protoOk) { 'yes' } else { 'NO' }))"
+Write-Host "features in source : $($features -join ', ')"
+Write-Host "missing from binary: $($missingFeatures.Count)"
+
+if (-not $protoOk) {
+    throw @"
+dist/plugin is STALE - the source declares PROTOCOL_VERSION $protoVersion but the
+shipped binary does not contain that string.
+Rebuild and refresh dist/plugin before committing.
+"@
+}
+
+if ($missingFeatures.Count -gt 0) {
+    throw @"
+dist/plugin is STALE - it does not advertise $($missingFeatures.Count) feature(s) the
+source declares: $($missingFeatures -join ', ')
+A feature the shipped plugin never advertises never negotiates, so the client
+degrades silently and users see the capability as simply absent.
+Rebuild and refresh dist/plugin before committing.
+"@
+}
+
 Write-Host "dist/plugin is current." -ForegroundColor Green

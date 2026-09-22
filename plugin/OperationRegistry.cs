@@ -158,6 +158,75 @@ namespace RhinoAIBridge
     }
 
     /// <summary>
+    /// Protocol 5.1: out-of-band progress for a running command.
+    ///
+    /// Why: a 3-minute execute_script is indistinguishable from a hang. The client
+    /// sees nothing until the single response frame arrives, so the model (and the
+    /// person watching) cannot tell "working" from "dead", and the usual reaction is
+    /// to cancel or re-run work that was almost finished.
+    ///
+    /// Mirrors the cancellation token above deliberately: commands run serially on
+    /// Rhino's UI thread, so a thread-static sink is correct, and handlers can emit
+    /// from the SAME checkpoints where they already poll CancelRequested.
+    ///
+    /// Everything here is best-effort. Progress is cosmetic: a failure to report must
+    /// never fail the command, so Report swallows anything the sink throws.
+    /// </summary>
+    public static class ProgressReporter
+    {
+        // Minimum gap between frames. A tight loop reporting every iteration would
+        // flood the socket and slow the very operation it is describing.
+        private const int MIN_INTERVAL_MS = 250;
+
+        [ThreadStatic] private static Action<double, string> _sink;
+        [ThreadStatic] private static int _lastTick;
+
+        public static void SetCurrent(Action<double, string> sink)
+        {
+            _sink = sink;
+            _lastTick = 0;
+        }
+
+        public static void ClearCurrent()
+        {
+            _sink = null;
+            _lastTick = 0;
+        }
+
+        /// <summary>True when the client asked for progress on this command.</summary>
+        public static bool Wanted => _sink != null;
+
+        /// <summary>
+        /// Report percent-complete (0-100). Throttled; pass force:true for a final or
+        /// milestone frame that must not be dropped.
+        /// </summary>
+        public static void Report(double percent, string message, bool force = false)
+        {
+            var sink = _sink;
+            if (sink == null) return;
+            if (!force)
+            {
+                int now = Environment.TickCount;
+                // Unsigned difference so the 49-day TickCount wraparound cannot make
+                // this go negative and silently suppress every later frame.
+                if (_lastTick != 0 && unchecked((uint)(now - _lastTick)) < MIN_INTERVAL_MS) return;
+                _lastTick = now;
+            }
+            if (percent < 0) percent = 0;
+            if (percent > 100) percent = 100;
+            try { sink(percent, message); }
+            catch { /* cosmetic - never fail a command over a status update */ }
+        }
+
+        /// <summary>Convenience for "item i of n" loops.</summary>
+        public static void ReportStep(int index, int total, string message, bool force = false)
+        {
+            if (total <= 0) return;
+            Report(index * 100.0 / total, message, force);
+        }
+    }
+
+    /// <summary>
     /// Crash-safe write-ahead log: every top-level mutating command is appended
     /// (JSONL) BEFORE execution and its status afterwards. After a Rhino crash the
     /// agent can read the tail to recover what it was doing and diff against the scene.
