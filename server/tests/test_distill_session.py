@@ -138,3 +138,25 @@ def test_empty_wal_yields_no_operations(tmp_path):
     p = tmp_path / "wal_empty.jsonl"
     p.write_text("", encoding="utf-8")
     assert distill.pair_operations(distill.load_wal(p)) == []
+
+
+# ── draft tolerances ─────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("scale", [3000.0, 3.0, 0.3])
+def test_tolerance_is_one_percent_in_any_unit_system(scale):
+    """An absolute floor like 1.0 assumes millimetres: in a metres document it
+    allowed a whole metre of error on a 3 m wall (33%), catching nothing."""
+    assert distill._tolerance(scale) == pytest.approx(scale * 0.01, abs=1e-3)
+
+
+def test_tolerance_never_collapses_to_zero():
+    assert distill._tolerance(0.0) > 0
+
+
+def test_draft_asserts_elevation_not_just_extent():
+    """Measured live: with height alone, a roof dropped from z=8000 to the ground
+    kept its height and passed every drafted assertion. top_z must be drafted too."""
+    import inspect
+    src = inspect.getsource(distill.build_assertions)
+    assert '"top_z"' in src and '"height"' in src

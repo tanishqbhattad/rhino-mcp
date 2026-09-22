@@ -270,6 +270,28 @@ async def call(command: str, params: dict | None = None) -> dict:
     return dict(resp.result)
 
 
+def _tolerance(scale: float) -> float:
+    """1% of the measured scale, in the document's own units.
+
+    Deliberately relative with only a tiny floor. An absolute floor like 1.0 assumes
+    millimetres - in a metres document it would allow a whole metre of error on a 3 m
+    wall (33%) and the assertion would catch nothing.
+    """
+    return max(round(abs(scale) * 0.01, 3), 0.001)
+
+
+async def _measure(layer: str, measure: str) -> float | None:
+    try:
+        r = await call("assert_dimensions", {
+            "targets": [{"selector": f"by_layer:{layer}", "measure": measure}]
+        })
+    except RuntimeError:
+        return None
+    rows = r.get("dimensions") or r.get("results") or []
+    actual = rows[0].get("actual") if rows else None
+    return float(actual) if isinstance(actual, (int, float)) else None
+
+
 async def build_assertions(min_objects: int) -> list[dict]:
     """Derive assertions from the live scene the session produced.
 
@@ -295,24 +317,28 @@ async def build_assertions(min_objects: int) -> list[dict]:
             "type": "layer_count", "layer": name, "min": count, "max": count,
         })
 
-    # Height/extent per populated layer, rounded to a tolerance the build can hit.
+    # Per populated layer: its vertical EXTENT (height) and its POSITION (top_z).
+    # Height alone is not enough - measured live, a roof slab dropped from z=8000 to
+    # the ground kept its 250 height and passed every drafted assertion. Wrong
+    # elevation is the classic parametric slip (a doubled base height, a plane
+    # origin off by a storey), and it is exactly what this project exists to catch.
     for name, _count in populated[:6]:
-        try:
-            dim = await call("assert_dimensions", {
-                "targets": [{"selector": f"by_layer:{name}", "measure": "height"}]
-            })
-        except RuntimeError:
-            continue
-        rows = dim.get("dimensions") or dim.get("results") or []
-        if not rows:
-            continue
-        actual = rows[0].get("actual")
-        if not isinstance(actual, (int, float)) or actual <= 0:
+        height = await _measure(name, "height")
+        if height is None or height <= 0:
             continue
         assertions.append({
             "type": "dimension", "selector": f"by_layer:{name}",
-            "measure": "height", "target": round(float(actual), 1),
-            "tol": max(1.0, round(abs(float(actual)) * 0.01, 1)),
+            "measure": "height", "target": round(height, 3), "tol": _tolerance(height),
+        })
+        top = await _measure(name, "top_z")
+        if top is None:
+            continue
+        # Elevation can legitimately be 0 or negative, so the tolerance scales with
+        # whichever is larger: how high it sits or how tall it is.
+        assertions.append({
+            "type": "dimension", "selector": f"by_layer:{name}",
+            "measure": "top_z", "target": round(top, 3),
+            "tol": _tolerance(max(abs(top), height)),
         })
 
     # Watertightness only where it already holds - see the docstring.
