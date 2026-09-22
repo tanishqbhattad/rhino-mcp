@@ -58,6 +58,10 @@ namespace RhinoAIBridge
         // Max concurrently executing multiplexed commands per connection.
         private const int MAX_INFLIGHT_PER_CONN = 16;
 
+        // Heartbeat progress interval (protocol 5.1). The first tick also waits this long,
+        // so commands that finish quickly never emit a heartbeat at all.
+        private const int HEARTBEAT_MS = 2000;
+
         private TcpListener _listener;
         private CancellationTokenSource _cts;
         private readonly object _lifecycleLock = new object();
@@ -643,18 +647,42 @@ namespace RhinoAIBridge
                 timeoutSec = Math.Max(5, Math.Min(600, requested.Value));
 
             var token = OperationRegistry.TokenFor(requestId);
+
+            // Protocol 5.1: one progress channel per command, shared by the handler (UI
+            // thread) and the heartbeat below (thread pool). Null when the client did not
+            // ask for progress, which keeps the whole mechanism inert.
+            var channel = progressSink != null ? new ProgressChannel(progressSink) : null;
+            System.Threading.Timer heartbeat = null;
+            if (channel != null)
+            {
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                int budget = timeoutSec;
+                // Most long commands cannot know their own percent - an execute_script is
+                // opaque. Elapsed time against the timeout budget is the honest number:
+                // it proves the command is alive AND says how close it is to timing out.
+                // Capped below 100 so a heartbeat never claims completion. Commands that
+                // report real progress (the batch loop) silence it via the channel.
+                heartbeat = new System.Threading.Timer(_ =>
+                {
+                    double s = clock.Elapsed.TotalSeconds;
+                    channel.Emit(Math.Min(99.0, s * 100.0 / budget),
+                                 string.Format("running {0:0}s of {1}s budget", s, budget),
+                                 force: true, isExplicit: false);
+                }, null, HEARTBEAT_MS, HEARTBEAT_MS);
+            }
+
             JObject result;
             try
             {
                 result = UiDispatcher.Invoke(() =>
                 {
                     OperationRegistry.SetCurrent(token);
-                    // Protocol 5.1: the progress sink is [ThreadStatic], exactly like the
+                    // Protocol 5.1: the channel pointer is [ThreadStatic], exactly like the
                     // cancellation token above, so it MUST be armed here - inside the UI
                     // thread that actually runs Dispatch. Arming it in the calling
                     // thread-pool task sets it on the wrong thread and every handler sees
-                    // a null sink (no frames are emitted, silently).
-                    ProgressReporter.SetCurrent(progressSink);
+                    // a null channel (no frames are emitted, silently).
+                    ProgressReporter.SetCurrent(channel);
                     try
                     {
                         JObject r;
@@ -711,6 +739,16 @@ namespace RhinoAIBridge
             {
                 if (mutating) OperationRegistry.Complete(requestId, new JObject { ["status"] = "error", ["message"] = e.Message });
                 result = new JObject { ["status"] = "error", ["message"] = e.Message };
+            }
+            finally
+            {
+                // Close BEFORE returning: the caller writes the response next, and no
+                // progress frame may trail it. Close takes the channel lock, so a heartbeat
+                // mid-Emit finishes its frame first and every later tick is a no-op. That
+                // also covers a timed-out command still running on the UI thread - its
+                // Report calls hit a closed channel.
+                heartbeat?.Dispose();
+                channel?.Close();
             }
             return result;
         }

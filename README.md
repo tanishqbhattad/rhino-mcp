@@ -307,7 +307,7 @@ CI builds the plugin, lints, and runs the test suite on every push.
 ## Changelog
 
 ### v4.16.0 (current)
-- **Live progress for long operations** (protocol 5.1) — batches report `op 7/40` as they run, surfaced as MCP progress notifications, so a long build no longer looks like a hang. Negotiated: older plugins and clients keep working unchanged
+- **Live progress for long operations** (protocol 5.1) — batches report `op 7/40` as they run, and long scripts, area schedules and clash checks send a heartbeat (`running 42s of 180s budget`), all surfaced as MCP progress notifications, so a long build no longer looks like a hang. Negotiated: older plugins and clients keep working unchanged
 - **`execute_python3` fixed** — it now returns the script's real `stdout`/`stderr`, reports a script that raises as an error with a traceback (it previously came back `ok`), and actually honours `timeout_seconds`
 - **Session distiller** (`evals/distill_session.py`) — turns the write-ahead log every session already keeps into a report (command mix, failures, retries, slow calls) and a draft eval task measured from the live scene
 - The `dist/` staleness check now also verifies the protocol version and advertised features — it previously passed while `dist/` lacked protocol 5.1 entirely

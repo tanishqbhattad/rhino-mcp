@@ -57,7 +57,7 @@ def test_progress_sink_is_armed_on_the_ui_thread():
     # The lambda body runs on the UI thread; both arms must be inside it.
     body = src[invoke:invoke + 2500]
     assert "OperationRegistry.SetCurrent(token);" in body, "cancellation arming moved"
-    assert "ProgressReporter.SetCurrent(progressSink);" in body, (
+    assert "ProgressReporter.SetCurrent(channel);" in body, (
         "ProgressReporter.SetCurrent must be INSIDE UiDispatcher.Invoke - arming it in "
         "the calling thread-pool task silently emits no progress frames"
     )
@@ -66,6 +66,50 @@ def test_progress_sink_is_armed_on_the_ui_thread():
     before = src[:invoke]
     assert "ProgressReporter.SetCurrent" not in before, (
         "ProgressReporter armed before UiDispatcher.Invoke - wrong thread"
+    )
+
+
+def test_heartbeat_is_stopped_before_the_response_is_written():
+    """No progress frame may trail the final response.
+
+    The heartbeat runs on a thread-pool timer, so it can fire at any moment -
+    including after the command finished, or while a timed-out command is still
+    running on the UI thread. ExecuteOnUi must dispose the timer AND close the
+    channel in a finally that covers every path (ok, timeout, exception), before
+    returning the result the caller then writes.
+    """
+    src = _cs("AIBridgeServer.cs")
+    start = src.index("private JObject ExecuteOnUi(")
+    end = src.index("private static void LogDispatch", start)
+    body = src[start:end]
+    assert "new ProgressChannel(progressSink)" in body
+    assert "new System.Threading.Timer(" in body, "heartbeat timer missing"
+    fin = body.rindex("finally")
+    tail = body[fin:]
+    assert "heartbeat?.Dispose();" in tail and "channel?.Close();" in tail, (
+        "the heartbeat must be stopped and the channel closed in the outer finally"
+    )
+    assert tail.index("channel?.Close();") < tail.index("return result;")
+    # Heartbeat frames must not claim completion.
+    assert "Math.Min(99.0" in body
+
+
+def test_progress_channel_keeps_mcp_progress_monotonic_and_ordered():
+    """Two emitters (heartbeat + handler) share one channel; MCP needs monotonic progress."""
+    src = _cs("OperationRegistry.cs")
+    start = src.index("public sealed class ProgressChannel")
+    body = src[start:start + 4000]
+    emit = body[body.index("public void Emit("):]
+    assert "lock (_gate)" in emit, "emission must be serialised"
+    assert "if (_closed) return;" in emit, "closed channel must drop frames"
+    assert "if (percent < _lastPercent) percent = _lastPercent;" in emit, (
+        "percent must never decrease - MCP requires increasing progress"
+    )
+    assert "else if (_explicitSeen) return;" in emit, (
+        "the heartbeat must stand down once a handler reports real progress"
+    )
+    assert "System.Environment.TickCount" in emit, (
+        "fully qualify System.Environment in the plugin (Rhino.DocObjects collides)"
     )
 
 

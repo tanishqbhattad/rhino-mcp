@@ -134,9 +134,17 @@ or `cancel_operation`. Concretely:
      status update.
   3. The client only sets `want_progress` once the plugin has advertised the feature, so an
      older plugin is never sent a parameter it must ignore.
-  Plugin side: `ProgressReporter` (thread-static sink, 250 ms throttle) mirrors the
-  cancellation token, so handlers emit from the checkpoints where they already poll
-  `CancelRequested`. Wired today: the `batch` loop (`op 7/40: create_object`).
+  Plugin side: each command gets one `ProgressChannel`, shared by two emitters:
+  - **Handlers** report real progress through `ProgressReporter` (thread-static pointer, 250 ms
+    throttle) from the checkpoints where they already poll `CancelRequested`. Wired today: the
+    `batch` loop (`op 7/40: create_object`).
+  - **A heartbeat timer** (every 2 s, first tick at 2 s) reports elapsed time against the
+    timeout budget (`running 42s of 180s budget`, capped at 99%) for commands that can't know
+    their own percent — an opaque `execute_script`, `report_areas`, `detect_clashes`, …
+  The channel serialises frames, never lets percent decrease (MCP requires increasing
+  progress), silences the heartbeat for good once a handler reports, and is closed in
+  `ExecuteOnUi`'s `finally` so no frame ever trails the response — including a timed-out
+  command still running on the UI thread.
 - **Timeouts surface the `request_id`** and tell the model to call `get_operation_result` —
   a long job that outlives its timeout is *retrievable*, not lost. This was a field-report fix;
   don't regress it.
@@ -493,10 +501,9 @@ branch, confirm CI is green, merge to `main`, and tag it. Nothing else is mid-fl
 ### Known gaps
 
 - **`build.bat` is cwd-dependent** — see §5. A `pushd "%~dp0"` fixes it.
-- **Progress is wired into `batch` only.** Other long commands (`report_areas`,
-  `place_openings_on_facade`, `execute_script`) already forward progress on the Python side but
-  emit none from C#: they have no checkpoint loop to report from yet. An opaque script can't
-  report a percent; an elapsed-time heartbeat would be the honest version.
+- **Only `batch` reports *real* percent progress.** Everything else long gets the elapsed-time
+  heartbeat. `place_openings_on_facade` and `derive_floors_from_mass` walk lists internally and
+  could report `wall i of n` from their loops — worth doing if they turn out to be slow.
 - **`distill_session.py draft` has never run against a live scene** — unit-tested only.
 - **The WAL truncates params at ~300 chars**, so `execute_script` bodies never reach it and the
   distiller cannot mine `rab` usage. Widening the budget is a plugin change.

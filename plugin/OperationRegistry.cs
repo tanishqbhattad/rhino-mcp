@@ -174,55 +174,93 @@ namespace RhinoAIBridge
     /// </summary>
     public static class ProgressReporter
     {
-        // Minimum gap between frames. A tight loop reporting every iteration would
-        // flood the socket and slow the very operation it is describing.
-        private const int MIN_INTERVAL_MS = 250;
+        // The channel itself is shared (the heartbeat timer holds it too); only the
+        // "which channel belongs to the command running on this thread" pointer is
+        // thread-static, and it must be armed on the UI thread - see AIBridgeServer.
+        [ThreadStatic] private static ProgressChannel _channel;
 
-        [ThreadStatic] private static Action<double, string> _sink;
-        [ThreadStatic] private static int _lastTick;
-
-        public static void SetCurrent(Action<double, string> sink)
-        {
-            _sink = sink;
-            _lastTick = 0;
-        }
-
-        public static void ClearCurrent()
-        {
-            _sink = null;
-            _lastTick = 0;
-        }
+        public static void SetCurrent(ProgressChannel channel) => _channel = channel;
+        public static void ClearCurrent() => _channel = null;
 
         /// <summary>True when the client asked for progress on this command.</summary>
-        public static bool Wanted => _sink != null;
+        public static bool Wanted => _channel != null;
 
         /// <summary>
-        /// Report percent-complete (0-100). Throttled; pass force:true for a final or
-        /// milestone frame that must not be dropped.
+        /// Report percent-complete (0-100) from a handler that knows its real progress.
+        /// Throttled; pass force:true for a milestone that must not be dropped. The first
+        /// explicit report permanently stands the elapsed-time heartbeat down.
         /// </summary>
         public static void Report(double percent, string message, bool force = false)
-        {
-            var sink = _sink;
-            if (sink == null) return;
-            if (!force)
-            {
-                int now = Environment.TickCount;
-                // Unsigned difference so the 49-day TickCount wraparound cannot make
-                // this go negative and silently suppress every later frame.
-                if (_lastTick != 0 && unchecked((uint)(now - _lastTick)) < MIN_INTERVAL_MS) return;
-                _lastTick = now;
-            }
-            if (percent < 0) percent = 0;
-            if (percent > 100) percent = 100;
-            try { sink(percent, message); }
-            catch { /* cosmetic - never fail a command over a status update */ }
-        }
+            => _channel?.Emit(percent, message, force, isExplicit: true);
 
         /// <summary>Convenience for "item i of n" loops.</summary>
         public static void ReportStep(int index, int total, string message, bool force = false)
         {
             if (total <= 0) return;
             Report(index * 100.0 / total, message, force);
+        }
+    }
+
+    /// <summary>
+    /// Progress state for ONE command, shared by the handler (UI thread) and the
+    /// heartbeat timer (thread pool).
+    ///
+    /// Why a channel rather than bare thread-statics: two emitters now exist. The
+    /// heartbeat reports elapsed time against the timeout budget for commands that
+    /// cannot know their own percent (an opaque execute_script); handlers like the
+    /// batch loop report real "op i of n" progress. Without one gate between them the
+    /// percent could go 10 -> 2.5 -> 12, and MCP requires progress to increase with
+    /// every notification. So under one lock this:
+    ///   - serialises frames, so wire order == emission order
+    ///   - clamps percent to never decrease
+    ///   - silences the heartbeat for good once explicit progress appears
+    ///   - drops anything after Close(), so no frame trails the final response
+    /// The sink runs inside the lock deliberately: it only takes the connection's
+    /// write lock, which never calls back in here, so there is no lock-order cycle.
+    /// </summary>
+    public sealed class ProgressChannel
+    {
+        // Minimum gap between throttled frames. A tight loop reporting every iteration
+        // would flood the socket and slow the very operation it is describing.
+        private const int MIN_INTERVAL_MS = 250;
+
+        private readonly Action<double, string> _sink;
+        private readonly object _gate = new object();
+        private int _lastTick;
+        private double _lastPercent;
+        private bool _explicitSeen;
+        private bool _closed;
+
+        public ProgressChannel(Action<double, string> sink) { _sink = sink; }
+
+        public void Emit(double percent, string message, bool force, bool isExplicit)
+        {
+            lock (_gate)
+            {
+                if (_closed) return;
+                if (isExplicit) _explicitSeen = true;
+                else if (_explicitSeen) return;   // real progress has taken over
+                if (!force)
+                {
+                    int now = System.Environment.TickCount;
+                    // Unsigned difference so the 49-day TickCount wraparound cannot make
+                    // this go negative and silently suppress every later frame.
+                    if (_lastTick != 0 && unchecked((uint)(now - _lastTick)) < MIN_INTERVAL_MS) return;
+                    _lastTick = now;
+                }
+                if (percent < 0) percent = 0;
+                if (percent > 100) percent = 100;
+                if (percent < _lastPercent) percent = _lastPercent;   // MCP: never decrease
+                _lastPercent = percent;
+                try { _sink(percent, message); }
+                catch { /* cosmetic - never fail a command over a status update */ }
+            }
+        }
+
+        /// <summary>Stop all further frames. Call before the final response is written.</summary>
+        public void Close()
+        {
+            lock (_gate) { _closed = true; }
         }
     }
 
